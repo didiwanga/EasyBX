@@ -1,0 +1,658 @@
+{
+  "wudang": {
+    "name": "武当派",
+    "jifa_hint": "内功太极神功(taiji-shengong)，剑法激发taiji-jian、太极拳激发taiji-quan、虎爪激发huzhao-shou；互备：太极拳+太极爪 / 玄虚刀法+太极剑。",
+    "presets": [
+      {
+        "name": "缠剑连招（通用）",
+        "desc": "缠字诀定身 + 连字诀多段物理连击，通用任务主推。",
+        "rotation": [
+          {"cmd": "perform taiji-jian.chan", "cd": 10, "min_qi": 30, "desc": "太极剑·缠字诀(busy)"},
+          {"cmd": "perform taiji-jian.lian", "cd": 16, "min_qi": 40, "desc": "太极剑·连字诀(物理连招)"}
+        ]
+      },
+      {
+        "name": "太极刚柔化学流",
+        "desc": "缠住后太极刚柔打上限（对明教等反弹目标有效），需 jiali max。",
+        "rotation": [
+          {"cmd": "perform taiji-jian.chan", "cd": 10, "min_qi": 30, "desc": "太极剑·缠字诀(busy)"},
+          {"cmd": "perform taiji-quan.gangrou", "cd": 8, "min_qi": 45, "desc": "太极拳·太极刚柔(化学)"}
+        ]
+      },
+      {
+        "name": "虎爪无影爪化学",
+        "desc": "无影爪打伤气血上限，加力有效，与刚柔共 CD。",
+        "rotation": [
+          {"cmd": "perform taiji-jian.chan", "cd": 10, "min_qi": 30, "desc": "太极剑·缠字诀(busy)"},
+          {"cmd": "perform huzhao-shou.juehu", "cd": 12, "min_qi": 45, "desc": "虎爪绝户手(化学)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力；perform dodge.zong 梯云纵 buff",
+      "互备：太极拳+太极爪 或 玄虚刀法+太极剑",
+      "对付明教务必用化学(刚柔/无影爪/震字诀)，不要用物理连招"
+    ]
+  },
+  "huashan": {
+    "name": "华山派",
+    "jifa_hint": "内功可激发 紫霞神功(zixia-shengong) / 华山内功(huashan-neigong)；剑法 huashan-jianfa、dugu-jiujian、kuangfeng-kuaijian。",
+    "presets": [
+      {
+        "name": "玉女十九式连招",
+        "desc": "玉女十九式连续攻击，出师可带走；前中期常用。",
+        "rotation": [
+          {"cmd": "perform yunushijiu-jian.shijiu", "cd": 8, "min_qi": 40, "desc": "玉女十九式(物理连招)"}
+        ]
+      },
+      {
+        "name": "独孤九剑克制流",
+        "desc": "破气式封对手 perform + 破掌式针对空手敌人，克制性强。",
+        "rotation": [
+          {"cmd": "perform dugu-jiujian.poqi", "cd": 10, "min_qi": 35, "desc": "独孤九剑·破气式(封perform)"},
+          {"cmd": "perform dugu-jiujian.pozhang", "cd": 12, "min_qi": 40, "desc": "独孤九剑·破掌式(克制空手)"}
+        ]
+      },
+      {
+        "name": "狂风快剑输出",
+        "desc": "狂风连环剑 + 天外飞龙，剑宗限定，高输出。",
+        "rotation": [
+          {"cmd": "perform kuangfeng-kuaijian.kuangfeng", "cd": 8, "min_qi": 40, "desc": "狂风连环剑(连招)"},
+          {"cmd": "perform kuangfeng-kuaijian.feilong", "cd": 14, "min_qi": 50, "desc": "天外飞龙(高伤)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "剑宗可学狂风快剑（需紫霞秘籍给封不平解密天外飞龙）"
+    ]
+  },
+  "mingjiao": {
+    "name": "明教",
+    "jifa_hint": "内功 九阳神功(jiuyang-shengong)，核心 乾坤大挪移(qiankun-danuoyi) 为 parry/dodge 激发。",
+    "presets": [
+      {
+        "name": "大挪移护体流",
+        "desc": "大挪移开启反弹 + 圣火令阴风刀输出。",
+        "rotation": [
+          {"cmd": "perform qiankun-danuoyi.danuoyi", "cd": 30, "min_qi": 20, "desc": "乾坤大挪移(buff反弹)"},
+          {"cmd": "perform shenghuo-lingfa.yinfeng", "cd": 8, "min_qi": 40, "desc": "圣火令·阴风刀(化学)"}
+        ]
+      },
+      {
+        "name": "透骨针物理流",
+        "desc": "寻瑕抵隙 + 透骨针连续输出。",
+        "rotation": [
+          {"cmd": "perform qiankun-danuoyi.xunxia", "cd": 10, "min_qi": 40, "desc": "乾坤大挪移·寻瑕抵隙(连招)"},
+          {"cmd": "perform shenghuo-lingfa.tougu", "cd": 8, "min_qi": 40, "desc": "圣火令·透骨针(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "战斗前先开 乾坤大挪移(danuoyi) 护体",
+      "漫天金花 perform feihua-shou.tan 可用于偷袭"
+    ]
+  },
+  "quanzhen": {
+    "name": "全真派",
+    "jifa_hint": "内功 先天功(xiantian-gong)；剑法 quanzhen-jian、一阳指 yizhi-yang（finger）。",
+    "presets": [
+      {
+        "name": "定阳针+七星绝命",
+        "desc": "定阳针 busy 后七星绝命剑输出（七星不被反弹）。",
+        "rotation": [
+          {"cmd": "perform quanzhen-jian.ding", "cd": 10, "min_qi": 30, "desc": "全真剑·定阳针(busy)"},
+          {"cmd": "perform quanzhen-jian.qixing", "cd": 12, "min_qi": 40, "desc": "全真剑·七星绝命(化学)"}
+        ]
+      },
+      {
+        "name": "同归爆发",
+        "desc": "同归于尽起手（低血小怪），慎用避免真死。",
+        "rotation": [
+          {"cmd": "perform quanzhen-jian.tonggui", "cd": 15, "min_qi": 50, "desc": "全真剑·同归(爆发)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "一阳指对 exp 比自己低的敌人命中高"
+    ]
+  },
+  "tianlongsi": {
+    "name": "天龙寺",
+    "jifa_hint": "内功 枯荣神功 / 北冥神功；剑法 liumai-shenjian（六脉神剑）、yizhi-yang（一阳指）。",
+    "presets": [
+      {
+        "name": "拂穴+六脉连招",
+        "desc": "一阳指拂穴 busy 后六脉神剑物理连招输出。",
+        "rotation": [
+          {"cmd": "perform yizhi-yang.fuxue", "cd": 10, "min_qi": 30, "desc": "一阳指·拂穴(busy)"},
+          {"cmd": "perform liumai-shenjian.liumai", "cd": 10, "min_qi": 40, "desc": "六脉神剑·六脉(物理连招)"}
+        ]
+      },
+      {
+        "name": "剑气化学流",
+        "desc": "一阳指疗伤防身 + 六脉剑气化学输出。",
+        "rotation": [
+          {"cmd": "perform liumai-shenjian.qifa", "cd": 10, "min_qi": 40, "desc": "六脉神剑·剑气(化学)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "六脉神剑不宜高于一阳指 10 级，否则无法练习",
+      "perform yizhi-yang.liao 可疗伤（自身受损，注意血量）"
+    ]
+  },
+  "taohua": {
+    "name": "桃花岛",
+    "jifa_hint": "内功 碧波神功(bibo-shengong)；剑法 yuxiao-jian（玉箫剑法）、劈空掌 pikong、兰花拂穴 hand。",
+    "presets": [
+      {
+        "name": "全化学流",
+        "desc": "玉箫剑法·箫花齐放 全化学连招（不被挪移），命中后伤害逐下递增。",
+        "rotation": [
+          {"cmd": "perform yuxiao-jian.xiaohua", "cd": 8, "min_qi": 40, "desc": "玉箫剑·箫花齐放(化学连招)"}
+        ]
+      },
+      {
+        "name": "碧海潮生群攻",
+        "desc": "碧海潮生群体攻击伤气血精神，成功可 busy 对手。",
+        "rotation": [
+          {"cmd": "perform yuxiao-jian.zouxiao", "cd": 12, "min_qi": 40, "desc": "玉箫剑·碧海潮生(群攻)"}
+        ]
+      },
+      {
+        "name": "弹指偷袭起手",
+        "desc": "弹指绝技不要求气势，非叫杀任务可用作起手 pfm（配玉石子有加成）。",
+        "rotation": [
+          {"cmd": "perform cuixin-zhi.tan", "cd": 6, "min_qi": 30, "desc": "弹指绝技(偷袭起手)"},
+          {"cmd": "perform yuxiao-jian.xiaohua", "cd": 8, "min_qi": 40, "desc": "玉箫剑·箫花齐放(化学连招)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "桃花多为化学 pfm，初始膂力可选 10",
+      "弹指需带玉石子攻击加成"
+    ]
+  },
+  "shaolini": {
+    "name": "少林派",
+    "jifa_hint": "内功 易筋经神功(yijin-jing) / 混元一气(hunyuan-yiqi)；三门功法三选一：燃木刀(ranmu-dao)/大韦陀杵(daweituo-chu)/日月鞭(riyue-bian)。",
+    "presets": [
+      {
+        "name": "一指禅定身流",
+        "desc": "惊魔一指 busy + 罗汉拳输出（禅宗心法越高越好）。",
+        "rotation": [
+          {"cmd": "perform yizhi-chan.jingmo", "cd": 12, "min_qi": 30, "desc": "一指禅·惊魔一指(busy)"},
+          {"cmd": "perform luohan-quan.luohan", "cd": 6, "min_qi": 40, "desc": "罗汉拳(输出)"}
+        ]
+      },
+      {
+        "name": "燃木刀法输出",
+        "desc": "燃木刀焚我连续攻击 + 举火焚天化学（不怕挪移）。注意焚我使用 20 次后武器销毁。",
+        "rotation": [
+          {"cmd": "perform ranmu-dao.fenwo", "cd": 3, "min_qi": 40, "desc": "燃木刀·焚我(物理连招)"},
+          {"cmd": "perform ranmu-dao.fentian", "cd": 6, "min_qi": 40, "desc": "燃木刀·举火焚天(化学)"}
+        ]
+      },
+      {
+        "name": "大韦陀杵连招",
+        "desc": "无相无我化学三连 + 我佛如来 5 连击（500 级可斩断兵器）。",
+        "rotation": [
+          {"cmd": "perform daweituo-chu.wuxiang", "cd": 8, "min_qi": 40, "desc": "大韦陀杵·无相无我(化学三连)"},
+          {"cmd": "perform daweituo-chu.rulai", "cd": 5, "min_qi": 40, "desc": "大韦陀杵·我佛如来(5连击)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "禅宗心法(buddhism) 400 级后惊魔一指不叫杀，1200 级自身 busy 极短",
+      "燃木刀不可用好兵器（木刀），防武器自毁"
+    ]
+  },
+  "gumu": {
+    "name": "古墓派",
+    "jifa_hint": "内功 玉女心经(yunv-xinjing) / 九阴神功；剑法 xuantie-jian（玄铁剑法）、yunv-jian（玉女剑法）。",
+    "presets": [
+      {
+        "name": "玄铁汹涌流",
+        "desc": "玄铁剑法汹涌两波攻击，前中期对任务 NPC 近乎 100% 命中，自带 busy。",
+        "rotation": [
+          {"cmd": "perform xuantie-jian.xiongyong", "cd": 10, "min_qi": 40, "desc": "玄铁剑·汹涌(物理+busy)"}
+        ]
+      },
+      {
+        "name": "玉女素心连招",
+        "desc": "玉女素心剑法连招 + 七星绝命剑（不被反弹，对明教用）。",
+        "rotation": [
+          {"cmd": "perform yunv-jian.suxin", "cd": 8, "min_qi": 40, "desc": "玉女剑·素心剑法(连招)"},
+          {"cmd": "perform xuantie-jian.qixing", "cd": 12, "min_qi": 40, "desc": "玄铁剑·七星绝命(不被反弹)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "女弟子可右手金铃索 chan、左手美女拳",
+      "对明教用七星绝命剑避免被反弹"
+    ]
+  },
+  "gaibang": {
+    "name": "丐帮",
+    "jifa_hint": "内功 混天气功(huntian-qigong)；打狗棒法 dagou-bang（staff）、降龙十八掌 xianglong-zhang（strike）。",
+    "presets": [
+      {
+        "name": "打狗棒缠戳流",
+        "desc": "缠字诀 busy + 戳字诀化学伤害（打上限和内力），需 jiali max 使用。",
+        "rotation": [
+          {"cmd": "perform dagou-bang.chan", "cd": 6, "min_qi": 30, "desc": "打狗棒·缠字诀(busy)"},
+          {"cmd": "perform dagou-bang.chuo", "cd": 3, "min_qi": 40, "desc": "打狗棒·戳字诀(化学)"}
+        ]
+      },
+      {
+        "name": "降龙掌爆发",
+        "desc": "亢龙三悔化学三连 + 雷霆降龙（一招晕，高等级命中下降）。",
+        "rotation": [
+          {"cmd": "perform xianglong-zhang.sanhui", "cd": 15, "min_qi": 45, "desc": "降龙掌·亢龙三悔(化学)"},
+          {"cmd": "perform xianglong-zhang.leiting", "cd": 20, "min_qi": 50, "desc": "降龙掌·雷霆降龙(一招晕)"}
+        ]
+      },
+      {
+        "name": "打狗棒群攻",
+        "desc": "转字诀群攻（最多 3 人，每人最多 5 下），适合群战任务。",
+        "rotation": [
+          {"cmd": "perform dagou-bang.zhuan", "cd": 8, "min_qi": 40, "desc": "打狗棒·转字诀(群攻)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "右手持棍 + 左手空手，可同时出打狗棒和降龙掌 pfm",
+      "戳字诀建议 jiali max 后使用再调回"
+    ]
+  },
+  "emei": {
+    "name": "峨嵋派",
+    "jifa_hint": "内功 峨眉九阳功(emei-jiuyang-gong)；剑法 fuliu-jian（拂柳剑）、天罡指 finger（凌空指穴）。",
+    "presets": [
+      {
+        "name": "凌空指穴+灭剑",
+        "desc": "天罡指·凌空指穴 busy 后灭剑输出，wiki 推荐流程。",
+        "rotation": [
+          {"cmd": "perform finger.lingkong", "cd": 8, "min_qi": 30, "desc": "天罡指·凌空指穴(busy)"},
+          {"cmd": "perform fuliu-jian.miejian", "cd": 8, "min_qi": 40, "desc": "拂柳剑·灭剑(输出)"}
+        ]
+      },
+      {
+        "name": "拂柳夺兵流",
+        "desc": "拂柳(夺兵器) + 回风/绝剑连击。",
+        "rotation": [
+          {"cmd": "perform fuliu-jian.fuliu", "cd": 10, "min_qi": 40, "desc": "拂柳剑·拂柳(夺兵器)"},
+          {"cmd": "perform fuliu-jian.juejian", "cd": 8, "min_qi": 40, "desc": "拂柳剑·绝剑(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "单剑(拂柳)+天罡指 可出 auto-pfm 麻痹",
+      "研读峨嵋功法笔记后，激发峨眉九阳功配刀/剑可出麻痹 auto-pfm"
+    ]
+  },
+  "riyue": {
+    "name": "日月神教",
+    "jifa_hint": "东方系可激发 葵花宝典(kuihua-baodian) 为 force/sword/parry/dodge；任系可激发 吸星大法(xixing-dafa)。",
+    "presets": [
+      {
+        "name": "眩目控场（踏实）",
+        "desc": "先放眩目 busy，随后普通攻击输出；不用兵剑种类限制。",
+        "rotation": [
+          {"cmd": "perform riyue-jian.xuanmu", "cd": 6, "min_qi": 30, "desc": "日月剑·眩目(busy)"}
+        ]
+      },
+      {
+        "name": "日月刀剑连击",
+        "desc": "眩目控制 + 日月刀法连环（最高 9 连）。前置：wbei 日月刀剑。",
+        "rotation": [
+          {"cmd": "perform riyue-jian.xuanmu", "cd": 6, "min_qi": 30, "desc": "日月剑·眩目(busy)"},
+          {"cmd": "perform riyue-dao.lianhuan", "cd": 8, "min_qi": 40, "desc": "日月刀·连环"}
+        ]
+      },
+      {
+        "name": "辟邪·刺目控场",
+        "desc": "刺目：短 busy + 化学伤害 + 减对方气血上限，群体攻击，叫杀。",
+        "rotation": [
+          {"cmd": "perform pixie-jian.cimu", "cd": 12, "min_qi": 40, "desc": "辟邪·刺目"}
+        ]
+      },
+      {
+        "name": "辟邪·刺腕下武器",
+        "desc": "刺腕解除敌人兵器，不叫杀，命中经验判断。",
+        "rotation": [
+          {"cmd": "perform pixie-jian.ciwan", "cd": 15, "min_qi": 40, "desc": "辟邪·刺腕"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "wbei riyue-jian riyue-dao（日月刀剑互备，出招二连）",
+      "bei 互备（开路掌+鹰爪功可选）",
+      "东方系推荐 wield 剑（绣花针触发葵花 pfm）"
+    ]
+  },
+  "xingxiu": {
+    "name": "星宿派",
+    "jifa_hint": "内功 化功大法(huagong-dafa)；掌法 chousui-zhang（抽髓掌）、摘星手 hand。",
+    "presets": [
+      {
+        "name": "碧火弹输出",
+        "desc": "火球巨大伤害，星宿最常用输出，带毒，命中后对手 busy 约 2 招。",
+        "rotation": [
+          {"cmd": "perform chousui-zhang.huoqiu", "cd": 4, "min_qi": 40, "desc": "抽髓掌·碧火弹(火球,高伤)"}
+        ]
+      },
+      {
+        "name": "毒神附体大招",
+        "desc": "毒神附体门派大招 buff + 火球输出。",
+        "rotation": [
+          {"cmd": "perform chousui-zhang.dushen", "cd": 30, "min_qi": 30, "desc": "抽髓掌·毒神附体(大招buff)"},
+          {"cmd": "perform chousui-zhang.huoqiu", "cd": 4, "min_qi": 40, "desc": "抽髓掌·碧火弹(高伤)"}
+        ]
+      },
+      {
+        "name": "活色生香毒伤",
+        "desc": "活色生香无自身 busy 但 4 秒 CD，持续毒伤折磨目标。",
+        "rotation": [
+          {"cmd": "perform tianshan-zhang.huose", "cd": 4, "min_qi": 40, "desc": "天山掌·活色生香(毒)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "火球命中偏低但伤害高，可 1 秒一发",
+      "做擒回/劝服任务禁用火球（带毒），需 set xx_poison 内敛"
+    ]
+  },
+  "murong": {
+    "name": "姑苏慕容",
+    "jifa_hint": "内功 斗转星移(douzhuan-xingyi) 为核心（parry）；剑法 murong-jianfa、参合指 canhe-zhi。",
+    "presets": [
+      {
+        "name": "参商增益+流星剑",
+        "desc": "参商指先加物理/化学伤害增益（1/5 臂力身法），随后流星快剑输出。",
+        "rotation": [
+          {"cmd": "perform canhe-zhi.canshang", "cd": 10, "min_qi": 30, "desc": "参合指·参商指(buff)"},
+          {"cmd": "perform murong-jianfa.liuxing", "cd": 10, "min_qi": 40, "desc": "慕容剑·流星快剑(连招)"}
+        ]
+      },
+      {
+        "name": "星移斗转反弹",
+        "desc": "星移/斗转化学反弹，让对手攻击自己（对加力敌人效果强）。",
+        "rotation": [
+          {"cmd": "perform douzhuan-xingyi.douzhuan", "cd": 12, "min_qi": 40, "desc": "斗转星移·斗转(反弹)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "悟性决定参合指判定和 busy 时长，建议悟性高",
+      "对高内力门派（天龙/星宿/日月任系）慎用星移斗转"
+    ]
+  },
+  "dalunsi": {
+    "name": "大轮寺",
+    "jifa_hint": "内功 龙象般若功(longxiang-boruo)；火焰刀 huoyan-dao、大手印 dashou-yin、降伏轮 xiangfu-lun。",
+    "presets": [
+      {
+        "name": "火焰刀输出",
+        "desc": "火焰刀气 + 火焰刀·燃 输出，化学伤害不怕挪移。",
+        "rotation": [
+          {"cmd": "perform huoyan-dao.daoqi", "cd": 8, "min_qi": 40, "desc": "火焰刀·刀气(输出)"},
+          {"cmd": "perform huoyan-dao.ran", "cd": 10, "min_qi": 40, "desc": "火焰刀·燃(化学)"}
+        ]
+      },
+      {
+        "name": "阿修罗天印",
+        "desc": "大手印·阿修罗天印，中期主力输出 pfm。",
+        "rotation": [
+          {"cmd": "perform dashou-yin.tianyin", "cd": 8, "min_qi": 40, "desc": "大手印·阿修罗天印(输出)"}
+        ]
+      },
+      {
+        "name": "降伏轮群攻",
+        "desc": "五轮大转群攻（最多 5 人）+ 天人五衰（需要一定经验）。",
+        "rotation": [
+          {"cmd": "perform xiangfu-lun.dazhuan", "cd": 10, "min_qi": 40, "desc": "降伏轮·五轮大转(群攻)"},
+          {"cmd": "perform xiangfu-lun.wushuai", "cd": 15, "min_qi": 45, "desc": "降伏轮·天人五衰(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "5.5M 经验可达到天人五衰经验下限",
+      "初期可用英雄剑法平砍 + 阿修罗天印"
+    ]
+  },
+  "chaoting": {
+    "name": "朝廷",
+    "jifa_hint": "内功 浩气罡风(haoqi-gangfeng)；金乌刀/狂风刀剑，护体 alert 为朝廷特色。",
+    "presets": [
+      {
+        "name": "杀威棒流",
+        "desc": "杀威棒输出 + alert 解 busy 保命（朝廷招牌）。",
+        "rotation": [
+          {"cmd": "perform tianshan-jian.qixing", "cd": 10, "min_qi": 40, "desc": "七星诀(化学)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "alert 可解除自身 busy，是朝廷招牌保命技",
+      "护镖追求掉宝时用平砍避免 pfm 秒杀导致无宝"
+    ]
+  },
+  "lingjiu": {
+    "name": "灵鹫宫",
+    "jifa_hint": "内功 小无相功(xiaowuxiang-gong)；掌法 liuyang-zhang（六阳掌）、折梅手 zhemei-shou、剑法 tianyu-qijian。",
+    "presets": [
+      {
+        "name": "生死符连种",
+        "desc": "种生死符 + 连种生死符，化学毒伤。注意六阳掌需同时激发掌法和暗器。",
+        "rotation": [
+          {"cmd": "perform liuyang-zhang.zhong", "cd": 6, "min_qi": 40, "desc": "六阳掌·种生死符(化学)"},
+          {"cmd": "perform liuyang-zhang.lianzhong", "cd": 8, "min_qi": 40, "desc": "六阳掌·连种生死符"}
+        ]
+      },
+      {
+        "name": "凤舞九天连招",
+        "desc": "凤舞九天无自身 busy 连打四下，有概率使对手 busy；可先折梅手 duo 下兵器。",
+        "rotation": [
+          {"cmd": "perform zhemei-shou.duo", "cd": 12, "min_qi": 30, "desc": "折梅手·空手入白刃(下兵器)"},
+          {"cmd": "perform tianyu-qijian.fengwu", "cd": 5, "min_qi": 40, "desc": "天羽奇剑·凤舞九天(4连击)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "激发小无相功时连种生死符 CD 增加为 12 秒",
+      "天羽分飞有 10 秒冷却、busy 2 秒；凤舞九天无自身 busy"
+    ]
+  },
+  "baituo": {
+    "name": "白驼山",
+    "jifa_hint": "内功 蛤蟆功(hamagong)；剑法 baima-jian（白马剑）、掌法 shentuo-zhang（神驼掌，蛤蟆功激发掌法可用）。",
+    "presets": [
+      {
+        "name": "神驼掌输出",
+        "desc": "神驼掌 pfm 命中提升一档，伤害不设上限（用蛤蟆功激发掌法时）。",
+        "rotation": [
+          {"cmd": "perform shentuo-zhang.shentuo", "cd": 8, "min_qi": 40, "desc": "神驼掌·神驼(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "蛤蟆功激发为掌法可使用神驼掌所有 pfm",
+      "扑击(puji) 使用后进入虚弱状态"
+    ]
+  },
+  "xueshan": {
+    "name": "雪山派",
+    "jifa_hint": "内功 玄冥神功 / 雪山内功；剑法 xueshan-jian（雪山剑法）、金乌刀 blade。",
+    "presets": [
+      {
+        "name": "缠斗+六出诀",
+        "desc": "缠斗 busy 点穴后六出诀连续出招。",
+        "rotation": [
+          {"cmd": "perform xueshan-jian.chandou", "cd": 10, "min_qi": 30, "desc": "雪山剑·缠斗(busy)"},
+          {"cmd": "perform xueshan-jian.liuchu", "cd": 8, "min_qi": 40, "desc": "雪山剑·六出诀(连招)"}
+        ]
+      },
+      {
+        "name": "金乌刀法",
+        "desc": "金乌融雪 + 金乌堕地 刀法输出。",
+        "rotation": [
+          {"cmd": "perform jinwu-dao.jinwu", "cd": 8, "min_qi": 40, "desc": "金乌刀·金乌融雪(输出)"},
+          {"cmd": "perform jinwu-dao.zhuidi", "cd": 10, "min_qi": 40, "desc": "金乌刀·金乌堕地(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "雪山剑四变：梅剑加躲闪、雪剑加招架、风剑加攻、霜剑加伤害",
+      "白虎职业 2 后雪剑 auto-pfm 化学伤害提升"
+    ]
+  },
+  "tiandihui": {
+    "name": "天地会",
+    "jifa_hint": "内功 天山六阳功 / 天地会内功；鞭法 jiulong-bian（九龙鞭）、伏龙手 hand。",
+    "presets": [
+      {
+        "name": "伏龙手+白璧流",
+        "desc": "伏龙手按穴 busy 后九龙鞭·白璧无瑕强攻（可强发加叹号）。",
+        "rotation": [
+          {"cmd": "perform fushou-hand.an", "cd": 10, "min_qi": 30, "desc": "伏龙手·按穴(busy)"},
+          {"cmd": "perform jiulong-bian.baibi", "cd": 8, "min_qi": 40, "desc": "九龙鞭·白璧无瑕(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "技能可强发：perform 命令后加半角感叹号（如 perform jiulong-bian.baibi!）",
+      "双手都拿武器则无法按穴，按穴时保持空手"
+    ]
+  },
+  "shenlong": {
+    "name": "神龙教",
+    "jifa_hint": "内功 神龙心法(shenlong-xinfa)；化骨绵掌 huagu-mianzhang、神龙鞭 shenlong-bian、毒龙匕 dulong-bi。",
+    "presets": [
+      {
+        "name": "化骨绵掌毒伤",
+        "desc": "辣手化骨降防 + 绵绵不绝持续疯魔（需 jiali 50+ 且全程保持加力）。",
+        "rotation": [
+          {"cmd": "perform huagu-mianzhang.hua", "cd": 8, "min_qi": 30, "desc": "化骨绵掌·辣手化骨(化学)"},
+          {"cmd": "perform huagu-mianzhang.bujue", "cd": 15, "min_qi": 45, "desc": "化骨绵掌·绵绵不绝(持续毒伤)"}
+        ]
+      },
+      {
+        "name": "毒龙匕连招",
+        "desc": "美人三招连击 + 孤注一掷（匕首流）。",
+        "rotation": [
+          {"cmd": "perform dulong-bi.meiren", "cd": 8, "min_qi": 40, "desc": "毒龙匕·美人三招(连招)"},
+          {"cmd": "perform dulong-bi.zhi", "cd": 10, "min_qi": 40, "desc": "毒龙匕·孤注一掷(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "绵绵不绝需 jiali 50+ 并全程保持加力，否则中断",
+      "神龙鞭·缠绕 chan 初期可靠，经验判定"
+    ]
+  },
+  "jueqinggu": {
+    "name": "绝情谷",
+    "jifa_hint": "内功 焚情心法(fenqing)；刀剑 yinyang-renfa（阴阳倒乱刃法）、铁掌 tiezhang-zhangfa。",
+    "presets": [
+      {
+        "name": "三刀四剑连招",
+        "desc": "刀剑互备三刀四剑：用刀出三招剑法物理、用剑出四招刀法化学，命中后下一招命中提升。",
+        "rotation": [
+          {"cmd": "perform yinyang-renfa.daojian", "cd": 8, "min_qi": 40, "desc": "阴阳倒乱刃·三刀四剑(物理+化学)"}
+        ]
+      },
+      {
+        "name": "铁掌降龙",
+        "desc": "铁掌降龙 + 天雷气 掌法输出。",
+        "rotation": [
+          {"cmd": "perform tiezhang-zhangfa.tiezhangxianglong", "cd": 8, "min_qi": 40, "desc": "铁掌·铁掌降龙(输出)"},
+          {"cmd": "perform tiezhang-zhangfa.tianlei", "cd": 10, "min_qi": 40, "desc": "铁掌·天雷气(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "手持刀剑且激发招架/刀/剑才可放三刀四剑",
+      "互备：阴阳倒乱刃法+阴阳倒乱刃法（需拜公孙止改姓）"
+    ]
+  },
+  "wudujiao": {
+    "name": "五毒教",
+    "jifa_hint": "内功 五毒内功；用毒为本门特色（基本毒技 poison），金蛇剑 jinshe-jian。",
+    "presets": [
+      {
+        "name": "金蛇剑输出",
+        "desc": "金蛇剑法 pfm 输出（左腕装钩子描述与伤害增强）。",
+        "rotation": [
+          {"cmd": "perform jinshe-jian.suo", "cd": 8, "min_qi": 40, "desc": "金蛇剑·锁(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "下蛊（蜘蛛）后软虹蛛索击中可使对手 3 秒禁止 pfm/移动",
+      "五毒教无特殊内功时伤害增加 20%"
+    ]
+  },
+  "qingcheng": {
+    "name": "青城派",
+    "jifa_hint": "内功 青城内功；剑法 songfeng-jianfa（松风剑法）、连环腿 wuying-huantui。",
+    "presets": [
+      {
+        "name": "连环踢双击",
+        "desc": "连环踢：第一击物理、第二击化学，第一击命中则第二击必中。",
+        "rotation": [
+          {"cmd": "perform wuying-huantui.lianhuan", "cd": 8, "min_qi": 40, "desc": "连环腿·连环踢(物理+化学)"}
+        ]
+      },
+      {
+        "name": "松风剑法连击",
+        "desc": "剑影 + 岁寒 输出，松风剑法多变。",
+        "rotation": [
+          {"cmd": "perform songfeng-jianfa.jianying", "cd": 8, "min_qi": 40, "desc": "松风剑·剑影(输出)"},
+          {"cmd": "perform songfeng-jianfa.suihan", "cd": 10, "min_qi": 40, "desc": "松风剑·岁寒(输出)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "连环踢若多敌人且仍剩 8 点气势则为群攻第一击"
+    ]
+  },
+  "benjiao": {
+    "name": "苯教",
+    "jifa_hint": "内功 轮回功(lunhui-gong)。苯教以转世轮回为特色。",
+    "presets": [
+      {
+        "name": "骨鸣啸",
+        "desc": "骨鸣啸：busy 类 pfm，杀气充足时有额外化学伤害。",
+        "rotation": [
+          {"cmd": "perform guming-xiao.guming", "cd": 10, "min_qi": 40, "desc": "骨鸣啸(busy+化学)"}
+        ]
+      }
+    ],
+    "prep_hint": [
+      "exert powerup 加力",
+      "轮回功 1000 级以上且不脱节，空手 pfm 可无视门派和内功要求"
+    ]
+  }
+}

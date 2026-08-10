@@ -1,0 +1,36 @@
+{
+  "description": "MUD 函数 `##` DSL API 手册（B3c）。UI 从本数据文件加载，零硬编码。",
+  "namespaces": [
+    {
+      "ns": "sys",
+      "name": "sys.* 客户端能力",
+      "functions": [
+        {"name": "sys.send", "signature": "sys.send(cmd)", "desc": "发送命令到游戏（等同输入框发送，支持别名展开）"},
+        {"name": "sys.sendRaw", "signature": "sys.sendRaw(cmd)", "desc": "原始发送命令，不做别名展开"},
+        {"name": "sys.echo", "signature": "sys.echo(text)", "desc": "输出文本到客户端窗口/状态栏"},
+        {"name": "sys.alert", "signature": "sys.alert(text)", "desc": "弹出提醒"},
+        {"name": "sys.setVar", "signature": "sys.setVar(name, value)", "desc": "设置 {变量}（运行期共享变量池）"},
+        {"name": "sys.getVar", "signature": "sys.getVar(name, default=None)", "desc": "读取 {变量}，不存在返回 default"},
+        {"name": "sys.say", "signature": "sys.say([text])", "desc": "返回最近一行 / 给定文本"},
+        {"name": "sys.setInput", "signature": "sys.setInput(text)", "desc": "设置输入框内容"},
+        {"name": "vars", "signature": "vars", "desc": "变量引擎字典（读写与触发器/宏共享）"}
+      ]
+    },
+    {
+      "ns": "com",
+      "name": "com.* 共享变量命名空间",
+      "functions": [
+        {"name": "com.<key>", "signature": "com[key] 或 com.key", "desc": "多脚本间共享的键值存储（本进程内）"},
+        {"name": "com.get", "signature": "com.get(key, default=None)", "desc": "读取共享变量"},
+        {"name": "com.set", "signature": "com[key] = value", "desc": "写入共享变量"}
+      ]
+    },
+    {
+      "ns": "my",
+      "name": "my.* 个人变量命名空间",
+      "functions": [
+        {"name": "my.<key>", "signature": "my[key] = value", "desc": "个人脚本私有变量"}
+      ]
+    }
+  ]
+}

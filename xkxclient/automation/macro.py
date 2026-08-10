@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import re
+from typing import Callable
+
+from PyQt6.QtCore import QObject, QTimer
+
+from xkxclient.automation.runner import split_commands, substitute
+
+
+class Macro:
+    def __init__(self, name: str, enabled: bool = True, shared: bool = False, steps: list | None = None,
+                 group: str = "") -> None:
+        self.name = name
+        self.enabled = enabled
+        self.shared = shared
+        self.steps = steps or []
+        self.group = group
+        self.labels = {s.get("label"): i for i, s in enumerate(self.steps) if s.get("label")}
+
+
+class MacroEngine(QObject):
+    """B3b 宏引擎：cmd/delay/label/jump(循环+条件)/if/input/wait_input/trigger + 暂停/恢复/进度。"""
+
+    def __init__(self, bus, session) -> None:
+        super().__init__(session)
+        self.bus = bus
+        self.session = session
+        self.macros: dict[str, Macro] = {}
+        self._active: dict[str, Macro] = {}
+        self._pos: dict[str, int] = {}
+        self._timers: dict[str, QTimer] = {}
+        self._waiting: tuple[str, int] | None = None
+        self._paused: set[str] = set()       # 被暂停的宏名
+        self._wait_input_timer: QTimer | None = None
+        self._trigger_sub: Callable | None = None
+        self._trigger_timer: QTimer | None = None
+
+    def load(self, definitions: list[dict]) -> None:
+        self.macros = {}
+        for d in definitions:
+            d = dict(d)
+            name = d.pop("name")
+            m = Macro(name, d.pop("enabled", True), d.pop("shared", False), d.pop("steps", []),
+                      d.pop("group", ""))
+            self.macros[m.name] = m
+            # 运行中的宏：实时应用修改后的内容（不打断运行，保留当前步骤位置）
+            if m.name in self._active:
+                self._active[m.name] = m
+
+    def list(self) -> list[str]:
+        return list(self.macros.keys())
+
+    def enable_all(self) -> None:
+        for m in self.macros.values():
+            m.enabled = True
+
+    def disable_all(self) -> None:
+        for m in self.macros.values():
+            m.enabled = False
+
+    def enable_group(self, group: str) -> None:
+        for m in self.macros.values():
+            if (m.group or "") == group:
+                m.enabled = True
+
+    def disable_group(self, group: str) -> None:
+        for m in self.macros.values():
+            if (m.group or "") == group:
+                m.enabled = False
+
+    def groups(self) -> list[str]:
+        seen: list[str] = []
+        for m in self.macros.values():
+            g = m.group or ""
+            if g and g not in seen:
+                seen.append(g)
+        return seen
+
+    def start(self, name: str) -> bool:
+        m = self.macros.get(name)
+        if not m or not m.enabled or name in self._active:
+            return False
+        if self._active:   # B3b：单宏串行，一次只跑一个宏
+            return False
+        self._active[name] = m
+        self._pos[name] = 0
+        self._paused.discard(name)
+        self.bus.publish("macro.start", account=self.session.account_id, name=name)
+        self._step(name)
+        return True
+
+    def pause(self, name: str | None = None) -> None:
+        """暂停当前宏（不指定则暂停全部运行中）。"""
+        targets = [name] if name else list(self._active.keys())
+        if not targets:
+            return
+        self._paused.update(t for t in targets if t in self._active)
+        self._notify_state("paused")
+
+    def resume(self, name: str | None = None) -> None:
+        """恢复暂停的宏。"""
+        targets = [name] if name else [t for t in self._active if t in self._paused]
+        if not targets:
+            return
+        self._paused.difference_update(targets)
+        self._notify_state("running")
+        for t in targets:
+            if t in self._active:
+                self._step(t)
+
+    def is_running(self, name: str | None = None) -> bool:
+        if name:
+            return name in self._active
+        return bool(self._active)
+
+    def is_paused(self, name: str | None = None) -> bool:
+        if name:
+            return name in self._paused
+        return bool(self._paused)
+
+    def progress(self, name: str) -> tuple[int, int]:
+        """(当前步骤序号, 总步骤数)，1-based；未运行返回 (0, 总数)。"""
+        m = self.macros.get(name)
+        total = len(m.steps) if m else 0
+        return (self._pos.get(name, 0) + 1, total)
+
+    def stop(self) -> None:
+        for t in self._timers.values():
+            t.stop()
+        self._timers.clear()
+        self._clear_wait()
+        names = list(self._active.keys())
+        self._active.clear()
+        self._pos.clear()
+        self._paused.clear()
+        self._waiting = None
+        if names:
+            self.bus.publish("macro.stop", account=self.session.account_id, names=names)
+
+    def _clear_wait(self) -> None:
+        if self._wait_input_timer is not None:
+            self._wait_input_timer.stop()
+            self._wait_input_timer = None
+        if self._trigger_timer is not None:
+            self._trigger_timer.stop()
+            self._trigger_timer = None
+        if self._trigger_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._trigger_sub)
+            self._trigger_sub = None
+
+    def _notify_state(self, state: str) -> None:
+        self.bus.publish("macro.state", account=self.session.account_id, state=state)
+
+    def _step(self, name: str) -> None:
+        m = self._active.get(name)
+        if not m:
+            return
+        if name in self._paused:
+            return
+        pos = self._pos.get(name, 0)
+        if pos >= len(m.steps):
+            self._halt(name)
+            return
+        step = m.steps[pos]
+        t = step.get("type")
+
+        self.bus.publish("macro.step", account=self.session.account_id,
+                         name=name, index=pos + 1, total=len(m.steps))
+
+        if t == "cmd":
+            for cmd in split_commands(substitute(step.get("command", ""), self.session.vars)):
+                self.session.send_auto(cmd)
+            self._goto(name, pos + 1)
+        elif t == "delay":
+            self._chain(name, int(step.get("ms") or step.get("delay_ms") or 500), pos + 1)
+        elif t == "label":
+            self._goto(name, pos + 1)
+        elif t == "jump":
+            self._jump(name, step, pos)
+        elif t == "if":
+            self._if(name, step, pos)
+        elif t == "status":
+            self._status(name, step, pos)
+        elif t == "input":
+            self._wait_input(name, step, pos)
+        elif t == "wait_input":
+            self._wait_input(name, step, pos)
+        elif t == "trigger":
+            self._wait_trigger(name, step, pos)
+        else:
+            self._goto(name, pos + 1)
+
+    def _wait_input(self, name: str, step: dict, pos: int) -> None:
+        """等待输入（B3b）：挂起宏，等待用户在输入框键入内容后继续。"""
+        self._waiting = (name, pos)  # 记录等待点与最后 pos
+        var = step.get("var") or "input"
+        prompt = step.get("prompt") or ""
+        timeout_s = int(step.get("timeout") or step.get("timeout_s") or 0)
+        self.bus.publish("macro.wait_input", account=self.session.account_id,
+                         name=name, var=var, prompt=prompt)
+        if timeout_s > 0:
+            self._wait_input_timer = QTimer(self)
+            self._wait_input_timer.setSingleShot(True)
+            self._wait_input_timer.timeout.connect(lambda: self._timeout_input(name, pos, var))
+            self._wait_input_timer.start(timeout_s * 1000)
+
+    def _timeout_input(self, name: str, pos: int, var: str) -> None:
+        """等待输入超时：变量保持未赋值，自动关闭继续向下。"""
+        self._wait_input_timer = None
+        if self._waiting == (name, pos):
+            self._waiting = None
+        if name in self._active:
+            self._goto(name, pos + 1)
+
+    def resume_input(self, text: str) -> None:
+        """输入框发送时调用：若宏正等待输入，将文本写入变量并继续。"""
+        if self._waiting is None:
+            return
+        name, pos = self._waiting
+        self._waiting = None
+        if self._wait_input_timer is not None:
+            self._wait_input_timer.stop()
+            self._wait_input_timer = None
+        m = self._active.get(name)
+        if not m or pos >= len(m.steps):
+            return
+        step = m.steps[pos]
+        self.session.vars[step.get("var") or "input"] = text
+        self._goto(name, pos + 1)
+
+    def _wait_trigger(self, name: str, step: dict, pos: int) -> None:
+        """触发器步骤（B3b ⑦）：阻塞等待服务器条件命中并捕获变量。
+
+        条件集 = conditions（B3 多条件，与/或）或旧单条件格式。
+        """
+        from xkxclient.automation.trigger import Trigger, TEMPLATE_VAR_RE
+
+        conds = step.get("conditions")
+        if conds:
+            conds = [dict(c) for c in conds]
+            mt = conds[0].get("match_type", "contains")
+            pat = conds[0].get("pattern", "")
+            relation = step.get("relation", "or")
+        else:
+            cond = step.get("condition") or {}
+            conds = [{"match_type": step.get("match_type") or cond.get("type") or "contains",
+                      "pattern": step.get("pattern") or cond.get("pattern") or ""}]
+            relation = "or"
+        timeout_s = int(step.get("timeout") or step.get("timeout_s") or 0)
+        self.bus.publish("macro.state", account=self.session.account_id,
+                         state="waiting_trigger", name=name)
+
+        def eval_line(line: str) -> list | None:
+            """按与/或评估条件集，返回捕获列表（None = 未命中）。"""
+            if relation == "and":
+                all_caps: list = []
+                for c in conds:
+                    caps = _match_trigger_cond(c, line)
+                    if caps is None:
+                        return None
+                    all_caps.extend(caps or [])
+                return all_caps
+            for c in conds:
+                caps = _match_trigger_cond(c, line)
+                if caps is not None:
+                    return caps or []
+            return None
+
+        def _match_trigger_cond(c: dict, line: str) -> list | None:
+            mtx = c.get("match_type", "contains")
+            if mtx == "status":
+                return [] if self._match_status_cond(c) else None
+            trg = Trigger("_c", match_type=mtx, pattern=c.get("pattern", ""))
+            if mtx == "contains":
+                return [] if trg.pattern in line else None
+            if mtx == "exact":
+                return [] if line == trg.pattern else None
+            if mtx == "regex":
+                try:
+                    m = re.search(trg.pattern, line)
+                except re.error:
+                    return None
+                return list(m.groups()) if m else None
+            if mtx == "template":
+                rx = trg.template_regex
+                if rx is None:
+                    return [] if trg.pattern in line else None
+                m = rx.search(line)
+                return list(m.groups()) if m else None
+            return None
+
+        def on_line(payload: dict) -> None:
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            line = payload.get("line") or ""
+            captures = eval_line(line)
+            if captures is None:
+                return
+            # 模板变量捕获（B3：命名/编号都支持）
+            names: list = []
+            for c in conds:
+                if c.get("match_type") == "template":
+                    tmp = Trigger("_t", match_type="template", pattern=c.get("pattern", ""))
+                    names.extend(getattr(tmp, "_names", []) or [])
+            for i, (var, _color) in enumerate(names):
+                g = captures[i] if i < len(captures) else ""
+                if var:
+                    self.session.vars[var] = g
+            if not names:
+                for i, cap in enumerate(captures or [], 1):
+                    self.session.vars[f"v{i:02d}"] = cap
+            self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
+            self._goto(name, pos + 1)
+
+        self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+        if timeout_s > 0:
+            self._trigger_timer = QTimer(self)
+            self._trigger_timer.setSingleShot(True)
+            self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos))
+            self._trigger_timer.start(timeout_s * 1000)
+
+    def _timeout_trigger(self, name: str, pos: int) -> None:
+        self._trigger_timer = None
+        if self._trigger_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._trigger_sub)
+            self._trigger_sub = None
+        if name in self._active:
+            self._goto(name, pos + 1)
+
+    def _halt(self, name: str) -> None:
+        self._active.pop(name, None)
+        self._pos.pop(name, None)
+        self._paused.discard(name)
+        self._timers.pop(name, None)
+        if self._waiting and self._waiting[0] == name:
+            self._waiting = None
+        self.bus.publish("macro.end", account=self.session.account_id, name=name)
+
+    def _chain(self, name: str, ms: int, next_pos: int) -> None:
+        tm = QTimer(self)
+        tm.setSingleShot(True)
+        tm.timeout.connect(lambda: self._goto(name, next_pos))
+        tm.start(ms)
+        self._timers[name] = tm
+
+    def _goto(self, name: str, target) -> None:
+        m = self._active.get(name)
+        if m and isinstance(target, str):
+            if target.isdigit():
+                # 步骤序号（1-based，来自 UI 下拉）→ 0-based 索引
+                target = max(0, int(target) - 1)
+            else:
+                target = m.labels.get(target, 0)
+        self._pos[name] = int(target)
+        self._step(name)
+
+    def _match(self, cond: dict) -> bool:
+        ctype = cond.get("type") or cond.get("match_type")  # 兼容跳转(type) 与 判断条件列表(match_type)
+        var = cond.get("var", "")
+        if ctype in ("jump", "wait", "loop"):
+            ok = self._last_line_has(cond.get("pattern", ""))
+        elif ctype == "contains":
+            ok = cond.get("pattern", "") in getattr(self.session, "last_line", "")
+        elif ctype == "regex":
+            ok = self._last_line_has(cond.get("pattern", ""))
+        elif ctype == "cmp":
+            key = var.strip().strip("{}")
+            ok = self._cmp(str(self.session.vars.get(key, "")),
+                           cond.get("op", "="), str(cond.get("value", "")))
+        elif ctype == "status":
+            ok = self._match_status_cond(cond)
+        elif ctype == "true":
+            ok = bool(self.session.vars.get(var))
+        elif ctype == "not":
+            ok = not bool(self.session.vars.get(var))
+        elif ctype == "equals":
+            ok = str(self.session.vars.get(var)) == str(cond.get("value"))
+        else:
+            ok = False
+        return (not ok) if cond.get("negate") else ok
+
+    @staticmethod
+    def _cmp(a: str, op: str, b: str) -> bool:
+        try:
+            fa, fb = float(a), float(b)
+        except ValueError:
+            fa = fb = None
+        if fa is not None:
+            if op == ">":
+                return fa > fb
+            if op == "<":
+                return fa < fb
+            if op == "!=":
+                return fa != fb
+            return fa == fb
+        if op == ">":
+            return a > b
+        if op == "<":
+            return a < b
+        if op == "!=":
+            return a != b
+        return a == b
+
+    def _jump(self, name: str, step: dict, pos: int) -> None:
+        cond = step.get("condition")
+        # 无条件跳转：无 condition 时直接跳转 then
+        ok = self._match(cond) if cond else True
+        if ok:
+            target = step.get("then")
+            if target is None:
+                target = step.get("next") or (pos + 1)
+            self._goto(name, target)
+        else:
+            self._goto(name, step.get("else") if step.get("else") is not None else pos + 1)
+
+    def _if(self, name: str, step: dict, pos: int) -> None:
+        # 多条件（B3b ⑤）：conditions 列表按 relation(与/或) 评估；单 condition 兼容旧数据
+        conds = step.get("conditions")
+        if conds:
+            relation = step.get("relation", "or")
+            if relation == "and":
+                ok = all(self._match(c) for c in conds)
+            else:
+                ok = any(self._match(c) for c in conds)
+        else:
+            ok = self._match(step.get("condition", {}))
+        branch = step.get("then") if ok else (step.get("else") if step.get("else") is not None else None)
+        self._goto_branch(name, pos, branch)
+
+    def _goto_branch(self, name: str, pos: int, branch) -> None:
+        """执行判断/状态分支：可选动作（cmd/set）+ 去向（标签/序号），缺省继续下一行。"""
+        if branch is None:
+            self._goto(name, pos + 1)
+            return
+        if isinstance(branch, dict):
+            target = branch.get("target")
+            action = branch.get("action")
+            if action:
+                self._exec_action(action)
+        else:
+            target = branch
+        if target in (None, ""):
+            target = pos + 1
+        self._goto(name, target)
+
+    def _status(self, name: str, step: dict, pos: int) -> None:
+        """状态步骤（B3b 新增 ⑧）：判断 GMCP 状态属性是否满足比较条件。
+
+        属性来自 session.state（气血/内力/精神/精力/食物/饮水/等级/经验/战意/真气/真元…）。
+        条件形如 `attr op value`（value 可含 {变量}）；满足走 then 分支，否则走 else 分支。
+        """
+        attr = step.get("attr") or "qi"
+        op = step.get("op") or "="
+        value = substitute(str(step.get("value") or ""), self.session.vars)
+        current = getattr(self.session.state, attr, None)
+        ok = self._cmp_state(current, op, value)
+        branch = step.get("then") if ok else (step.get("else") if step.get("else") is not None else None)
+        self._goto_branch(name, pos, branch)
+
+    def _cmp_state(self, current, op: str, value: str) -> bool:
+        """状态值与比较值比较：优先数值，失败退化字符串。支持 =/≠/>/</≥/≤。"""
+        if current is None:
+            return False
+        try:
+            cv, vv = float(current), float(value)
+        except (TypeError, ValueError):
+            cv, vv = str(current), str(value)
+            if op in (">", "<", ">=", "<="):
+                return False
+            return (cv == vv) if op == "=" else (cv != vv)
+        if op == ">":
+            return cv > vv
+        if op == "<":
+            return cv < vv
+        if op == ">=":
+            return cv >= vv
+        if op == "<=":
+            return cv <= vv
+        if op == "!=":
+            return cv != vv
+        return cv == vv
+
+    def _match_status_cond(self, c: dict) -> bool:
+        """状态比较条件（触发器步骤/判断步骤的 status 条件）：读 session.state 属性比较。"""
+        attr = c.get("attr") or "qi"
+        op = c.get("op") or "="
+        value = substitute(str(c.get("value") or ""), self.session.vars)
+        current = getattr(self.session.state, attr, None)
+        return self._cmp_state(current, op, value)
+
+    def _exec_action(self, action: dict) -> None:
+        """判断分支动作：发送命令 / 变量赋值（B3b ⑤）。"""
+        t = action.get("type")
+        if t == "cmd":
+            for cmd in split_commands(substitute(action.get("command", ""), self.session.vars)):
+                self.session.send_auto(cmd)
+        elif t == "set":
+            var = action.get("var", "")
+            val = action.get("value", "")
+            if var:
+                self.session.vars[var] = substitute(val, self.session.vars)
+
+    def _last_line_has(self, pattern: str) -> bool:
+        line = getattr(self.session, "last_line", "")
+        try:
+            return re.search(pattern, line) is not None
+        except re.error:
+            return False
