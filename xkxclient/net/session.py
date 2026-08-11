@@ -12,6 +12,8 @@ from xkxclient.core.dsl import DslEngine
 from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.history import HistoryStore
 from xkxclient.core.map import MapCache
+from xkxclient.core.skills import _GROUP_RE as _SKILL_GROUP_RE
+from xkxclient.core.skills import _SKILL_ROW_RE as _SKILL_ROW_RE
 from xkxclient.core.state import CharacterState
 from xkxclient.net.connection import Connection
 from xkxclient.parse.look import LookParser
@@ -24,6 +26,29 @@ _BUF_PROMPTS = ("命令进入缓冲", "命令缓冲", "指令进入缓冲")
 # node 表格框线字符：捕获期间仅抑制含这些字符的行，其余信息照常上屏
 _NODE_BOX_CHARS = "│┌┐└┘├┤─"
 _NODE_EMPTY_MSG = "这里没有玩家定义的路径"
+# node 数据行兜底：`[│|]?[★☆]?ASCII名称│`（表头页丢失时也能进表）
+_NODE_ROW_RE = re.compile(r"^\s*[│|]?\s*[★☆]?\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[│|]")
+# node 表格分页自动继续（持续看门狗）。服务器每页约 40 行内容 + 一条
+# 「==未完继续==」提示行（晚约 1s 发送，且不占页）。正常流程由 `_is_pager`
+# 识别提示行翻页；但提示行可能漏识别/迟到，且各页内容行数并不总是对齐 40，
+# 旧的「行数>=40 才启动 1.5s 兜底」会在错误时机抢发空指令、被迟到的提示行
+# 吞掉，导致服务器分页一直停在等待输入、屏幕冻结。改为持续看门狗：
+#   进表即启动；每次收到表格行/提示行都刷新时间戳并重排定时器；
+#   超过 _NODE_PAGE_GAP 秒没有表格活动 → 判定服务器等翻页输入 → 自动补发
+#   空指令；翻页生效收到新行后复位；多次补发仍无进展则停止探测。
+_NODE_PAGE_GAP = 2.0          # 表格停摆多少秒判定为等待分页输入（>提示行 ~1s 延迟）
+_NODE_PAGE_RETRY_MAX = 4      # 单次停摆最多补发几次空指令，之后静默等超时收尾
+# 自动翻页后：连续收到这么多非表格行 ⇒ 判定 node 已无数据，关闭捕获。
+_NODE_STRAY_MAX = 2
+
+# 通用分页看门狗（非 node 命令，如 help list）：一旦识别到 `== 未完继续 ==`
+# 提示行即进入分页会话，此后内容/提示行停摆超过 _PAGER_GAP 秒仍无进展 →
+# 判定服务器分页在等输入，自动补发翻页；补发仍无进展则按上限重试后放弃。
+# 结束条件：裸 `> ` 提示行（服务器已回到正常命令环）、用户新发命令、或重试封顶。
+# 间隔取 1.5s：大于提示行晚于页内容 ~1s 的典型延迟（正常流程不会误触），
+# 又足够快地兜住「首次回车未生效」的情况（实测 help list 即需补发）。
+_PAGER_GAP = 1.5
+_PAGER_RETRY_MAX = 4
 
 DEFAULT_PROMPTS = {
     "encoding": ("Input 1 for GBK", "Input 1 for UTF8", "编码已改为"),
@@ -100,6 +125,25 @@ class AccountSession(QObject):
         self._node_capture = False
         self._node_capture_start = 0.0
         self._node_in_table = False
+        # 分页自动继续（持续看门狗，见 _NODE_PAGE_GAP）
+        self._node_page_lines = 0      # 表内累计行数（数据行+分隔线）
+        self._node_page_sent = False   # 当前页是否已发过自动翻页
+        self._node_stray = 0           # 自动翻页后的连续杂行计数
+        self._node_page_last_active = 0.0   # 上次表格/提示行活动时间（monotonic）
+        self._node_page_retries = 0         # 当前停摆已补发空指令次数
+        self._node_page_timer = QTimer(self)
+        self._node_page_timer.setSingleShot(True)
+        self._node_page_timer.setInterval(int(_NODE_PAGE_GAP * 1000))
+        self._node_page_timer.timeout.connect(self._node_page_fallback)
+
+        # 通用分页会话（持续看门狗，见 _PAGER_GAP）
+        self._pager_pending = False      # 通用分页会话进行中（已识别过提示行）
+        self._pager_last = 0.0           # 上次会话活动时间（monotonic）
+        self._pager_retries = 0          # 当前停摆已补发次数
+        self._pager_timer = QTimer(self)
+        self._pager_timer.setSingleShot(True)
+        self._pager_timer.setInterval(int(_PAGER_GAP * 1000))
+        self._pager_timer.timeout.connect(self._pager_fallback)
 
         # 频道开关（B5e 持久化：config "channels"）
         self._channels: dict[str, bool] = dict(ConfigManager.instance().get("channels") or {})
@@ -164,6 +208,8 @@ class AccountSession(QObject):
         self.logged_in = False
         self._node_capture = False
         self._node_in_table = False
+        self._node_page_stop()
+        self._pager_close()
         self._macro_captcha_active = False
         if self._login is not None:
             self._login.dispose()
@@ -201,6 +247,7 @@ class AccountSession(QObject):
 
     def send(self, text: str) -> None:
         self._last_sent = text
+        self._pager_close()  # 用户新发命令：通用分页会话到此结束
         # B3b 宏录制：录制用户从命令框/快捷动作/移动控制发出的手动命令
         if self._macro_recording and self._macro_recorder is not None:
             self._macro_recorder(text)
@@ -255,20 +302,63 @@ class AccountSession(QObject):
             self._login.on_line(text)
         if self.logged_in:
             fired = self.triggers.handle_line(text)
-            if self._is_pager(text):
-                # 翻页提示行：发空指令继续下一页，本行不上屏（含聊天栏/主输出）
-                self._pager_continue()
-            elif self._consume_node_line(text):
-                # node 表格行：不上主输出（已由 dock 订阅 net.text_display 解析）
-                pass
-            else:
+            if not self._consume_line(text):
                 self._route_line(text, spans, bool(fired))
         else:
             self.line_displayed.emit(spans, False)
+        # 旁路解析（不阻塞主输出）：缓冲区告警 / look 捕获 / fullme 链接
         self._maybe_buffer_warning(text)
-        self._maybe_cap_skills(text)
         self._maybe_cap_look(text)
         self._maybe_fullme(text)
+
+    def _consume_line(self, text: str) -> bool:
+        """统一消费层：判断本行是否被客户端静默消费（不进主输出）。
+
+        数据流模型：服务器返回是一批连续数据，命令边界才可能穿插其他消息。
+        因此每个「静默消费器」都以命令触发开启、以该命令的特征收尾（表尾框线/页尾
+        提示）关闭，且只在该命令的捕获窗口内吞行，窗口外一行都不吞、一律照常上屏。
+
+        优先级：翻页提示 > 裸 `>` 提示回显 > node 表格 > skills 表格。命中
+        任意一项即返回 True，未命中返回 False，由调用方走正常路由上屏。
+        """
+        if self._is_pager(text):
+            self._on_pager_line()
+            return True
+        if self._PROMPT_ECHO_RE.match(text):
+            # 裸 `>` 提示行：回显噪声，静默吞掉；分页会话在此回到正常命令环
+            self._pager_close()
+            return True
+        if self._consume_node_line(text):
+            return True
+        if self._consume_skills_line(text):
+            return True
+        if self._pager_pending:
+            # 通用分页会话进行中：任何普通内容都算分页活动，刷新看门狗基线
+            self._pager_last = time.monotonic()
+            self._pager_timer.start()
+        return False
+
+    def _on_pager_line(self) -> None:
+        """命中页尾提示行进处理。
+
+        node 表格在捕获中且等待表格数据时，分页提示行晚于表格内容 ~1s 到达，
+        属于表格活动：刷新看门狗基线后发空指令翻页。若看门狗/上一提示行已为
+        本章节补发过（_node_page_sent=True），迟到的提示行只吞不发，避免重复
+        空指令跳页；但保留看门狗继续运行——补发万一被服务器吞掉、下一页内容
+        始终不来时，看门狗会再次补发。
+        """
+        if self._node_capture and self._node_in_table:
+            self._node_page_touch()
+            if self._node_page_sent:
+                # 看门狗/提示行已补发过本章节，迟到的提示行只吞不发
+                return
+            self._pager_continue()
+            self._node_page_sent = True        # 已为本章节发过自动翻页
+            self._node_page_lines = 0          # 正常章节已翻页，行数从零累计下一页
+            self._node_stray = 0
+            return
+        self._pager_arm()
+        self._pager_continue()
 
         # ---- node 命令捕获：表格行拦截，不上主输出 ----
     def request_node(self) -> None:
@@ -278,43 +368,128 @@ class AccountSession(QObject):
         self._node_capture = True
         self._node_in_table = False
         self._node_capture_start = time.time()
+        self._node_page_stop()
         self.connection.send_line("node")
 
     def _consume_node_line(self, text: str) -> bool:
         """捕获期间抑制 node 表格行，返回 True 表示本行不上主输出。
 
-        状态机：只有确认已进入表格（表头 `名称/目的地` 或顶框线 `┌`）才开始吞行；
-        未进表格的普通文本（闲聊、`这里没有玩家定义的路径` 提示等）一律照常上屏。
-        - 表格内：仅吞框线字符行；表格内夹杂的无框线文本也照常上屏
-        - 页尾框线 `└…┘` 到达即结束捕获；空路径提示行到达也结束捕获（照常上屏）
-        - 5s 超时兜底：异常中断时自动关闭捕获，避免长期拦截
+        状态机（按真实 node 表格格式）：
+        - 表头/顶框线确认进入表格：含 `│` 且 `名称/目的地`，或以 `┌` 开头含 `─`；
+          数据行兜底：表头页丢失时，首列 `[★☆]?ASCII名称│` 也能进表
+        - 表格内：仅吞含竖线 `│` 的数据行、框线连接符（├┤┼┬┴）的行、表尾 `└…─…┘`
+        - 表尾框线到达即结束捕获；空路径提示行到达也结束（照常上屏）
+        - 未进表的普通文本不吞也不关闭捕获（避免漏掉后续表格）；
+        - 进表后绝不因超时关闭：分页间隙（手动翻页等待/服务器慢）长短不影响捕获，
+          只有表尾或空路径才结束。等待表头阶段保留短超时兜底。
         """
         if not self._node_capture:
             return False
-        if time.time() - self._node_capture_start > 5.0:
+        has_vbar = "│" in text or "|" in text
+        frame = any(ch in text for ch in "├┤┼┬┴")
+        if not self._node_in_table and time.time() - self._node_capture_start > 5.0:
+            # 等表头超过 5s：直接关闭，不再等（进表后此分支不再生效）
             self._node_capture = False
             self._node_in_table = False
             return False
         if _NODE_EMPTY_MSG in text:
-            # 空路径：非表格信息，照常上屏，但捕获到此结束
+            # 空路径：捕获到此结束并静默（不上主输出）
+            self._node_page_stop()
             self._node_capture = False
             self._node_in_table = False
-            return False
-        has_box = any(ch in text for ch in _NODE_BOX_CHARS)
+            return True
+        has_vbar = "│" in text or "|" in text
+        frame = any(ch in text for ch in "├┤┼┬┴")
         if not self._node_in_table:
-            # 确认进入表格：表头（名称/目的地）或顶框线 `┌` 行
-            if ("名称" in text and "目的地" in text) or ("┌" in text and "─" in text):
+            # 确认进入表格：含竖线的表头（名称/目的地）或顶框线 `┌…─` 行。
+            # 兜底：表头页丢失（分页交互/首段被吞）时，数据行本身也能进表
+            # —— 首列 `[★☆]?ASCII名称` 后跟竖线即判定为 node 数据行。
+            if (has_vbar and "名称" in text and "目的地" in text) or \
+               (text.startswith("┌") and "─" in text) or \
+               (_NODE_ROW_RE.match(text) is not None):
                 self._node_in_table = True
+                self._node_page_lines = 1   # 进表首行计入服务器分的页行数
+                self._node_page_touch()     # 进表即启动持续看门狗
                 return True
-            return False  # 未进表格：不拦截，照常上屏
-        # 已在表格内：仅吞框线行
-        if not has_box:
-            return False
-        if "└" in text:
-            # 表尾框线：本行也是表格内容，吞掉并结束捕获
+            return False  # 未进表：不吞，继续等表头（超时兜底）
+# 已在表格内：仅吞表格结构行
+        if "└" in text and "─" in text:
+            # 表尾框线行：吞掉并结束捕获，重置分页状态
+            self._node_page_stop()
             self._node_capture = False
             self._node_in_table = False
-        return True
+            return True
+        if has_vbar or frame:
+            # 吞入表格结构行并累计行数
+            self._node_page_lines += 1
+            self._node_stray = 0
+            if self._node_page_sent:
+                # 自动翻页已发过、现在又收到表格行：翻页生效，重新累计下一页
+                # 行数并复位重试计数（支持多页连续翻）
+                self._node_page_lines = 1
+                self._node_page_sent = False
+                self._node_page_retries = 0
+            # 有表格活动：刷新停摆基线，重置看门狗窗口
+            self._node_page_touch()
+            return True   # 数据行 / 水平分隔线
+        # 表格内普通文本：仅在自动翻页后按杂行计数，连续 _NODE_STRAY_MAX
+        # 行无表格内容 ⇒ 判定 node 已无数据，关闭捕获；否则照常上屏
+        if self._node_page_sent:
+            self._node_stray += 1
+            if self._node_stray >= _NODE_STRAY_MAX:
+                self._node_page_stop()
+                self._node_capture = False
+                self._node_in_table = False
+        return False      # 普通文本照常上屏
+
+    def _node_page_touch(self) -> None:
+        """表格/提示行活动到达：刷新停摆基线并重置看门狗窗口。
+
+        看门狗语义：停摆 = 自最后一次活动起 _NODE_PAGE_GAP 秒无表格内容。
+        每次活动都重新计时，因此持续的表格流永远不会触发翻页；只有表格
+        真正停摆（服务器在等待分页输入）才会补发。"""
+        self._node_page_last_active = time.monotonic()
+        self._node_page_timer.start()
+
+    def _node_page_stop(self) -> None:
+        """重置 node 分页看门狗状态（表尾/关闭/断线时统一调用）。"""
+        self._node_page_timer.stop()
+        self._node_page_lines = 0
+        self._node_page_sent = False
+        self._node_stray = 0
+        self._node_page_last_active = 0.0
+        self._node_page_retries = 0
+
+    def _node_page_fallback(self) -> None:
+        """持续看门狗（_NODE_PAGE_GAP）。表格在停摆 GAP 秒后仍无新内容且
+        未到表尾 → 判定服务器分页停在等待输入（提示行缺失/未识别/补发被
+        吞），静默补发空指令翻页。补发后仍无进展则按 _NODE_PAGE_RETRY_MAX
+        重试，超过上限静默放弃，交给 navdock 捕获超时收尾。
+        """
+        if not (self._node_capture and self._node_in_table):
+            return
+        now = time.monotonic()
+        if now - self._node_page_last_active < _NODE_PAGE_GAP:
+            # 已有活动刷新过基线：本次触发无效，重新计时继续观察
+            self._node_page_timer.start()
+            return
+        if self._node_page_sent and self._node_page_retries >= _NODE_PAGE_RETRY_MAX:
+            # 已多次补发仍无进展：停止探测，等 navdock 捕获超时收尾
+            return
+        self._node_page_sent = True
+        self._node_page_retries += 1
+        self._node_page_last_active = now
+        self._pager_continue()
+        self._node_page_timer.start()
+
+    def abort_node_capture(self) -> None:
+        """外部（navdock 捕获超时）强制中止 node 捕获：停止吞行与看门狗，
+        避免服务器分页卡死时主输出被长期抑制。"""
+        if not self._node_capture:
+            return
+        self._node_capture = False
+        self._node_in_table = False
+        self._node_page_stop()
 
     def _route_line(self, text: str, spans: list, highlight: bool = False) -> None:
         """频道分流（B5e）：【频道】行进聊天栏（富文本），永不回主输出；说道等对话直接进主屏。"""
@@ -345,28 +520,81 @@ class AccountSession(QObject):
             self.throttle.on_buffer_warning()
 
     # ---- 分页翻页 ----
-    # 精确匹配整行：`== 未完继续 40% == (q 离开，b 前一页，其他继续下一页)`
-    # 只识别完整页尾提示，避免误过滤普通文本。数字可带小数（如 34.5%）。
+    # 识别页尾提示：放宽锚定覆盖常见分页提示变体——
+    #   `== 未完继续 40% == (...)` / `==未完继续==` / `未完 N%` / `未完（回车…`
+    #   `回车继续` / `继续下一页` / `q 离开`（“未完”后非「继续/%/括号」不命中，
+    #   如“故事未完待续”不上钩；普通对话文本几乎不含这些组合）。
     _PAGER_RE = re.compile(
-        r"^\s*==\s*未完继续\s*\d+(?:\.\d+)?\s*%\s*==\s*"
-        r"\(q\s*离开[，,]?\s*b\s*前一页[，,]?\s*其他继续下一页\)\s*$"
+        r"未完(?:继续|(?:\s*\d*(?:\.\d+)?\s*%|\s*[（(]))"
+        r"|回车继续|继续下一页|q\s*离开"
     )
+    # 裸 `>` 提示行（MudOS 命令提示/分页结束后回提示的回显）。分页自动翻页与
+    # 各类静默命令结束后都会回显这类行，属提示噪声，静默吞掉保持界面整洁。
+    _PROMPT_ECHO_RE = re.compile(r"^\s*>\s*$")
     _PAGER_AUTO = True
     _PAGER_LAST_SEND = 0.0
 
     def _is_pager(self, text: str) -> bool:
-        """页尾提示识别：完整匹配「== 未完继续 N% == (q 离开，b 前一页，其他继续下一页)」。"""
+        """页尾提示识别：行内含「未完继续 + %」即认为分页，自动发空行继续。"""
         if not self.logged_in or not self._PAGER_AUTO:
             return False
-        return self._PAGER_RE.match(text) is not None
+        return self._PAGER_RE.search(text) is not None
 
     def _pager_continue(self) -> None:
-        """命中翻页提示：发空指令（回车）继续下一页。限频防刷屏。"""
+        """命中翻页提示：发空命令（回车）继续下一页。限频防刷屏。
+
+        B5-3 设计即「自动发送空命令继续翻页」（回车=空命令=「其他继续下一页」），
+        node 分页器实测同样接受回车空命令；空命令对各类分页器兼容性最好。
+        注意：不在此处重置 node 分页状态——`_node_page_sent` 由
+        `_on_pager_line` / 看门狗 `_node_page_fallback` 置位，迟到提示
+        行到来时在 `_on_pager_line` 消费（防重复翻页）。
+        """
         now = time.time()
         if now - self._PAGER_LAST_SEND < 0.12:
             return
         self._PAGER_LAST_SEND = now
         self.connection.send_line("")
+        # 分页间隙不打断进行中的 node/look 捕获（换页未到表尾，续命等待后续表格行）
+        if self._node_capture and self._node_in_table:
+            self._node_capture_start = now
+
+    def _pager_arm(self) -> None:
+        """识别到页尾提示行：进入（或续命）通用分页会话并启动看门狗。"""
+        self._pager_pending = True
+        self._pager_retries = 0
+        self._pager_last = time.monotonic()
+        self._pager_timer.start()
+
+    def _pager_close(self) -> None:
+        """分页会话结束（回到裸 `>` 提示 / 用户新发命令 / 重试封顶）。"""
+        self._pager_pending = False
+        self._pager_retries = 0
+        self._pager_timer.stop()
+
+    def _pager_fallback(self) -> None:
+        """通用分页看门狗（_PAGER_GAP）。分页会话内容停摆 GAP 秒仍无进展 →
+        判定服务器分页在等输入（提示行缺失/未识别/翻页键未被接受），补发空格；
+        补发仍无进展则按 _PAGER_RETRY_MAX 重试，超上限静默放弃。
+        node 捕获期间不干预——node 有自己的分页看门狗。
+        """
+        if not self._pager_pending:
+            return
+        if self._node_capture:
+            self._pager_last = time.monotonic()
+            self._pager_timer.start()
+            return
+        now = time.monotonic()
+        if now - self._pager_last < _PAGER_GAP:
+            # 已有活动刷新过基线：继续观察
+            self._pager_timer.start()
+            return
+        if self._pager_retries >= _PAGER_RETRY_MAX:
+            self._pager_close()
+            return
+        self._pager_retries += 1
+        self._pager_last = now
+        self._pager_continue()
+        self._pager_timer.start()
 
     def _maybe_fullme(self, text: str) -> None:
         # 宏验证码步骤期间：fullme 链接由宏引擎消费，避免再弹普通 fullme 窗
@@ -401,7 +629,9 @@ class AccountSession(QObject):
         if "MXP" in text:
             return
         self._look_buf += text + "\n"
-        if ("出口是" in text) or ("这里是" in text and len(self._look_buf) > 40) or (not text and len(self._look_buf) > 20):
+        if ("出口有" in text or "出口是" in text or "方向有" in text or "方向是" in text) \
+           or ("这里是" in text and len(self._look_buf) > 40) \
+           or (not text and len(self._look_buf) > 20):
             self._capture_look = False
             buf = self._look_buf
             self._look_buf = ""
@@ -423,17 +653,39 @@ class AccountSession(QObject):
             self.app.bus.publish("state.room", account=self.account_id,
                                  name=self.room_name, exits=self.exits)
 
-    def _maybe_cap_skills(self, text: str) -> None:
-        if self._capture_skills:
-            self._skills_buf += text + "\n"
-            if "技能槽" in text or "空余" in text:
-                self._capture_skills = False
-                if self.skills_dock is not None:
-                    self.skills_dock.on_skills(self._skills_buf)
-                self._skills_buf = ""
+    def _consume_skills_line(self, text: str) -> bool:
+        """技能表格捕获（进面板），不吞屏：skills 表照常上主输出，面板仅旁路解析。
+
+        以 `send_skills` 开启，以技能槽摘要行 / 表尾框线 `└` / 8s 超时结束。
+        只累积「像技能表格」的行（框线/分隔符/技能行/技能槽行），
+        人物名、门派、等级等普通文本即使混入也不会污染技能面板。
+        """
+        if not self._capture_skills:
+            return False
+        if not self._is_skill_table_line(text):
+            return False
+        self._skills_buf += text + "\n"
+        if ("技能槽" in text or "空余" in text) or \
+           (self._skills_started and time.time() - self._skills_started > 8.0) or \
+           ("└" in text or "┘" in text):
+            self._capture_skills = False
+            if self.skills_dock is not None:
+                self.skills_dock.on_skills(self._skills_buf)
+            self._skills_buf = ""
+        return False  # 技能表照常上屏，仅静默喂给面板
+
+    _SKILL_TABLE_HINT = ("│", "丨", "|", "┌", "┐", "├", "┤", "└", "┘", "─")
+
+    def _is_skill_table_line(self, text: str) -> bool:
+        """技能输出大多数行带框线/分隔符；表头/分组行也用框线，技能槽摘要行含「技能槽/空余」。
+        只有这类行才进入技能捕获缓冲，其他文本（人物名/门派/等级等）一律丢弃。"""
+        if "技能槽" in text or "空余" in text:
+            return True
+        return any(ch in text for ch in self._SKILL_TABLE_HINT)
 
     def send_skills(self) -> None:
         self._capture_skills = True
+        self._skills_started = time.time()
         self._skills_buf = ""
         self.connection.send_line("skills")
 
@@ -441,6 +693,21 @@ class AccountSession(QObject):
         self.connection.send_line("look")
         self._capture_look = True
         self._look_buf = ""
+
+    def cn_name(self) -> str:
+        """玩家中文名：优先账号配置持久化的 cn_name（登录时 GMCP.Status 首条真实身份），
+        其次 state.name（id 不含 `#` 时才存到），保证不被战斗敌名污染。"""
+        try:
+            accs = ConfigManager.instance().accounts()
+            data = accs.get(self.account_id)
+            if isinstance(data, dict):
+                cn = data.get("cn_name")
+                if cn:
+                    return str(cn)
+        except Exception:
+            pass
+        name = getattr(self.state, "name", "")
+        return name or ""
 
     def _backfill_account(self) -> None:
         """D1 登录后信息回填：GMCP Status 的 中文名/门派/级别/头衔 写回账号持久化。

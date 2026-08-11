@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .navdock import FlowLayout
+
 # B9 预设快捷动作
 _QUICK_PRESETS = [
     ("详情", "score"), ("技能", "skills"), ("状态", "hp"),
@@ -252,6 +254,20 @@ class MoveControlDock(QWidget):
             self._btns[name] = btn
             row2.addWidget(btn)
         lay.addLayout(row2)
+
+        # 出口编号按钮：1-10，对应房间出口顺序（简写显示，点击发送完整出口名）
+        self._num_btns: list[QPushButton] = []
+        num_lay = FlowLayout(hspacing=4, vspacing=4)
+        for i in range(1, 11):
+            btn = QPushButton(str(i))
+            btn.setProperty("numBtn", True)
+            btn.setFixedSize(26, 26)
+            btn.setToolTip(f"第 {i} 个出口")
+            btn.clicked.connect(lambda _=False, idx=i - 1: self._move_num(idx))
+            self._num_btns.append(btn)
+            num_lay.addWidget(btn)
+        lay.addLayout(num_lay)
+
         lay.addStretch(1)
         self._cur_exits: list[str] = []
         self._btn_exit: dict[str, str] = {}
@@ -271,6 +287,11 @@ class MoveControlDock(QWidget):
         else:
             self.session.send(d)
 
+    def _move_num(self, idx: int) -> None:
+        if self.session is None:
+            return
+        self.session.send(str(idx + 1))
+
     def set_exits(self, exits: list[str]) -> None:
         self._cur_exits = list(exits or [])
         self._btn_exit = {}
@@ -281,6 +302,9 @@ class MoveControlDock(QWidget):
                 self._btn_exit.setdefault(short, full)
         for name, btn in self._btns.items():
             btn.setEnabled(name in avail)
+        n = min(len(self._cur_exits), 10)
+        for i, btn in enumerate(self._num_btns):
+            btn.setEnabled(str(i + 1) in self._cur_exits)
 
 
 class MacroControlDock(QWidget):

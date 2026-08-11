@@ -129,7 +129,7 @@ class NavDock(QWidget):
         self._idle_timer.timeout.connect(lambda: self._fetch_node_list(auto=True))
         self._cap_timer = QTimer(self)
         self._cap_timer.setSingleShot(True)
-        self._cap_timer.setInterval(6000)
+        self._cap_timer.setInterval(20000)
         self._cap_timer.timeout.connect(self._capture_timeout)
 
         self.exits_box = QWidget()
@@ -165,7 +165,7 @@ class NavDock(QWidget):
         header = self.dest_list.header()
         if isinstance(header, QHeaderView):
             header.setStretchLastSection(True)
-        self.dest_list.itemDoubleClicked.connect(lambda _i, _c: self._send_node_walk())
+        self.dest_list.itemDoubleClicked.connect(lambda item, _c: self._send_node_walk(item))
         self.stop_btn = QPushButton("■ 停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop)
@@ -360,6 +360,7 @@ class NavDock(QWidget):
 
     # ---- 目的地：服务器 node 命令列表 ----
     _NODE_NAME_RE = re.compile(r"^\s*[★☆]?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*$")
+    _NODE_ROW_RE = re.compile(r"^\s*[│|]?\s*[★☆]?\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[│|]")
 
     def _fetch_node_list(self, auto: bool = False) -> None:
         """发送 `node` 开始捕获玩家路径表格（session 拦截表格行不上主输出）。
@@ -400,11 +401,14 @@ class NavDock(QWidget):
         return False
 
     def _capture_timeout(self) -> None:
-        """捕获超时兜底：结束捕获，避免卡在捕获态。"""
+        """捕获超时兜底：结束捕获，避免卡在捕获态；同时通知会话停止吞行。"""
         if self._capturing:
             self._capturing = False
             self._seen_header = False
             self._cap_timer.stop()
+            s = self.session
+            if s is not None:
+                s.abort_node_capture()
             self.status.setText(f"node 读取超时（已获 {len(self._node_rows)} 条）")
 
     def _on_text(self, payload: dict) -> None:
@@ -418,26 +422,34 @@ class NavDock(QWidget):
     def _feed_node_line(self, line: str) -> None:
         """解析 node 表格行（如 `│★ cj_yz  │扬州的中央广场  │...│`）。
 
-        捕获起点：首行表头 `│名称  │目的地…`；清除起点：表尾 `└─…─┘` 行。
+        捕获起点：首行表头 `│名称  │目的地…`；清除起点：表尾 `└─…─┘` 行，
+        或空路径提示「这里没有玩家定义的路径」。
+        未见表头前：遇到普通消息行（世界/频道/临时讯息，无框线）只忽略，
+        绝不终止捕获——否则 node 表格前的任何一条闲杂文本都会让整张表漏抓。
         """
         if not line.strip():
             return
         has_box = any(ch in line for ch in "│┌┐└┘├┤─")
-        if self._seen_header is False:
-            if not has_box:
-                # 空路径提示（无框线）或完全不是表格：终止捕获
-                self._capturing = False
-                self._cap_timer.stop()
-                self.status.setText(
-                    "当前房间没有玩家定义的路径" if "这里没有玩家定义的路径" in line
-                    else "node 列表为空或不可用"
-                )
-                return
-            if "名称" not in line or "目的地" not in line:
-                # 起始框线/空行，继续等表头
-                return
-            self._seen_header = True
+        # 分页提示行（`== 未完继续 X% ==`）：到达即续命超时，等下一页数据
+        if "未完继续" in line and "%" in line:
+            self._cap_timer.start()
             return
+        if "这里没有玩家定义的路径" in line:
+            # 空路径提示：无框线、明确无表格，终止捕获
+            self._capturing = False
+            self._seen_header = False
+            self._cap_timer.stop()
+            self.status.setText("当前房间没有玩家定义的路径")
+            return
+        if self._seen_header is False:
+            # 表头行或数据行兜底：表头页丢失（分页交互吞掉）时，首列
+            # `[★☆]?ASCII名称│` 的数据行本身也能确认表格并开始解析。
+            if has_box and "名称" in line and "目的地" in line:
+                self._seen_header = True
+            elif self._NODE_ROW_RE.match(line) is not None:
+                self._seen_header = True
+            else:
+                return  # 未见表头：框线/表头/闲杂行一律忽略，继续等待表头
         if "└" in line and "─" in line:
             # 表尾框线，本次捕获结束
             self._capturing = False
@@ -461,15 +473,19 @@ class NavDock(QWidget):
         self._node_rows.append((name, dest))
         item = QTreeWidgetItem([name, dest])
         self.dest_list.addTopLevelItem(item)
+        self._cap_timer.start()  # 分页活动期续命：每次都重置超时，防止长表格中途被误杀
 
-    def _send_node_walk(self) -> None:
-        """发送 `node walk <名称>`：取选中行名，否则用输入框文本。"""
+    def _send_node_walk(self, item=None) -> None:
+        """发送 `node walk <名称>`：优先双击 item，否则用选中行，否则输入框文本。"""
         if self.session is None:
             return
         target = ""
-        items = self.dest_list.selectedItems()
-        if items:
-            target = items[0].text(0)
+        if item is not None:
+            target = item.text(0)
+        if not target:
+            items = self.dest_list.selectedItems()
+            if items:
+                target = items[0].text(0)
         if not target:
             target = self.dest_ed.text().strip()
         if not target:

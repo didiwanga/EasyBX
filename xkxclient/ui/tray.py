@@ -41,7 +41,11 @@ class AppTray(QSystemTrayIcon):
             self._restore()
 
     def _quit(self) -> None:
-        self.main.app.shutdown()
+        # 与窗口关闭一致：弹「正在关闭」进度窗（shutdown 会阻塞最多 3s 优雅登出）
+        if hasattr(self.main, "_show_shutdown_progress"):
+            self.main._show_shutdown_progress()
+        else:
+            self.main.app.shutdown()
         self.main.close()
 
     def notify(self, title: str, message: str) -> None:

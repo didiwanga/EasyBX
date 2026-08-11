@@ -72,6 +72,10 @@ class InputLine(QLineEdit):
     def _on_return(self) -> None:
         text = self.text()
         if not text.strip():
+            # 空输入（含仅空格）回车：发送一条空指令（回车），用于手动
+            # 继续翻页/触发服务器空命令处理，而不是无动作
+            if self._session is not None and self._session.connected:
+                self._session.connection.send_line("")
             return
         self.submit.emit(text)
         if self._history is not None:

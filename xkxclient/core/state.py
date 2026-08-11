@@ -55,6 +55,11 @@ class CharacterState:
 
     def update_from_gmcp_status(self, data: dict) -> bool:
         changed = False
+        # 身份字段：GMCP.Status 的 name/id 在战斗时是「当前敌人」（id 带 #oid），
+        # 只有在 id 不含 `#`（自身身份）时才允许覆盖玩家名，避免状态栏被敌人名污染。
+        ident = data.get("id")
+        if isinstance(ident, str) and "#" in ident:
+            data = {k: v for k, v in data.items() if k not in ("name", "id")}
         mapping = {
             "name": "name", "id": "id", "title": "title", "level": "level",
             "qi": "qi", "max_qi": "max_qi", "jing": "jing", "max_jing": "max_jing",

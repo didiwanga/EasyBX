@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup
-from PyQt6.QtWidgets import QCheckBox, QDockWidget, QMainWindow, QMessageBox, QTabWidget, QToolBar, QWidget
+from PyQt6.QtWidgets import (QCheckBox, QDialog, QDockWidget, QLabel, QMainWindow,
+                             QMessageBox, QProgressBar, QTabWidget, QToolBar,
+                             QVBoxLayout, QWidget)
 
 from xkxclient.core import config as cfg
 from xkxclient.core import resources
@@ -277,7 +279,8 @@ class MainWindow(QMainWindow):
     def _update_status(self, session) -> None:
         st = session.state
         qi = f"{st.qi}/{st.max_qi}" if st.max_qi else ""
-        self.status.set_state(f"{st.name or ''} Lv{st.level or '?'} {qi}".strip())
+        name = st.name or session.cn_name() or ""
+        self.status.set_state(f"{name} Lv{st.level or '?'} {qi}".strip())
         self.status.set_encoding(session.connection.encoding)
         self.status.set_timer_count(len(session.timers.list()))
 
@@ -324,6 +327,7 @@ class MainWindow(QMainWindow):
 
         session = self._cur_tab.session
         w = FullmeGridWindow(session, urls=payload.get("urls") or [])
+        w._debug_log = lambda msg: self.status.showMessage(str(msg)[:140], 8000)
         self._fullme_grid_win = w
         w.show()
 
@@ -641,10 +645,49 @@ class MainWindow(QMainWindow):
             self._minimize_to_tray()
             event.ignore()
 
+    def _show_shutdown_progress(self) -> None:
+        """弹「正在关闭客户端，请稍候…」进度窗（见 _do_quit 说明）。
+
+        shutdown 内部是嵌套事件循环，进度条动画定时器在其中照常触发。
+        无登录会话时 shutdown 秒完成，此窗一闪即逝。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("EasyBXb")
+        dlg.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        dlg.setFixedSize(340, 96)
+        dlg_lay = QVBoxLayout(dlg)
+        dlg_lay.addStretch(1)
+        tip = QLabel("正在关闭客户端，请稍候…")
+        tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dlg_lay.addWidget(tip)
+        bar = QProgressBar(dlg)
+        bar.setRange(0, 0)                       # 不定值：连续动画
+        bar.setTextVisible(False)
+        dlg_lay.addWidget(bar)
+        dlg_lay.addStretch(1)
+        dlg.setModal(True)
+        dlg.show()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()   # 先让等待窗完成绘制，再进入 shutdown 的阻塞
+        anim = QTimer(dlg)
+        anim.setInterval(150)
+        anim.timeout.connect(lambda: bar.setValue((bar.value() + 1) % 100))
+        anim.start()
+        try:
+            self.save_layout()
+            self.app.shutdown()
+        finally:
+            anim.stop()
+            dlg.close()
+
     def _do_quit(self, event) -> None:
-        """真正退出：保存布局 → 优雅登出 + 关会话 + 存配置 → 接受关闭。"""
-        self.save_layout()
-        self.app.shutdown()
+        """真正退出：弹出「正在关闭」提示 → 保存布局 → 优雅登出 + 关会话 + 存配置 → 接受关闭。
+
+        `app.shutdown()` 会阻塞最多 3s（优雅登出等服务器断开，见 Exit 提示），
+        若直接执行进程会显得「点了退出没反应」。这里先弹一个带进度动画的
+        等待窗，让用户看到反馈。
+        """
+        self._show_shutdown_progress()
         super().closeEvent(event)
 
     def _minimize_to_tray(self) -> None:

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 
-_GROUP_RE = re.compile(r"─{2,}\s*[:：]?\s*(.{2,20}?)\s*(?:─{2,}|:―{2,}|::)")
-_SKILL_ROW_RE = re.compile(
-    r"[│丨|]\s*([^\s│|].*?)\s*\(([a-zA-Z0-9\-]+)\)\s*[-─｜|]?\s*(.*)$"
+_GROUP_RE = re.compile(r"^├\s*─{2,}\s*([^─┼┴│\s].*?)\s*─{2,}[┼┤]")
+_KEY_RE = re.compile(r"\(([a-zA-Z0-9\-]+)\)")
+_SLOT_RE = re.compile(
+    r"共使用\s*了?\s*([\d.]+)\s*个技能槽位?\s*[，,]\s*空余槽位\s*\(?\s*([\d.]+)\)?"
 )
-_SLOT_RE = re.compile(r"共使用\s*([\d.]+)\s*个技能槽\s*，\s*空余\s+[槽位]+\s*\(?\s*([\d.]+)\)?")
+_SKILL_ROW_RE = _KEY_RE  # 兼容旧导入：session 曾引用该名
 
 
 class Skill:
@@ -35,7 +36,7 @@ class Skill:
 
 
 class SkillsParser:
-    """E-skill_panel：`skills` 命令输出解析。"""
+    """北侠 `skills` 表格：按 `│` 分列解析，兼容 `40.01/-` 无上限与 `□/△` 前缀。"""
 
     def __init__(self) -> None:
         self.groups: list[str] = []
@@ -49,16 +50,16 @@ class SkillsParser:
         category = "通用"
         found_row = False
         for raw in text.replace("\r", "").split("\n"):
-            raw = raw.strip()
-            if not raw:
+            line = raw.strip()
+            if not line:
                 continue
-            gm = _GROUP_RE.search(raw)
+            gm = _GROUP_RE.match(line)
             if gm:
                 category = gm.group(1).strip()
                 if category not in self.groups:
                     self.groups.append(category)
                 continue
-            sm = _SLOT_RE.search(raw)
+            sm = _SLOT_RE.search(line)
             if sm:
                 try:
                     self.slots_used = float(sm.group(1))
@@ -66,14 +67,20 @@ class SkillsParser:
                 except ValueError:
                     pass
                 continue
-            rm = _SKILL_ROW_RE.search(raw)
-            if rm:
-                name, key = rm.group(1).strip(), rm.group(2).strip()
-                if name and key:
-                    enabled = raw.lstrip().startswith("□")
-                    skill = Skill(key=key, name=name, category=category,
-                                  level=rm.group(3).strip(), desc=rm.group(3).strip(),
-                                  enabled=enabled)
-                    self.skills.append(skill)
-                    found_row = True
+            cells = [c.strip() for c in line.split("│") if c.strip()]
+            if len(cells) < 3:
+                continue
+            header_cell, desc, level = cells[0], cells[1], cells[-1]
+            km = _KEY_RE.search(header_cell)
+            if not km:
+                continue  # 表头行「技能/描述/级别上限」无括号拼音，跳过
+            key = km.group(1).strip()
+            name = header_cell[:km.start()].replace("□", "").strip("　 ")
+            if not name or not level:
+                continue
+            found_row = True
+            self.skills.append(Skill(
+                key=key, name=name, category=category,
+                level=level, desc=desc, enabled=header_cell.startswith("□"),
+            ))
         return found_row or bool(self.groups)
