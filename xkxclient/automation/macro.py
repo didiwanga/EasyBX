@@ -6,6 +6,7 @@ from typing import Callable
 from PyQt6.QtCore import QObject, QTimer
 
 from xkxclient.automation.runner import split_commands, substitute
+from xkxclient.core.fullme import extract_fullme_url
 
 
 class Macro:
@@ -20,7 +21,15 @@ class Macro:
 
 
 class MacroEngine(QObject):
-    """B3b 宏引擎：cmd/delay/label/jump(循环+条件)/if/input/wait_input/trigger + 暂停/恢复/进度。"""
+    """B3b 宏引擎：cmd/delay/label/jump(循环+条件)/if/input/wait_input/trigger/captcha + 暂停/恢复/进度。"""
+
+    @staticmethod
+    def _varname(name: str) -> str:
+        """规范化变量名：去除前后空白、外层 `{}`、首部 `$`。`{v01}`/`v01`/`$v01` 等价。"""
+        n = (name or "").strip()
+        if n.startswith("$"):
+            n = n[1:]
+        return n.strip("{}").strip()
 
     def __init__(self, bus, session) -> None:
         super().__init__(session)
@@ -35,6 +44,10 @@ class MacroEngine(QObject):
         self._wait_input_timer: QTimer | None = None
         self._trigger_sub: Callable | None = None
         self._trigger_timer: QTimer | None = None
+        self._captcha_wait: tuple[str, int] | None = None   # (name, pos) 等待验证码输入
+        self._captcha_sub: Callable | None = None           # net.text_display 订阅
+        self._captcha_timer: QTimer | None = None           # 3s 检测窗口
+        self._captcha_win = None                            # 验证码窗口引用（防 GC）
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -148,6 +161,8 @@ class MacroEngine(QObject):
         if self._trigger_sub is not None:
             self.bus.unsubscribe("net.text_display", self._trigger_sub)
             self._trigger_sub = None
+        self._close_captcha()
+        self._captcha_wait = None
 
     def _notify_state(self, state: str) -> None:
         self.bus.publish("macro.state", account=self.session.account_id, state=state)
@@ -188,6 +203,8 @@ class MacroEngine(QObject):
             self._wait_input(name, step, pos)
         elif t == "trigger":
             self._wait_trigger(name, step, pos)
+        elif t == "captcha":
+            self._wait_captcha(name, step, pos)
         else:
             self._goto(name, pos + 1)
 
@@ -196,14 +213,14 @@ class MacroEngine(QObject):
         self._waiting = (name, pos)  # 记录等待点与最后 pos
         var = step.get("var") or "input"
         prompt = step.get("prompt") or ""
-        timeout_s = int(step.get("timeout") or step.get("timeout_s") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
         self.bus.publish("macro.wait_input", account=self.session.account_id,
                          name=name, var=var, prompt=prompt)
-        if timeout_s > 0:
+        if timeout_ms > 0:
             self._wait_input_timer = QTimer(self)
             self._wait_input_timer.setSingleShot(True)
             self._wait_input_timer.timeout.connect(lambda: self._timeout_input(name, pos, var))
-            self._wait_input_timer.start(timeout_s * 1000)
+            self._wait_input_timer.start(timeout_ms)
 
     def _timeout_input(self, name: str, pos: int, var: str) -> None:
         """等待输入超时：变量保持未赋值，自动关闭继续向下。"""
@@ -226,7 +243,7 @@ class MacroEngine(QObject):
         if not m or pos >= len(m.steps):
             return
         step = m.steps[pos]
-        self.session.vars[step.get("var") or "input"] = text
+        self.session.vars[self._varname(step.get("var") or "input")] = text
         self._goto(name, pos + 1)
 
     def _wait_trigger(self, name: str, step: dict, pos: int) -> None:
@@ -247,7 +264,7 @@ class MacroEngine(QObject):
             conds = [{"match_type": step.get("match_type") or cond.get("type") or "contains",
                       "pattern": step.get("pattern") or cond.get("pattern") or ""}]
             relation = "or"
-        timeout_s = int(step.get("timeout") or step.get("timeout_s") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
         self.bus.publish("macro.state", account=self.session.account_id,
                          state="waiting_trigger", name=name)
 
@@ -299,6 +316,13 @@ class MacroEngine(QObject):
             captures = eval_line(line)
             if captures is None:
                 return
+            # 命中：先真正取消订阅（否则后续行仍会回调，重复 goto/赋值）
+            if self._trigger_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
             # 模板变量捕获（B3：命名/编号都支持）
             names: list = []
             for c in conds:
@@ -307,23 +331,20 @@ class MacroEngine(QObject):
                     names.extend(getattr(tmp, "_names", []) or [])
             for i, (var, _color) in enumerate(names):
                 g = captures[i] if i < len(captures) else ""
+                var = self._varname(var)
                 if var:
                     self.session.vars[var] = g
             if not names:
                 for i, cap in enumerate(captures or [], 1):
                     self.session.vars[f"v{i:02d}"] = cap
-            self._trigger_sub = None
-            if self._trigger_timer is not None:
-                self._trigger_timer.stop()
-                self._trigger_timer = None
             self._goto(name, pos + 1)
 
         self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
-        if timeout_s > 0:
+        if timeout_ms > 0:
             self._trigger_timer = QTimer(self)
             self._trigger_timer.setSingleShot(True)
             self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos))
-            self._trigger_timer.start(timeout_s * 1000)
+            self._trigger_timer.start(timeout_ms)
 
     def _timeout_trigger(self, name: str, pos: int) -> None:
         self._trigger_timer = None
@@ -333,6 +354,101 @@ class MacroEngine(QObject):
         if name in self._active:
             self._goto(name, pos + 1)
 
+    # ---- 验证码步骤（新）：发送命令 → 3s 检测链接 → 弹窗输入 → 变量赋值 ----
+    def _wait_captcha(self, name: str, step: dict, pos: int) -> None:
+        """验证码步骤：先发送用户设置的命令，然后在 timeout 毫秒内监听 fullme 链接。
+
+        - 命中链接：弹验证码窗（同 fullme 布局），用户输入回车/确定后把验证码
+          写入 `var` 变量，宏继续下一步
+        - 未命中：弹「未检测到验证码链接」对话框，确定后停止当前宏
+        """
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 3) * 1000)
+        var = step.get("var") or "captcha"
+        # 1) 发送命令；并标记宏验证码期间抑制 session 普通 fullme 弹窗
+        self.session._macro_captcha_active = True
+        for cmd in split_commands(substitute(step.get("command", ""), self.session.vars)):
+            self.session.send_auto(cmd)
+        self.bus.publish("macro.state", account=self.session.account_id,
+                         state="waiting_captcha", name=name)
+        self._captcha_wait = (name, pos)
+
+        def on_line(payload: dict) -> None:
+            if self._captcha_wait != (name, pos):
+                return
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            url = extract_fullme_url(payload.get("line") or "")
+            if not url:
+                return
+            # 2) 命中链接：先真正取消订阅（否则后续 URL 行会再弹窗），再弹窗
+            if self._captcha_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._captcha_sub)
+                self._captcha_sub = None
+            if self._captcha_timer is not None:
+                self._captcha_timer.stop()
+                self._captcha_timer = None
+            self._open_captcha_win(name, pos, var, url)
+
+        self._captcha_sub = self.bus.subscribe("net.text_display", on_line)
+        self._captcha_timer = QTimer(self)
+        self._captcha_timer.setSingleShot(True)
+        self._captcha_timer.timeout.connect(lambda: self._timeout_captcha(name, pos))
+        self._captcha_timer.start(timeout_ms)
+
+    def _open_captcha_win(self, name: str, pos: int, var: str, url: str) -> None:
+        from xkxclient.ui.fullme import CaptchaWindow
+
+        def on_submit(code: str) -> None:
+            self.session.vars[self._varname(var)] = code
+            self.session._macro_captcha_active = False
+            self._captcha_win = None
+            self._captcha_wait = None
+            if name in self._active:
+                self._goto(name, pos + 1)
+
+        def on_finished(_result: int) -> None:
+            # 未提交即关闭窗口：视为取消，停止宏
+            if self._captcha_wait == (name, pos):
+                self._captcha_wait = None
+                self._captcha_win = None
+                self.session._macro_captcha_active = False
+                self.stop()
+
+        self._captcha_win = CaptchaWindow(self.session, url, on_submit=on_submit)
+        self._captcha_win.finished.connect(on_finished)
+        self._captcha_win.show()
+
+    def _timeout_captcha(self, name: str, pos: int) -> None:
+        self._captcha_timer = None
+        if self._captcha_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._captcha_sub)
+            self._captcha_sub = None
+        if self._captcha_wait != (name, pos):
+            return
+        self._captcha_wait = None
+        self.session._macro_captcha_active = False
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(None, "验证码", "未检测到验证码链接，宏已停止。",
+                                QMessageBox.StandardButton.Ok)
+        self.stop()
+
+    def _close_captcha(self) -> None:
+        """停止/清理时关闭验证码监听与窗口。"""
+        if self._captcha_timer is not None:
+            self._captcha_timer.stop()
+            self._captcha_timer = None
+        if self._captcha_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._captcha_sub)
+            self._captcha_sub = None
+        if self._captcha_win is not None:
+            self._captcha_win.close()
+            self._captcha_win = None
+        self._captcha_wait = None
+        if getattr(self.session, "_macro_captcha_active", False):
+            self.session._macro_captcha_active = False
+
     def _halt(self, name: str) -> None:
         self._active.pop(name, None)
         self._pos.pop(name, None)
@@ -340,6 +456,8 @@ class MacroEngine(QObject):
         self._timers.pop(name, None)
         if self._waiting and self._waiting[0] == name:
             self._waiting = None
+        if self._captcha_wait and self._captcha_wait[0] == name:
+            self._close_captcha()
         self.bus.publish("macro.end", account=self.session.account_id, name=name)
 
     def _chain(self, name: str, ms: int, next_pos: int) -> None:
@@ -370,17 +488,17 @@ class MacroEngine(QObject):
         elif ctype == "regex":
             ok = self._last_line_has(cond.get("pattern", ""))
         elif ctype == "cmp":
-            key = var.strip().strip("{}")
+            key = self._varname(var)
             ok = self._cmp(str(self.session.vars.get(key, "")),
                            cond.get("op", "="), str(cond.get("value", "")))
         elif ctype == "status":
             ok = self._match_status_cond(cond)
         elif ctype == "true":
-            ok = bool(self.session.vars.get(var))
+            ok = bool(self.session.vars.get(self._varname(var)))
         elif ctype == "not":
-            ok = not bool(self.session.vars.get(var))
+            ok = not bool(self.session.vars.get(self._varname(var)))
         elif ctype == "equals":
-            ok = str(self.session.vars.get(var)) == str(cond.get("value"))
+            ok = str(self.session.vars.get(self._varname(var))) == str(cond.get("value"))
         else:
             ok = False
         return (not ok) if cond.get("negate") else ok
@@ -501,7 +619,7 @@ class MacroEngine(QObject):
             for cmd in split_commands(substitute(action.get("command", ""), self.session.vars)):
                 self.session.send_auto(cmd)
         elif t == "set":
-            var = action.get("var", "")
+            var = self._varname(action.get("var", ""))
             val = action.get("value", "")
             if var:
                 self.session.vars[var] = substitute(val, self.session.vars)

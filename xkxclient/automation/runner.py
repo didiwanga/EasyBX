@@ -3,12 +3,14 @@ from __future__ import annotations
 import re
 
 _VAR_RE = re.compile(r"\{(\w+)(?::(\w+))?\}")
+_DOLLAR_RE = re.compile(r"\$(\w+)")
 
 
 def substitute(text: str, vars: dict) -> str:
-    """`{变量}` 代入（wiki B3，统一 `{}` 格式）；`{名:color}` 取颜色值。
+    """`{变量}` / `$变量` 代入（wiki B3，统一 `{}` 格式）；`{名:color}` 取颜色值。
 
     `{v01}` → vars['v01']；`{v01:color}` → vars['v01:color']（颜色 #RRGGBB），
+    `$v01` → vars['v01']（宏验证码步骤产物，兼容 `$` 调用）；
     未定义时保留原占位符。
     """
     def rep(m):
@@ -16,7 +18,12 @@ def substitute(text: str, vars: dict) -> str:
         if m.group(2):
             key = f"{key}:{m.group(2)}"
         return str(vars.get(key, m.group(0)))
-    return _VAR_RE.sub(rep, text)
+    out = _VAR_RE.sub(rep, text)
+
+    def rep2(m):
+        key = m.group(1)
+        return str(vars.get(key, m.group(0)))
+    return _DOLLAR_RE.sub(rep2, out)
 
 
 def split_commands(text: str) -> list[str]:

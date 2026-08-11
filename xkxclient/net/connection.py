@@ -35,6 +35,7 @@ class Connection(QObject):
         self._tbuf = bytearray()
         self._parser = TelnetParser(self._reply, self._gmcp_handshake)
         self._gmcp_started = False
+        self._gmcp_hello_sent = False
 
         self.sock.connected.connect(lambda: self.connected.emit(self.host))
         self.sock.connected.connect(self._on_connected_probe)
@@ -50,6 +51,7 @@ class Connection(QObject):
         self._tbuf = bytearray()
         self._parser = TelnetParser(self._reply, self._gmcp_handshake)
         self._gmcp_started = False
+        self._gmcp_hello_sent = False
         self.sock.connectToHost(host, port)
 
     def close(self) -> None:
@@ -63,14 +65,19 @@ class Connection(QObject):
         self.sock.write(data)
 
     def start_gmcp_hello(self) -> None:
-        """登录完成后补发 GMCP Core.Hello。
+        """登录完成后补发 GMCP Core.Hello（IAC SB GMCP 子协商）。
 
-        连接早期服务器正处于「输入英文名字」阶段，若立刻发 Core.Hello，
-        该文本行会被当成玩家名字输入并报「必须是 3 到 12 个英文字母」。
-        因此 GMCP 握手推迟到登录完成后再发；即使服务器未 WILL GMCP，
-        连接建立时的 DO 0xC9 主动探测（C1）也会让本补发建立通道。
+        GMCP 必须用 telnet 子协商 IAC SB GMCP + payload + IAC SE 发送，
+        文本行形式会被服务器当作命令或玩家名输入。连接早期服务器正处于
+        「输入英文名字」阶段，因此握手推迟到登录完成后再发；即使服务器
+        未主动 WILL GMCP，连接建立时的 DO 0xC9 主动探测（C1）也会让本
+        补发建立通道。全程仅发送一次。
         """
-        self.send_raw(b'Core.Hello {"client":"%s","version":"0.1.0"}\r\n' % CLIENT_ID.encode("utf-8"))
+        if self._gmcp_hello_sent:
+            return
+        self._gmcp_hello_sent = True
+        payload = b'Core.Hello {"client":"%s","version":"0.1.0"}' % CLIENT_ID.encode("utf-8")
+        self.send_raw(bytes([IAC, SB, GMCP_OPT]) + payload + bytes([IAC, SE]))
 
     # ---- 内部 ----
     def _reply(self, data: bytes) -> None:

@@ -41,7 +41,7 @@ class _StepDialog(QWidget):
         super().__init__(parent)
         self.engine = engine
         self.cmd_ed = QLineEdit()
-        self.cd_sp = QSpinBox(); self.cd_sp.setRange(0, 300); self.cd_sp.setSuffix(" 秒")
+        self.cd_sp = QSpinBox(); self.cd_sp.setRange(0, 300000); self.cd_sp.setSuffix(" ms")
         self.qi_sp = QSpinBox(); self.qi_sp.setRange(0, 100); self.qi_sp.setSuffix(" %")
         form = QFormLayout(self)
         form.addRow("命令", self.cmd_ed)
@@ -234,14 +234,14 @@ class CombatAssistDock(QWidget):
         self.step_list.clear()
         for i, act in enumerate(e.rotation):
             cmd = act.get("cmd") or ""
-            cd = act.get("cd") or 0
+            cd_ms = int(act.get("cd") or 0)
             qi = act.get("min_qi") or 0
-            remaining = max(0.0, e._last_cd_time.get(cmd, 0.0) + float(cd) - now)
+            remaining_ms = max(0, int((e._last_cd_time.get(cmd, 0.0) + cd_ms / 1000.0 - now) * 1000))
             text = cmd
-            if cd:
-                text += f"  [CD{cd}s"
-                if remaining > 0:
-                    text += f" 剩{remaining:.0f}s"
+            if cd_ms:
+                text += f"  [CD{cd_ms}ms"
+                if remaining_ms > 0:
+                    text += f" 剩{remaining_ms}ms"
                 text += "]"
             if qi:
                 text += f"  {qi}%"
@@ -250,7 +250,7 @@ class CombatAssistDock(QWidget):
             if e.current_cmd and e.current_cmd == cmd:
                 item.setBackground(QColor("#3a5a8a"))
                 item.setForeground(QColor("white"))
-            elif remaining > 0:
+            elif remaining_ms > 0:
                 item.setForeground(QColor("#888"))
             self.step_list.addItem(item)
         # 恢复用户选中行（旋转里第几行就选第几行）
@@ -261,7 +261,7 @@ class CombatAssistDock(QWidget):
         self.buff_list.clear()
         for w in self._engine.buff_watch:
             cd = w.get("cooldown") or 0
-            self.buff_list.addItem(QListWidgetItem(f"{w.get('name')} → {w.get('cmd')}  CD{cd}s"))
+            self.buff_list.addItem(QListWidgetItem(f"{w.get('name')} → {w.get('cmd')}  CD{cd}ms"))
 
     def _on_add_buff(self) -> None:
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox
@@ -271,7 +271,7 @@ class CombatAssistDock(QWidget):
         f = QFormLayout(dlg)
         name_ed = QLineEdit(); name_ed.setPlaceholderText("如 powerup")
         cmd_ed = QLineEdit(); cmd_ed.setPlaceholderText("如 yun powerup")
-        cd_sp = QSpinBox(); cd_sp.setRange(0, 300); cd_sp.setSuffix(" 秒")
+        cd_sp = QSpinBox(); cd_sp.setRange(0, 300000); cd_sp.setSuffix(" ms")
         f.addRow("Buff名", name_ed)
         f.addRow("命令", cmd_ed)
         f.addRow("冷却", cd_sp)
@@ -315,7 +315,7 @@ class CombatAssistDock(QWidget):
         dlg.setMinimumWidth(340)
         f = QFormLayout(dlg)
         cmd_ed = QLineEdit()
-        cd_sp = QSpinBox(); cd_sp.setRange(0, 300); cd_sp.setSuffix(" 秒")
+        cd_sp = QSpinBox(); cd_sp.setRange(0, 300000); cd_sp.setSuffix(" ms")
         qi_sp = QSpinBox(); qi_sp.setRange(0, 100); qi_sp.setSuffix(" %")
         f.addRow("命令", cmd_ed)
         f.addRow("冷却", cd_sp)

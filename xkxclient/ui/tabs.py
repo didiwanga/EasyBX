@@ -263,8 +263,13 @@ class AccountTab(QWidget):
         self.output.filter_add_requested.connect(self._add_filter)
         self.output.search_requested.connect(lambda t: self.show_find())
         self.output.autopage_hit.connect(self._on_autopage)
+        self.output.clicked_blank.connect(self._refocus_input)
         self.chat.channel_toggled.connect(self.session.set_channel)
         self._sync_channels()
+
+    def _refocus_input(self) -> None:
+        """点击输出区空白：焦点还给命令输入框。"""
+        self.input_line.setFocus()
 
     # ---- 频道（B5e） ----
     def _sync_channels(self) -> None:
@@ -311,11 +316,11 @@ class AccountTab(QWidget):
         self.session.send(text)
         self.session.app.bus.publish("input.sent", account=self.account_id, text=text)
 
-    def append_spans(self, spans: list) -> None:
-        self.output.append_spans(spans)
+    def append_spans(self, spans: list, highlight: bool = False) -> None:
+        self.output.append_spans(spans, highlight=highlight)
 
-    def append_channel(self, name: str, spans: list) -> None:
-        self.chat.append(name, spans)
+    def append_channel(self, name: str, spans: list, highlight: bool = False) -> None:
+        self.chat.append(name, spans, highlight=highlight)
 
     def on_line(self, line: str) -> None:
         self.output.append_line(line)

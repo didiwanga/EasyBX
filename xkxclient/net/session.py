@@ -21,6 +21,10 @@ _GMCP_SUBSCRIBE = ["Status", "Move", "System", "Combat", "Buff"]
 # 「命令进入缓冲」提示（服务端命令缓冲限流，见 wiki about_cmdbuffer）
 _BUF_PROMPTS = ("命令进入缓冲", "命令缓冲", "指令进入缓冲")
 
+# node 表格框线字符：捕获期间仅抑制含这些字符的行，其余信息照常上屏
+_NODE_BOX_CHARS = "│┌┐└┘├┤─"
+_NODE_EMPTY_MSG = "这里没有玩家定义的路径"
+
 DEFAULT_PROMPTS = {
     "encoding": ("Input 1 for GBK", "Input 1 for UTF8", "编码已改为"),
     "name": ("英文名字",),
@@ -35,18 +39,12 @@ DEFAULT_PROMPTS = {
 # 均需识别为名字提示。
 _REAL_NAME_RE = re.compile(r"您的英文名字(?:\（[^）]*\）)?\s*：")
 
-# 房间内对话：`张三说道：「你好」` / `你说道：...` / `李四对着王五说道：...`
-# 识别行首 姓名(≤8 中文字符或·) + 可选 对着<姓名> + 说道/低声道/大声道 + 冒号
-_SAY_RE = re.compile(
-    r"^(?:你|[\u4e00-\u9fff·]{1,8})(?:对着[\u4e00-\u9fff·]{1,8})?(?:低声道|轻声说|大声道|说道|说)："
-)
-
 
 class AccountSession(QObject):
     """每账号运行时实例（wiki D4）：连接 + 状态 + 自动化引擎 + D2 自动登录。"""
 
-    line_displayed = pyqtSignal(list)     # 应进入主输出的文本
-    channel_text = pyqtSignal(str, list)   # channel name, spans(含色) → 进聊天栏
+    line_displayed = pyqtSignal(list, bool)     # 应进入主输出的文本, 是否触发器命中高亮
+    channel_text = pyqtSignal(str, list, bool)  # channel name, spans(含色) → 进聊天栏, 是否高亮
 
     def __init__(self, app, account_id: str) -> None:
         super().__init__(app)
@@ -63,6 +61,7 @@ class AccountSession(QObject):
         self.chat_open = True  # B5e：聊天栏恒开
         self._fullme_collect = 0
         self._fullme_urls: list[str] = []
+        self._macro_captcha_active = False  # 宏验证码步骤期间抑制普通 fullme 弹窗
 
         from xkxclient.automation.alias import AliasEngine
         from xkxclient.automation.combat import CombatEngine
@@ -96,6 +95,11 @@ class AccountSession(QObject):
         self.skills_dock = None
         self._capture_look = False
         self._look_buf = ""
+
+        # node 命令捕获：表格行拦截不上主输出（仅表格行），带 5s 超时兜底
+        self._node_capture = False
+        self._node_capture_start = 0.0
+        self._node_in_table = False
 
         # 频道开关（B5e 持久化：config "channels"）
         self._channels: dict[str, bool] = dict(ConfigManager.instance().get("channels") or {})
@@ -158,6 +162,9 @@ class AccountSession(QObject):
     def _on_disconnected(self, reason: str) -> None:
         self.connected = False
         self.logged_in = False
+        self._node_capture = False
+        self._node_in_table = False
+        self._macro_captcha_active = False
         if self._login is not None:
             self._login.dispose()
         self.timers.stop_all()
@@ -247,29 +254,78 @@ class AccountSession(QObject):
         if self._login and not self._login.finished:
             self._login.on_line(text)
         if self.logged_in:
-            self.triggers.handle_line(text)
+            fired = self.triggers.handle_line(text)
             if self._is_pager(text):
                 # 翻页提示行：发空指令继续下一页，本行不上屏（含聊天栏/主输出）
                 self._pager_continue()
+            elif self._consume_node_line(text):
+                # node 表格行：不上主输出（已由 dock 订阅 net.text_display 解析）
+                pass
             else:
-                self._route_line(text, spans)
+                self._route_line(text, spans, bool(fired))
         else:
-            self.line_displayed.emit(spans)
+            self.line_displayed.emit(spans, False)
         self._maybe_buffer_warning(text)
         self._maybe_cap_skills(text)
         self._maybe_cap_look(text)
         self._maybe_fullme(text)
 
-    def _route_line(self, text: str, spans: list) -> None:
-        """频道分流（B5e）：【频道】行 + `某某说道：` 只进聊天栏（富文本），永不回主输出。"""
+        # ---- node 命令捕获：表格行拦截，不上主输出 ----
+    def request_node(self) -> None:
+        """发送 `node` 并开启捕获（dock 调用）。"""
+        if not self.logged_in:
+            return
+        self._node_capture = True
+        self._node_in_table = False
+        self._node_capture_start = time.time()
+        self.connection.send_line("node")
+
+    def _consume_node_line(self, text: str) -> bool:
+        """捕获期间抑制 node 表格行，返回 True 表示本行不上主输出。
+
+        状态机：只有确认已进入表格（表头 `名称/目的地` 或顶框线 `┌`）才开始吞行；
+        未进表格的普通文本（闲聊、`这里没有玩家定义的路径` 提示等）一律照常上屏。
+        - 表格内：仅吞框线字符行；表格内夹杂的无框线文本也照常上屏
+        - 页尾框线 `└…┘` 到达即结束捕获；空路径提示行到达也结束捕获（照常上屏）
+        - 5s 超时兜底：异常中断时自动关闭捕获，避免长期拦截
+        """
+        if not self._node_capture:
+            return False
+        if time.time() - self._node_capture_start > 5.0:
+            self._node_capture = False
+            self._node_in_table = False
+            return False
+        if _NODE_EMPTY_MSG in text:
+            # 空路径：非表格信息，照常上屏，但捕获到此结束
+            self._node_capture = False
+            self._node_in_table = False
+            return False
+        has_box = any(ch in text for ch in _NODE_BOX_CHARS)
+        if not self._node_in_table:
+            # 确认进入表格：表头（名称/目的地）或顶框线 `┌` 行
+            if ("名称" in text and "目的地" in text) or ("┌" in text and "─" in text):
+                self._node_in_table = True
+                return True
+            return False  # 未进表格：不拦截，照常上屏
+        # 已在表格内：仅吞框线行
+        if not has_box:
+            return False
+        if "└" in text:
+            # 表尾框线：本行也是表格内容，吞掉并结束捕获
+            self._node_capture = False
+            self._node_in_table = False
+        return True
+
+    def _route_line(self, text: str, spans: list, highlight: bool = False) -> None:
+        """频道分流（B5e）：【频道】行进聊天栏（富文本），永不回主输出；说道等对话直接进主屏。"""
         channel = self.channel_of(text)
         if channel:
             on = self._channels.get(channel, True)
             if not on:
                 return  # 阻断频道：聊天栏与主输出都不显示
-            self.channel_text.emit(channel, spans)
+            self.channel_text.emit(channel, spans, highlight)
             return  # 只进聊天栏，不再进主输出
-        self.line_displayed.emit(spans)
+        self.line_displayed.emit(spans, highlight)
 
     def channel_of(self, text: str) -> str | None:
         if text.startswith("【") and "】" in text and text[1:2] != "】":
@@ -281,9 +337,7 @@ class AccountSession(QObject):
                 ch[name] = True
                 cfg.set("channels", ch)
             return name.strip() if name.strip() else None
-        # 房间内对话：`张三说道：「...」` 归入「说道」频道
-        if _SAY_RE.match(text):
-            return "说道"
+        # 房间内对话（`张三说道：「...」`）不再分流：直接进主屏
         return None
 
     def _maybe_buffer_warning(self, text: str) -> None:
@@ -315,6 +369,9 @@ class AccountSession(QObject):
         self.connection.send_line("")
 
     def _maybe_fullme(self, text: str) -> None:
+        # 宏验证码步骤期间：fullme 链接由宏引擎消费，避免再弹普通 fullme 窗
+        if getattr(self, "_macro_captcha_active", False):
+            return
         url = extract_fullme_url(text)
         if url:
             if self._fullme_collect > 0:
@@ -340,6 +397,8 @@ class AccountSession(QObject):
 
     def _maybe_cap_look(self, text: str) -> None:
         if not self._capture_look:
+            return
+        if "MXP" in text:
             return
         self._look_buf += text + "\n"
         if ("出口是" in text) or ("这里是" in text and len(self._look_buf) > 40) or (not text and len(self._look_buf) > 20):
@@ -416,6 +475,11 @@ class AccountSession(QObject):
 
     def _on_gmcp(self, payload: bytes) -> None:
         module, data = gmcp.parse_payload(payload)
+        if module.startswith("GMCP."):
+            module = module[len("GMCP."):]
+        module = module.split(".", 1)[0]
+        if not module.startswith("GMCP."):
+            module = "GMCP." + module
         self.app.bus.publish(module, account=self.account_id, data=data)
         if ConfigManager.instance().get("debug.gmcp_log", False):
             self._gmcp_log(module, data)
@@ -429,10 +493,18 @@ class AccountSession(QObject):
             if self.state.update_from_gmcp_status(data):
                 self.app.bus.publish("state.changed", account=self.account_id, state=self.state)
                 self._backfill_account()
-        elif module == "GMCP.Move" and isinstance(data, list):
-            d = data[0] if data and isinstance(data[0], dict) else {}
-            self.navigator.on_move(str(d.get("result", "")) == "true")   # walk 确认
-            if d.get("result") == "true":
+        elif module == "GMCP.Move":
+            if isinstance(data, list):
+                d = data[0] if data and isinstance(data[0], dict) else {}
+            elif isinstance(data, dict):
+                d = data
+            else:
+                d = {}
+            ok = d.get("result")
+            if not isinstance(ok, bool):
+                ok = str(ok or "").strip().lower() in ("true", "1")
+            self.navigator.on_move(ok)
+            if ok:
                 self.room_name = str(d.get("short") or self.room_name)
                 self.exits = list(d.get("dir") or [])
                 self.map_cache.on_move(d)
@@ -441,7 +513,6 @@ class AccountSession(QObject):
                 if self.auto_look:
                     self._send_look()
         elif module == "GMCP.Combat":
-            # 北侠战斗风暴期 Combat 可能是 list（多条事件塞一个载荷），统一归一为 dict
             if isinstance(data, list):
                 d = None
                 for it in data:
@@ -455,7 +526,6 @@ class AccountSession(QObject):
             pfm = data.get("perform_id") or data.get("perform")
             if pfm:
                 self.state.update_perform_cd(pfm, data)
-            # 常规 Combat 事件仍发布（存量订阅者用 enemy_name/qi_damage）
             self.app.bus.publish("GMCP.Combat", account=self.account_id, data=data)
             self.app.bus.publish("state.combat", account=self.account_id, enemy=self.state.enemy)
             if data.get("enemy_out"):
@@ -470,7 +540,6 @@ class AccountSession(QObject):
                 if isinstance(item, dict):
                     self.app.bus.publish("GMCP.Message", account=self.account_id, data=item,
                                          name=str(item.get("name", "")), url=str(item.get("url", "")))
-
     def _gmcp_log(self, module: str, data) -> None:
         try:
             cfg = ConfigManager.instance()
@@ -501,6 +570,18 @@ class AccountSession(QObject):
         self.throttle.close()
         self.combat.close()
         self.connection.close()
+
+    def logout(self) -> None:
+        """客户端关闭前的优雅登出：发送 quit 让服务器存档/清理，避免直接断线丢物品。
+
+        仅对已登录且有连接时发送；不阻塞、不等服务器应答（等待由 app.shutdown 统一处理）。
+        """
+        if not self.logged_in or not self.connected:
+            return
+        try:
+            self.connection.send_line("quit")
+        except Exception:
+            pass
 
 
 class LoginMachine:

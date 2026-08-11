@@ -50,7 +50,7 @@ class Trigger:
         if not names:
             return None
         try:
-            self._tmpl_regex = re.compile(raw)
+            self._tmpl_regex = re.compile(raw + "$")
             self._names = names
             return self._tmpl_regex
         except re.error:
@@ -87,9 +87,11 @@ class TriggerEngine(QObject):
             )
             self.triggers.append(t)
 
-    def handle_line(self, line: str) -> None:
+    def handle_line(self, line: str) -> list[str]:
+        """处理一行文本，返回本行命中的触发器名列表（空 = 未命中）。"""
         if not self.master_on:
-            return
+            return []
+        fired: list[str] = []
         for trg in self.triggers:
             if not trg.enabled:
                 continue
@@ -104,6 +106,8 @@ class TriggerEngine(QObject):
             self._schedule(trg)
             if trg.one_shot:
                 trg.enabled = False
+            fired.append(trg.name)
+        return fired
 
     # ---- B3 多条件：全与(and) / 全或(or)，默认 or；模板变量捕获 ----
     def _match_conditions(self, t: Trigger, line: str) -> tuple[bool, list]:

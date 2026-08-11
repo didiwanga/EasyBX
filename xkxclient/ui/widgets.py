@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QMouseEvent, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QMouseEvent, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -43,7 +43,10 @@ class ChannelToggleRow(QWidget):
                 btn = QPushButton(name)
                 btn.setCheckable(True)
                 btn.setChecked(on)
-                btn.clicked.connect(lambda _=False, n=name: self.channel_toggled.emit(n, btn.isChecked()))
+                # 用默认参数绑定 btn/name，避免闭包捕获循环变量导致全部指向最后一个按钮
+                btn.clicked.connect(
+                    lambda _=False, b=btn, n=name: self.channel_toggled.emit(n, b.isChecked())
+                )
                 self._buttons[name] = btn
                 self._lay.addWidget(btn)
 
@@ -119,7 +122,8 @@ class ChannelBar(QWidget):
         if self._drag_y is None:
             return
         d = int(e.globalPosition().y() - self._drag_y)
-        self.setFixedHeight(min(self._max_h(), max(self._min_h(), self._drag_h + d)))
+        # 向上拖（d<0）→ 高度增加；向下拖（d>0）→ 高度减少（顶部边界在上方）
+        self.setFixedHeight(min(self._max_h(), max(self._min_h(), self._drag_h - d)))
         e.accept()
 
     def _release(self, e: QMouseEvent) -> None:
@@ -141,12 +145,16 @@ class ChannelBar(QWidget):
         self._channels[name] = on
         self.toggle_row.set_channels(self._channels)
 
-    def append(self, name: str, spans: list) -> None:
+    def append(self, name: str, spans: list, highlight: bool = False) -> None:
         """富文本追加：按 spans 逐段着色，字体同主输出（B5e）。"""
         if not self._channels.get(name, True):
             return
         cursor = QTextCursor(self.output.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        if highlight:
+            bg = QTextBlockFormat()
+            bg.setBackground(QColor("#3d3410"))
+            cursor.setBlockFormat(bg)
         # 频道前缀淡色标识
         prefix = QTextCharFormat()
         prefix.setForeground(QColor("#808080"))

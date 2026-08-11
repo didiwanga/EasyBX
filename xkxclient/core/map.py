@@ -221,6 +221,10 @@ class LookCapture(QObject):
         exits = getattr(room, "exits", None) or []
         self.cache.set_room(name, exits=list(exits))
         self.cache.mark_dirty(name, exits)
+        # look 到的房间作为当前位置：服务器不推 GMCP.Move 时也能让位置/导航前进
+        if self.cache.current != name:
+            self.cache.current = name
+            self.cache._dirty = True
         for ent in getattr(result, "entities", None) or []:
             ename = getattr(ent, "name", "")
             if ename:

@@ -916,6 +916,8 @@ class MacroEditor(_EditorBase):
             cond = s.get("condition") or {}
             pat = s.get("pattern") or cond.get("pattern", "")
             return f"触发: {cond.get('type', s.get('match_type', 'contains'))} {pat}"
+        if t == "captcha":
+            return f"验证码: {s.get('command', '')} → ${s.get('var', 'captcha')}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -992,7 +994,7 @@ class StepDialog(QDialog):
 
     _STEP_LABELS = [("cmd", "命令"), ("delay", "延时"), ("label", "标签"),
                     ("jump", "跳转"), ("if", "判断"), ("status", "状态"),
-                    ("input", "等待输入"), ("trigger", "触发")]
+                    ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -1072,15 +1074,23 @@ class StepDialog(QDialog):
         # ---- 等待输入页 ----
         self.var_ed = QLineEdit(); self.var_ed.setPlaceholderText("等待赋值的变量名，如 {v01}")
         self.prompt_ed = QLineEdit(); self.prompt_ed.setPlaceholderText("提示词（如 口令）")
-        self.timeout_sb = QSpinBox(); self.timeout_sb.setRange(0, 3600); self.timeout_sb.setSuffix(" 秒")
+        self.timeout_sb = QSpinBox(); self.timeout_sb.setRange(0, 3600000); self.timeout_sb.setSuffix(" ms")
 
         # ---- 触发器页：复用 B3 条件表单 ----
         self.trg_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
         self.trg_cond.setMinimumHeight(160)
         self.trg_delay_sb = QSpinBox(); self.trg_delay_sb.setRange(0, 3600000)
         self.trg_delay_sb.setSuffix(" ms")
-        self.trg_timeout_sb = QSpinBox(); self.trg_timeout_sb.setRange(0, 3600)
-        self.trg_timeout_sb.setSuffix(" 秒")
+        self.trg_timeout_sb = QSpinBox(); self.trg_timeout_sb.setRange(0, 3600000)
+        self.trg_timeout_sb.setSuffix(" ms")
+
+        # ---- 验证码页 ----
+        self.cap_cmd_ed = QLineEdit()
+        self.cap_cmd_ed.setPlaceholderText("如 fullme（发送的命令）")
+        self.cap_var_ed = QLineEdit()
+        self.cap_var_ed.setPlaceholderText("接收验证码的变量名，如 code")
+        self.cap_timeout_sb = QSpinBox(); self.cap_timeout_sb.setRange(100, 3600000)
+        self.cap_timeout_sb.setValue(3000); self.cap_timeout_sb.setSuffix(" ms")
 
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
@@ -1140,6 +1150,13 @@ class StepDialog(QDialog):
         tf.addRow("超时", self.trg_timeout_sb)
         self._pages["trigger"] = p_trg
 
+        p_cap = QWidget()
+        cf = QFormLayout(p_cap)
+        cf.addRow("发送命令", self.cap_cmd_ed)
+        cf.addRow("变量名", self.cap_var_ed)
+        cf.addRow("检测超时", self.cap_timeout_sb)
+        self._pages["captcha"] = p_cap
+
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
             self.stack.addWidget(self._pages[code])
@@ -1188,7 +1205,7 @@ class StepDialog(QDialog):
         self.label_ed.setText(s.get("label", "") or "")
         self.var_ed.setText(s.get("var", "") or "")
         self.prompt_ed.setText(s.get("prompt", ""))
-        self.timeout_sb.setValue(int(s.get("timeout") or s.get("timeout_s") or 0))
+        self.timeout_sb.setValue(self._timeout_ms(s))
 
         cond = s.get("condition") or {}
         # 跳转
@@ -1237,13 +1254,27 @@ class StepDialog(QDialog):
             self.trg_cond.set_conditions(trg_conds)
             self.trg_cond.set_relation(s.get("relation", "or"))
             self.trg_delay_sb.setValue(int(s.get("delay_ms", 0)))
-            self.trg_timeout_sb.setValue(int(s.get("timeout") or s.get("timeout_s") or 0))
+            self.trg_timeout_sb.setValue(self._timeout_ms(s))
+
+        # 验证码步骤
+        if t == "captcha":
+            self.cap_cmd_ed.setText(s.get("command", ""))
+            self.cap_var_ed.setText(s.get("var", "") or "")
+            self.cap_timeout_sb.setValue(self._timeout_ms(s))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
             return
         idx = cb.findData(str(val))
         cb.setCurrentIndex(max(0, idx))
+
+    @staticmethod
+    def _timeout_ms(s: dict) -> int:
+        """读取步骤超时（毫秒）：新格式 `timeout_ms` 直接取；旧格式 `timeout`/`timeout_s` 为秒，乘 1000。"""
+        if s.get("timeout_ms") not in (None, ""):
+            return int(s["timeout_ms"])
+        sec = int(s.get("timeout") or s.get("timeout_s") or 0)
+        return sec * 1000
 
     def _load_action(self, type_cb: QComboBox, ed: QLineEdit, act: dict) -> None:
         at = act.get("type") if isinstance(act, dict) else None
@@ -1322,7 +1353,7 @@ class StepDialog(QDialog):
         elif t == "input":
             s["var"] = self.var_ed.text().strip() or "input"
             s["prompt"] = self.prompt_ed.text()
-            s["timeout"] = self.timeout_sb.value()
+            s["timeout_ms"] = self.timeout_sb.value()
         elif t == "trigger":
             conds = list(self.trg_cond.conditions)
             s["relation"] = self.trg_cond.relation()
@@ -1330,7 +1361,11 @@ class StepDialog(QDialog):
             s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
             s["pattern"] = conds[0].get("pattern", "") if conds else ""
             s["delay_ms"] = self.trg_delay_sb.value()
-            s["timeout"] = self.trg_timeout_sb.value()
+            s["timeout_ms"] = self.trg_timeout_sb.value()
+        elif t == "captcha":
+            s["command"] = self.cap_cmd_ed.text().strip()
+            s["var"] = self.cap_var_ed.text().strip() or "captcha"
+            s["timeout_ms"] = self.cap_timeout_sb.value()
         self._step = s
         self.accept()
 

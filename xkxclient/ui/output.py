@@ -27,6 +27,9 @@ _MAX_AUTO_PAGES = 20
 _WINDOW_MAX = 5000
 _HISTORY_MAX = 20000
 
+# 触发器命中行的整行高亮背景（深金色，避免与普通前景/背景冲突）
+_HIGHLIGHT_BG = QColor("#3d3410")
+
 
 class OutputView(QPlainTextEdit):
     """主输出窗口（wiki B5 / B5d / B5-2）。
@@ -41,6 +44,7 @@ class OutputView(QPlainTextEdit):
     search_requested = pyqtSignal(str)
     autopage_hit = pyqtSignal(int)
     search_hits_updated = pyqtSignal(list)   # B5：当前命中行列表 [(行号1基, 全文)]，供分屏显示
+    clicked_blank = pyqtSignal()             # 点击输出区空白 → 焦点还给命令输入框
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -77,13 +81,19 @@ class OutputView(QPlainTextEdit):
         f.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(f)
 
+    def mouseReleaseEvent(self, e) -> None:
+        """点击输出区（读only）：焦点还给命令输入框，不拦截右键菜单/拖选。"""
+        super().mouseReleaseEvent(e)
+        if e.button() == Qt.MouseButton.LeftButton and not self.textCursor().hasSelection():
+            self.clicked_blank.emit()
+
     def set_font_spec(self, spec: dict) -> None:
         self._apply_font(spec)
         cfg.ConfigManager.instance().set("font", spec)
 
     # ---------- 追加 ----------
-    def append_spans(self, spans: list[Span]) -> None:
-        self._insert_blocks([(spans, None)])
+    def append_spans(self, spans: list[Span], highlight: bool = False) -> None:
+        self._insert_blocks([(spans, None)], highlight=highlight)
 
     def append_line(self, text: str) -> None:
         self._insert_blocks([([Span(text)], None)])
@@ -105,7 +115,7 @@ class OutputView(QPlainTextEdit):
             self._insert_blocks([([Span(display, fg=color)], key)])
         self._last_fold_key = key
 
-    def _insert_blocks(self, blocks: list[tuple[list[Span], str | None]]) -> None:
+    def _insert_blocks(self, blocks: list[tuple[list[Span], str | None]], highlight: bool = False) -> None:
         """追加若干行。B5d：未跟随（暂停）时不滚动，只累计浮动按钮计数。
         B5：若处于跟随窗口模式（非回看），插入后把超出 5000 行的最顶行移入历史队列。
         """
@@ -116,6 +126,10 @@ class OutputView(QPlainTextEdit):
         cursor = QTextCursor(self.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
         for spans, fold_key in blocks:
+            if highlight:
+                bg = QTextBlockFormat()
+                bg.setBackground(_HIGHLIGHT_BG)
+                cursor.setBlockFormat(bg)
             for s in spans:
                 fmt = QTextCharFormat()
                 if s.bold:
@@ -131,13 +145,18 @@ class OutputView(QPlainTextEdit):
                 fmt.setForeground(QColor("#" + (spans[0].fg or "888888")))
                 cursor.insertText(f" (×{n})", fmt)
             cursor.insertText("\n")
+            if highlight:
+                # 换行已创建下一个块：重置块格式为空，避免高亮背景继承给后续所有行
+                cursor.setBlockFormat(QTextBlockFormat())
         if was_following:
             self.setTextCursor(cursor)
             self.ensureCursorVisible()
+            self._trim_history()
         else:
+            # 非跟随（回看历史）期间不 trim：避免删除顶部行导致滚动条持续扰动，
+            # 待用户回到底部恢复跟随后再统一裁剪。
             self._new_since_pause += 1
             self._update_new_btn()
-        self._trim_history()
         for spans, _ in blocks:
             if self._auto_paging and spans:
                 self._check_paging(spans[0].text)
@@ -157,20 +176,24 @@ class OutputView(QPlainTextEdit):
 
     def _load_earlier(self) -> None:
         """B5d：回看到达文档顶部并且历史队列仍有更早行时，把更多历史插入顶部。
-        插入后用滚动条偏移保持视觉位置（等效“向上扩展内容”）。
+        插入后用滚动条偏移补偿视觉位置（等效“向上扩展内容”），保持当前可见内容原位不动。
         """
         if not self._history or self._view_all:
             return
         self._view_all = True
         lines = list(self._history)
         self._history.clear()
+        sb = self.verticalScrollBar()
+        old_value = sb.value()
+        old_h = self.document().size().height()
         for text_line in lines:
             cur = QTextCursor(self.document())
             cur.movePosition(QTextCursor.MoveOperation.Start)
             cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
             cur.insertText(text_line + "\n")   # 插到最前：每行插在段落开头的行上方
-        # 由于先插入到顶部，滚动条需要补偿视觉位置
-        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+        new_h = self.document().size().height()
+        # 顶部插入 N 行后，文档变高；把滚动值同步下移插入高度，让原本可见的内容保持原位
+        sb.setValue(int(old_value + (new_h - old_h)))
 
     def _jump_top_to_bottom(self) -> None:
         """Ctrl+End（或「到底部」）：强制回底并恢复跟随（B5d）。"""
@@ -202,6 +225,8 @@ class OutputView(QPlainTextEdit):
                 self.new_btn.setVisible(False)
                 self.jump_to_bottom()
             self._following = True
+            # 回到底部恢复跟随后：一次性裁剪到窗口上限（回看期间跳过的 trim）
+            self._trim_history()
         else:
             self._following = False
 

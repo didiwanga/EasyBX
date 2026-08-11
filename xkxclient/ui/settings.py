@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QListWidget,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
 )
 
+from xkxclient.core.config import ConfigManager
 from xkxclient.core.shortcuts import ShortcutManager
 
 
@@ -113,3 +116,55 @@ class ShortcutDialog(QDialog):
     def _reset(self) -> None:
         self.sm.reset_all()
         self._rebuild()
+
+
+# 关闭行为配置键的取值：always_tray / always_quit / ask（默认）
+_CLOSE_MODE_KEY = "close.mode"
+
+
+class CloseBehaviorDialog(QDialog):
+    """关闭行为设置：关闭按钮是退出还是缩到托盘，或每次询问；修改这里可改变保存过的选择。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("关闭行为")
+        self.setMinimumWidth(360)
+        self.ask_rb = QRadioButton("每次询问（推荐）")
+        self.tray_rb = QRadioButton("关闭即缩到系统托盘")
+        self.quit_rb = QRadioButton("关闭即直接退出")
+        mode = ConfigManager.instance().get(_CLOSE_MODE_KEY, "ask")
+        if mode == "always_tray":
+            self.tray_rb.setChecked(True)
+        elif mode == "always_quit":
+            self.quit_rb.setChecked(True)
+        else:
+            self.ask_rb.setChecked(True)
+        group = QButtonGroup(self)
+        group.addButton(self.ask_rb)
+        group.addButton(self.tray_rb)
+        group.addButton(self.quit_rb)
+
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self._save)
+        close_btn = QPushButton("取消")
+        close_btn.clicked.connect(self.accept)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("点击主窗口关闭按钮时的行为："))
+        lay.addWidget(self.ask_rb)
+        lay.addWidget(self.tray_rb)
+        lay.addWidget(self.quit_rb)
+        btns = QHBoxLayout()
+        btns.addWidget(save_btn)
+        btns.addWidget(close_btn)
+        lay.addLayout(btns)
+
+    def _save(self) -> None:
+        if self.tray_rb.isChecked():
+            mode = "always_tray"
+        elif self.quit_rb.isChecked():
+            mode = "always_quit"
+        else:
+            mode = "ask"
+        ConfigManager.instance().set(_CLOSE_MODE_KEY, mode)
+        self.accept()

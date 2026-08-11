@@ -217,6 +217,27 @@ QComboBox QAbstractItemView {{ background: {raised}; color: {text};
     selection-background-color: {btn_hover}; }}
 QSpinBox {{ background: {field}; color: {text}; border: 1px solid {border};
     border-radius: 5px; padding: 2px 6px; }}
+QSpinBox::up-button, QSpinBox::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: right;
+    width: 18px;
+    border-left: 1px solid {border};
+    background: {btn};
+}}
+QSpinBox::up-button {{ subcontrol-position: top right; border-top-right-radius: 5px; }}
+QSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: 5px; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {btn_hover}; }}
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background: {btn_down}; }}
+QSpinBox::up-arrow {{
+    image: none; width: 0; height: 0;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-bottom: 6px solid {text};
+}}
+QSpinBox::down-arrow {{
+    image: none; width: 0; height: 0;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 6px solid {text};
+}}
 QScrollBar:vertical {{ background: {base}; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {border2}; border-radius: 5px; min-height: 30px; }}
 QScrollBar:horizontal {{ background: {base}; height: 10px; }}

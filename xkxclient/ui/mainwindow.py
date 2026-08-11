@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QActionGroup
-from PyQt6.QtWidgets import QDockWidget, QMainWindow, QMessageBox, QTabWidget, QToolBar, QWidget
+from PyQt6.QtWidgets import QCheckBox, QDockWidget, QMainWindow, QMessageBox, QTabWidget, QToolBar, QWidget
 
 from xkxclient.core import config as cfg
 from xkxclient.core import resources
@@ -16,7 +16,8 @@ from xkxclient.ui.commands import CommandPanel, CommandStore
 from xkxclient.ui.dslmanual import DslManualPanel
 from xkxclient.ui.lookdock import LookDock
 from xkxclient.ui.mapdock import MapDock
-from xkxclient.ui.settings import EnvSettingsDialog, ShortcutDialog
+from xkxclient.ui.navdock import NavDock
+from xkxclient.ui.settings import CloseBehaviorDialog, EnvSettingsDialog, ShortcutDialog
 from xkxclient.ui.skillsdock import SkillsDock
 from xkxclient.ui.statusdock import StateDock
 from xkxclient.ui.statusbar import StatusBar
@@ -58,6 +59,7 @@ class MainWindow(QMainWindow):
         self.combat_dock = self._make_dock("自动战斗", CombatAssistDock(None))
         self.xiuxian_dock = self._make_dock("辅助修炼", XiuxianDock(None))
         self.map_dock = self._make_dock("地图", MapDock(None))
+        self.nav_dock = self._make_dock("导航目的地", NavDock(None))
         self.look_dock = self._make_dock("房间详情", LookDock(None))
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.skills_dock)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.state_dock)
@@ -70,6 +72,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.combat_dock)
         self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.xiuxian_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.map_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.nav_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.look_dock)
 
         self._cur_tab: AccountTab | None = None
@@ -117,6 +120,8 @@ class MainWindow(QMainWindow):
         fm.addAction("断开当前标签", self._disconnect_current)
         fm.addAction("重新连接", self._reconnect_current)
         fm.addSeparator()
+        fm.addAction("关闭行为…", lambda: CloseBehaviorDialog(self).exec())
+        fm.addSeparator()
         fm.addAction("退出", self.close)
 
         em = bar.addMenu("编辑")
@@ -143,6 +148,7 @@ class MainWindow(QMainWindow):
         vm.addAction("自动战斗", self._toggle_dock(self.combat_dock))
         vm.addAction("辅助修炼", self._toggle_dock(self.xiuxian_dock))
         vm.addAction("地图", self._toggle_dock(self.map_dock))
+        vm.addAction("导航目的地", self._toggle_dock(self.nav_dock))
         vm.addAction("房间详情", self._toggle_dock(self.look_dock))
         vm.addSeparator()
         tm_themes = vm.addMenu("🎨 主题")
@@ -177,7 +183,7 @@ class MainWindow(QMainWindow):
 
         hm = bar.addMenu("帮助")
         hm.addAction("关于", self._about)
-        hm.addAction("脚本 API 文档", self._api_doc)
+        hm.addAction("Lua 脚本手册", self._open_manual)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("自动化", self)
@@ -189,25 +195,27 @@ class MainWindow(QMainWindow):
         tb.addAction("🎬 宏", lambda: self._open_editor("macro"))
         tb.addAction("📜 脚本", lambda: self._open_editor("script"))
         tb.addSeparator()
-        self._trg_on_act = tb.addAction("✓ 触发器")
+        self._trg_on_act = tb.addAction("🟢 触发器")
         self._trg_on_act.setCheckable(True)
-        self._trg_on_act.setChecked(bool(self.app.config.get("automation.trigger_on", True)))
+        self._trg_on_act.setToolTip("触发器总开关：一键启用/停用全部触发器")
         self._trg_on_act.toggled.connect(self._toggle_trigger_master)
-        self._tmr_on_act = tb.addAction("✓ 定时器")
+        self._trg_on_act.setChecked(bool(self.app.config.get("automation.trigger_on", True)))
+        self._tmr_on_act = tb.addAction("🟢 定时器")
         self._tmr_on_act.setCheckable(True)
-        self._tmr_on_act.setChecked(bool(self.app.config.get("automation.timer_on", True)))
+        self._tmr_on_act.setToolTip("定时器总开关：一键启用/停用全部定时器")
         self._tmr_on_act.toggled.connect(self._toggle_timer_master)
+        self._tmr_on_act.setChecked(bool(self.app.config.get("automation.timer_on", True)))
         tb.addSeparator()
-        tb.addAction("▶ 宏控制", lambda: self.macro_dock.show())
+        tb.addAction("▶ 宏控制", self._toggle_dock(self.macro_dock))
         tb.addAction("🔍 查找", self._show_find)
-        tb.addAction("📖 命令速查", lambda: self.commands_dock.show())
+        tb.addAction("📖 命令速查", self._toggle_dock(self.commands_dock))
         self.addToolBar(tb)
 
     def _build_shortcuts(self) -> None:
         sc = ShortcutManager.instance()
         actions = {
             "find": self._show_find, "font": self._open_font, "fullscreen": self._toggle_fullscreen,
-            "close_tab": self._close_current, "commands_panel": lambda: self.commands_dock.show(),
+            "close_tab": self._close_current, "commands_panel": self._toggle_dock(self.commands_dock),
             "trigger_edit": lambda: self._open_editor("trigger"),
             "alias_edit": lambda: self._open_editor("alias"),
             "timer_edit": lambda: self._open_editor("timer"),
@@ -223,7 +231,7 @@ class MainWindow(QMainWindow):
             "next_tab": self._next_tab,
             "prev_tab": self._prev_tab,
             "find_next": self._find_next,
-            "local_map": lambda: self.map_dock.show(),
+            "local_map": self._toggle_dock(self.map_dock),
         }
         for key, cb in actions.items():
             sc.register(key, cb)
@@ -251,6 +259,7 @@ class MainWindow(QMainWindow):
         self.combat_dock.widget().bind(session)
         self.xiuxian_dock.widget().bind(session)
         self.map_dock.widget().bind(session)
+        self.nav_dock.widget().bind(session)
         self.look_dock.widget().bind(session)
         self.skills_dock_widget().bind(session)
         self._subscribe_nav(session)
@@ -263,6 +272,7 @@ class MainWindow(QMainWindow):
     def _subscribe_nav(self, session) -> None:
         """地图导航状态事件转发给地图面板更新 UI。"""
         self.app.bus.subscribe_pattern("nav.*", self.map_dock.widget().on_nav_state)
+        self.app.bus.subscribe_pattern("nav.*", self.nav_dock.widget()._nav_state)
 
     def _update_status(self, session) -> None:
         st = session.state
@@ -314,6 +324,7 @@ class MainWindow(QMainWindow):
 
         session = self._cur_tab.session
         w = FullmeGridWindow(session, urls=payload.get("urls") or [])
+        self._fullme_grid_win = w
         w.show()
 
     def _on_login_done(self, payload: dict) -> None:
@@ -333,6 +344,8 @@ class MainWindow(QMainWindow):
 
         session = self._cur_tab.session
         w = FullmeWindow(session, source=payload.get("source", "manual"), url=payload.get("url", ""))
+        w._debug_log = lambda msg: self.status.showMessage(str(msg)[:120], 5000)
+        self._fullme_win = w
         w.show()
 
     def _on_throttle(self, payload: dict) -> None:
@@ -402,7 +415,8 @@ class MainWindow(QMainWindow):
     def _new_connection(self) -> None:
         from xkxclient.ui.login import LoginWindow
 
-        LoginWindow(self.app, self).show()
+        self._login_window = LoginWindow(self.app, self)
+        self._login_window.show()
 
     def _command_fill(self, name: str) -> None:
         tab = self._tab()
@@ -434,11 +448,11 @@ class MainWindow(QMainWindow):
     def _about(self) -> None:
         AboutDialog(self).exec()
 
-    def _api_doc(self) -> None:
-        QMessageBox.information(self, "脚本 API",
-                                "send(cmd) / print(text)\n"
-                                "触发器/别名/定时器/宏 由编辑器管理。\n"
-                                "事件总线事件前缀：net.* state.* GMCP.* channel.* look.parsed map.*")
+    def _open_manual(self) -> None:
+        from xkxclient.ui.manual import LuaManualDialog
+
+        self._manual_dialog = LuaManualDialog(self)
+        self._manual_dialog.show()
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -465,6 +479,7 @@ class MainWindow(QMainWindow):
             t = self.tabs.widget(i)
             if isinstance(t, AccountTab):
                 t.session.triggers.master_on = on
+        self._update_master_action(self._trg_on_act, "触发器", on)
 
     def _toggle_timer_master(self, on: bool) -> None:
         self.app.config.set("automation.timer_on", on)
@@ -472,6 +487,13 @@ class MainWindow(QMainWindow):
             t = self.tabs.widget(i)
             if isinstance(t, AccountTab):
                 t.session.timers.master_on = on
+        self._update_master_action(self._tmr_on_act, "定时器", on)
+
+    def _update_master_action(self, act, name: str, on: bool) -> None:
+        """总开关按钮图标 + 文字随状态切换，并状态栏提示。"""
+        icon = "🟢" if on else "⚫"
+        act.setText(f"{icon} {name}")
+        self.status.showMessage(f"{name}已{'启用' if on else '停用'}", 3000)
 
     def _show_find(self) -> None:
         tab = self._tab()
@@ -507,10 +529,41 @@ class MainWindow(QMainWindow):
             tab.session.set_encoding(enc)
 
     def _toggle_dock(self, dock: QDockWidget):
+        """菜单/工具栏切到某 dock：隐藏则显示；显示但被其它 dock 标签盖住则切到该标签，并闪烁提示。"""
+
         def toggle():
-            dock.setVisible(not dock.isVisible())
+            if dock.isVisible():
+                self._raise_dock(dock)
+            else:
+                dock.setVisible(True)
+                self._raise_dock(dock)
 
         return toggle
+
+    def _raise_dock(self, dock: QDockWidget) -> None:
+        """把 dock 提到所在组合（tab 化）的前台，并闪烁 2-3 次提示位置。"""
+        dock.raise_()
+        self._flash_dock(dock, 3)
+
+    def _flash_dock(self, dock: QDockWidget, times: int) -> None:
+        """闪烁 dock 标题栏：交替高亮/正常背景色，times 次。"""
+        from PyQt6.QtCore import QTimer
+
+        title = dock.titleBarWidget() if dock.titleBarWidget() is not None else dock
+        base = title.styleSheet()
+        flash = "background:#5a7ad1; color:#ffffff; border-radius:4px; padding:2px 6px;"
+        count = [0]
+
+        def step():
+            count[0] += 1
+            title.setStyleSheet(flash if count[0] % 2 == 1 else base)
+            if count[0] >= times * 2:
+                title.setStyleSheet(base)
+
+        t = QTimer(self)
+        t.setInterval(160)
+        t.timeout.connect(step)
+        t.start()
 
     def _open_editor(self, kind: str) -> None:
         tab = self._tab()
@@ -530,7 +583,7 @@ class MainWindow(QMainWindow):
     # ---- 布局持久化 ----
     # 默认启动布局：以用户当前 dock 布局固化（8 方向各 dock 位置/尺寸）。
     _DEFAULT_LAYOUT = (
-        "000000ff00000000fd000000020000000000000144000002ddfc0200000001fc00000042000002dd000002b101000019fa000000000100000004fb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff000000f000fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff000000e600fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff0000014400fffffffb0000000e0064006f0063006b005f573056fe0100000000ffffffff000000f000ffffff0000000100000106000002ddfc0200000003fc00000042000000dd000000dd01000019fa000000000100000004fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000009600fffffffb000000100064006f0063006b005f5b8f63a752360100000000ffffffff0000010600fffffffb000000120064006f0063006b005f547d4ee4901f67e501000003fc000001040000004f00fffffffb000000160064006f0063006b005f00440053004c0020624b518c0100000000ffffffff0000004f00fffffffc0000012300000137000000d801000019fa000000010100000003fb0000000e0064006f0063006b005f72b6600101000005a500000106000000dc00fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff000000c800fffffffb000000120064006f0063006b005f623f95f48be660c50100000000ffffffff000000dc00fffffffb000000120064006f0063006b005f79fb52a863a75236010000025e000000c1000000c100ffffff000002ae000002dd00000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
+        "000000ff00000000fd000000020000000000000144000002ddfc0200000001fc00000042000002dd000002b201000019fa000000000100000005fb000000140064006f0063006b005f5bfc822a76ee768457300100000000ffffffff0000014400fffffffb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff000000f000fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff000000e600fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff0000014400fffffffb0000000e0064006f0063006b005f573056fe0100000000ffffffff000000f000ffffff0000000100000106000002ddfc0200000003fc00000042000000dd000000dd01000019fa000000000100000004fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000009600fffffffb000000100064006f0063006b005f5b8f63a752360100000000ffffffff0000010600fffffffb000000120064006f0063006b005f547d4ee4901f67e501000003fc000001040000004f00fffffffb000000160064006f0063006b005f00440053004c0020624b518c0100000000ffffffff0000004f00fffffffc0000012300000137000000d801000019fa000000000100000003fb0000000e0064006f0063006b005f72b6600101000005a500000106000000dc00fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff000000c800fffffffb000000120064006f0063006b005f623f95f48be660c50100000000ffffffff000000dc00fffffffb000000120064006f0063006b005f79fb52a863a75236010000025e000000c1000000c100ffffff000002ae000002dd00000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
     )
 
     def _restore_layout(self) -> None:
@@ -549,6 +602,53 @@ class MainWindow(QMainWindow):
         cfg.ConfigManager.instance().set("layout_state", bytes(state).hex())
 
     def closeEvent(self, event) -> None:
+        # 已在执行退出流程（托盘"退出"）时直接放行，不再询问
+        if self.app.shutting_down:
+            self.save_layout()
+            super().closeEvent(event)
+            return
+        mode = cfg.ConfigManager.instance().get("close.mode", "ask")
+        if mode == "always_quit":
+            self._do_quit(event)
+            return
+        if mode == "always_tray":
+            self._minimize_to_tray()
+            event.ignore()
+            return
+        # 询问：退出 / 缩托盘 / 取消
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭 EasyBXb")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("确定要关闭客户端吗？")
+        remember_cb = QCheckBox("记住我的选择，不再提示", box)
+        box.setCheckBox(remember_cb)
+        btn_quit = box.addButton("关闭客户端", QMessageBox.ButtonRole.DestructiveRole)
+        btn_tray = box.addButton("缩到系统托盘", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is None or box.buttonRole(clicked) == QMessageBox.ButtonRole.RejectRole:
+            event.ignore()
+            return
+        if clicked is btn_quit:
+            if remember_cb.isChecked():
+                cfg.ConfigManager.instance().set("close.mode", "always_quit")
+            self._do_quit(event)
+            return
+        if clicked is btn_tray:
+            if remember_cb.isChecked():
+                cfg.ConfigManager.instance().set("close.mode", "always_tray")
+            self._minimize_to_tray()
+            event.ignore()
+
+    def _do_quit(self, event) -> None:
+        """真正退出：保存布局 → 优雅登出 + 关会话 + 存配置 → 接受关闭。"""
         self.save_layout()
         self.app.shutdown()
         super().closeEvent(event)
+
+    def _minimize_to_tray(self) -> None:
+        """最小化到系统托盘（进程保留在后台）。"""
+        self.hide()
+        if hasattr(self, "tray"):
+            self.tray.show()

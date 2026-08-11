@@ -54,6 +54,10 @@ class CombatEngine(QObject):
         self.fight_count = 0              # 累计战斗次数
         self.last_step_at = 0.0
 
+        self.buff_watch: list[dict] = []   # [{name, cmd, cooldown}]
+        self._buff_last_cast: dict[str, float] = {}
+
+        self._load_buff_watch()
         self._load_cfg()
         self._rebuild_actions()
 
@@ -67,9 +71,6 @@ class CombatEngine(QObject):
         self.bus.subscribe("GMCP.Combat", self._on_combat)
         self.bus.subscribe("state.combat", self._on_enemy)
         self.bus.subscribe("state.buffs", self._on_buffs)
-        self.buff_watch: list[dict] = []   # [{name, cmd, cooldown}]
-        self._buff_last_cast: dict[str, float] = {}
-        self._load_buff_watch()
 
     # ---- 配置 ----
     def _load_cfg(self) -> None:
@@ -77,11 +78,21 @@ class CombatEngine(QObject):
         self._cfg = dict(cfg.get(f"combat.{self.account}") or {})
         self.enabled = bool(self._cfg.get("enabled", False))
         self.rotation = list(self._cfg.get("rotation") or [])
+        self._migrate_cd_units()
 
-    def save_cfg(self) -> None:
-        pieces = {"enabled": self.enabled, "rotation": self.rotation}
-        self._cfg.update(pieces)
-        ConfigManager.instance().set(f"combat.{self.account}", dict(self._cfg))
+    def _migrate_cd_units(self) -> None:
+        """旧版冷却为秒（0-300），现统一为毫秒：把看起来像秒的旧值 ×1000 迁移。"""
+        changed = False
+        for item in self.rotation:
+            if isinstance(item, dict) and item.get("cd") and item["cd"] <= 300:
+                item["cd"] = int(item["cd"]) * 1000
+                changed = True
+        for w in self.buff_watch:
+            if isinstance(w, dict) and w.get("cooldown") and w["cooldown"] <= 300:
+                w["cooldown"] = int(w["cooldown"]) * 1000
+                changed = True
+        if changed:
+            self.save_cfg()
 
     def set_rotation(self, rotation: list[dict]) -> None:
         self.rotation = list(rotation or [])
@@ -112,7 +123,7 @@ class CombatEngine(QObject):
                 continue
             acts.append({
                 "cmd": cmd,
-                "cd": max(0.0, float(item.get("cd") or 0)),
+                "cd": max(0.0, float(item.get("cd") or 0) / 1000.0),
                 "min_qi": int(item.get("min_qi") or 0),
                 "desc": str(item.get("desc") or cmd),
             })
@@ -260,7 +271,7 @@ class CombatEngine(QObject):
             name = str(w.get("name") or "")
             if not name or any(name in a or a in name for a in active_names):
                 continue
-            cd = float(w.get("cooldown") or 0)
+            cd = float(w.get("cooldown") or 0) / 1000.0
             if now - self._buff_last_cast.get(name, 0.0) >= cd:
                 self._buff_last_cast[name] = now
                 self.session.send_auto(str(w.get("cmd") or ""))
