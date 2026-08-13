@@ -40,8 +40,12 @@ class OutputView(QPlainTextEdit):
     """
 
     new_trigger_requested = pyqtSignal(str)
-    filter_add_requested = pyqtSignal(str)
+    screen_block_add_requested = pyqtSignal(str)
     search_requested = pyqtSignal(str)
+    command_fill_requested = pyqtSignal(str)   # 右键：填写命令（仅填入命令框）
+    command_send_requested = pyqtSignal(str)   # 右键：发送命令（填入并执行）
+    look_send_requested = pyqtSignal(str)      # 右键：直接发送 look + 选中文本
+    ask_fill_requested = pyqtSignal(str)       # 右键：填入 ask + 选中文本 + about
     autopage_hit = pyqtSignal(int)
     search_hits_updated = pyqtSignal(list)   # B5：当前命中行列表 [(行号1基, 全文)]，供分屏显示
     clicked_blank = pyqtSignal()             # 点击输出区空白 → 焦点还给命令输入框
@@ -348,14 +352,14 @@ class OutputView(QPlainTextEdit):
         self._following = False
 
     def clear(self) -> None:
-        """清洁画面：清空可见文档，历史保留（B5 _history 不动）。"""
+        """清屏：清空可见文档，历史保留（B5 _history 不动）。"""
         self._search_matches = []
         self._search_index = -1
         self.setExtraSelections([])
         super().clear()
 
     def clear_history(self) -> None:
-        """清空输出（含历史）：同时清空可见文档与 _history。"""
+        """清空历史：同时清空可见文档与 _history。"""
         self.clear()
         if getattr(self, "_history", None) is not None:
             self._history.clear()
@@ -365,10 +369,16 @@ class OutputView(QPlainTextEdit):
         menu = QMenu(self)
         menu.addAction("复制", self.copy)
         menu.addSeparator()
-        sel = self.textCursor().selectedText()
-        menu.addAction("搜索…", lambda: self.search_requested.emit(sel))
+        raw = self.textCursor().selectedText()
+        sel = re.sub(r"[\u2029\u2028\n\r\t]+", " ", raw).strip()
+        menu.addAction("填写命令", lambda: self.command_fill_requested.emit(sel))
+        menu.addAction("发送命令", lambda: self.command_send_requested.emit(sel))
+        menu.addAction("看", lambda: self.look_send_requested.emit(sel))
+        menu.addAction("NPC对话", lambda: self.ask_fill_requested.emit(sel))
+        menu.addSeparator()
+        menu.addAction("搜索…", lambda: self.search_requested.emit(raw))
         menu.addAction("新建触发器…", lambda: self.new_trigger_requested.emit(sel))
-        menu.addAction("添加到过滤器", lambda: self.filter_add_requested.emit(sel))
+        menu.addAction("添加到屏显屏蔽", lambda: self.screen_block_add_requested.emit(sel))
         menu.addSeparator()
         menu.addAction("字体设置…", self._open_font_dialog)
         menu.addAction("清屏", self.clear)

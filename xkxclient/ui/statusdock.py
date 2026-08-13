@@ -178,7 +178,7 @@ class StateDock(QWidget):
         if en:
             bits.append(str(en))
         if pct is not None:
-            self.enemy_bar.setValue(_clamp(_pct(pct)))
+            self.enemy_bar.setValue(_clamp(_pct(pct) / 100))
         if dmg is not None:
             bits.append(f"伤害{dmg}")
         self.enemy_label.setText(" ".join(bits))

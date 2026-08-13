@@ -83,15 +83,19 @@ class ActionEdit(QWidget):
         self.timer_names = timer_names or []
         self.list = QListWidget()
         self.add_btn = QPushButton("＋ 动作")
+        self.edit_btn = QPushButton("编辑")
         self.del_btn = QPushButton("－ 删除")
         self.add_btn.clicked.connect(self._on_add)
+        self.edit_btn.clicked.connect(self._on_edit)
         self.del_btn.clicked.connect(self._on_del)
+        self.list.itemDoubleClicked.connect(lambda _i: self._on_edit())
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(QLabel("动作"))
         lay.addWidget(self.list, 1)
         btns = QHBoxLayout()
         btns.addWidget(self.add_btn)
+        btns.addWidget(self.edit_btn)
         btns.addWidget(self.del_btn)
         lay.addLayout(btns)
         self.actions: list[dict] = []
@@ -119,6 +123,22 @@ class ActionEdit(QWidget):
         return name
 
     def _on_add(self) -> None:
+        a = self._dlg()
+        if a:
+            self.actions.append(a)
+            self._refresh()
+
+    def _on_edit(self) -> None:
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.actions):
+            return
+        a = self._dlg(self.actions[row])
+        if a:
+            self.actions[row] = a
+            self._refresh()
+
+    def _dlg(self, cur: dict | None = None) -> dict | None:
+        """动作编辑对话框：按类型动态显示相关控件。"""
         dlg = QDialog(self)
         dlg.setWindowTitle("动作")
         type_cb = QComboBox()
@@ -126,6 +146,9 @@ class ActionEdit(QWidget):
             type_cb.addItem(label, code)
         cmd_ed = QLineEdit(); cmd_ed.setPlaceholderText("命令（{变量}）")
         timer_ed = QLineEdit()
+        timer_ed.setPlaceholderText("定时器名")
+        if self.timer_names:
+            timer_ed.setText(self.timer_names[0])
         msg_ed = QLineEdit(); msg_ed.setPlaceholderText("通知内容")
         target_cb = QComboBox(); target_cb.addItems(["trigger", "macro", "timer"])
         op_cb = QComboBox(); op_cb.addItems(["start", "stop", "pause", "resume"])
@@ -134,23 +157,42 @@ class ActionEdit(QWidget):
         form.addRow("命令", cmd_ed)
         form.addRow("定时器名", timer_ed)
         form.addRow("消息", msg_ed)
-        form.addRow("控制", target_cb); form.addRow("操作", op_cb)
+        form.addRow("控制", target_cb)
+        form.addRow("操作", op_cb)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
         box.accepted.connect(dlg.accept)
         box.rejected.connect(dlg.reject)
         lay = QVBoxLayout(dlg); lay.addLayout(form); lay.addWidget(box)
+
+        def sync(idx: int) -> None:
+            t = type_cb.itemData(idx)
+            cmd_ed.setVisible(t == "cmd")
+            timer_ed.setVisible(t in ("timer_start", "timer_stop"))
+            msg_ed.setVisible(t == "notify")
+            target_cb.setVisible(t == "control")
+            op_cb.setVisible(t == "control")
+
+        type_cb.currentIndexChanged.connect(sync)
+        if cur:
+            t = cur.get("type")
+            type_cb.setCurrentIndex(max(0, type_cb.findData(t)))
+            cmd_ed.setText(cur.get("command", "") if t == "cmd" else "")
+            timer_ed.setText(cur.get("name", "") if t in ("timer_start", "timer_stop") else "")
+            msg_ed.setText(cur.get("message", "") if t == "notify" else "")
+            if t == "control":
+                target_cb.setCurrentIndex(max(0, target_cb.findText(cur.get("target", "trigger"))))
+                op_cb.setCurrentIndex(max(0, op_cb.findText(cur.get("op", "start"))))
+        sync(type_cb.currentIndex())
         if not dlg.exec():
-            return
+            return None
         t = type_cb.currentData()
         if t == "cmd":
-            self.actions.append({"type": "cmd", "command": cmd_ed.text().strip()})
-        elif t in ("timer_start", "timer_stop"):
-            self.actions.append({"type": t, "name": timer_ed.text().strip()})
-        elif t == "notify":
-            self.actions.append({"type": "notify", "message": msg_ed.text().strip()})
-        else:
-            self.actions.append({"type": "control", "target": target_cb.currentText(), "op": op_cb.currentText()})
-        self._refresh()
+            return {"type": "cmd", "command": cmd_ed.text().strip()}
+        if t in ("timer_start", "timer_stop"):
+            return {"type": t, "name": timer_ed.text().strip()}
+        if t == "notify":
+            return {"type": "notify", "message": msg_ed.text().strip()}
+        return {"type": "control", "target": target_cb.currentText(), "op": op_cb.currentText()}
 
     def _on_del(self) -> None:
         row = self.list.currentRow()
@@ -918,6 +960,14 @@ class MacroEditor(_EditorBase):
             return f"触发: {cond.get('type', s.get('match_type', 'contains'))} {pat}"
         if t == "captcha":
             return f"验证码: {s.get('command', '')} → ${s.get('var', 'captcha')}"
+        if t == "branch":
+            conds = s.get("conditions") or []
+            kws = s.get("keywords") or []
+            dm = s.get("delay_ms") or 0
+            tm = s.get("timeout_ms") or 0
+            return f"判断分支: 条件{len(conds)} 关键字{len(kws)} 延时{dm} 超时{tm}"
+        if t == "loop":
+            return f"计数循环: 起点{s.get('start', '')} 次数{s.get('count', 0)}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -994,13 +1044,15 @@ class StepDialog(QDialog):
 
     _STEP_LABELS = [("cmd", "命令"), ("delay", "延时"), ("label", "标签"),
                     ("jump", "跳转"), ("if", "判断"), ("status", "状态"),
-                    ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码")]
+                    ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码"),
+                    ("branch", "判断分支"), ("loop", "计数循环")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("宏步骤")
         self._step: dict | None = None
         self._steps = steps or []
+        self._branch_keywords: list[dict] = []
 
         # ---- 类型选择 ----
         self.type_cb = QComboBox()
@@ -1092,6 +1144,36 @@ class StepDialog(QDialog):
         self.cap_timeout_sb = QSpinBox(); self.cap_timeout_sb.setRange(100, 3600000)
         self.cap_timeout_sb.setValue(3000); self.cap_timeout_sb.setSuffix(" ms")
 
+        # ---- 判断分支页：可选触发条件 + 关键字列表（每个关键字一个动作）+ 延时/超时 ----
+        self.br_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.br_cond.setMinimumHeight(150)
+        self.br_kw_list = QListWidget()
+        self.br_kw_list.setMinimumHeight(150)
+        self.br_kw_add = QPushButton("＋关键字")
+        self.br_kw_edit = QPushButton("编辑")
+        self.br_kw_del = QPushButton("－关键字")
+        self.br_kw_add.clicked.connect(self._br_kw_add)
+        self.br_kw_edit.clicked.connect(lambda: self._br_kw_edit(None))
+        self.br_kw_del.clicked.connect(self._br_kw_del)
+        self.br_kw_list.itemDoubleClicked.connect(lambda _i: self._br_kw_edit(None))
+        br_kw_btns = QHBoxLayout()
+        br_kw_btns.addWidget(self.br_kw_add)
+        br_kw_btns.addWidget(self.br_kw_edit)
+        br_kw_btns.addWidget(self.br_kw_del)
+        self.br_delay_sb = QSpinBox(); self.br_delay_sb.setRange(0, 3600000)
+        self.br_delay_sb.setSuffix(" ms")
+        self.br_delay_sb.setToolTip("命中后延时执行动作")
+        self.br_timeout_sb = QSpinBox(); self.br_timeout_sb.setRange(0, 3600000)
+        self.br_timeout_sb.setSuffix(" ms")
+        self.br_timeout_sb.setToolTip("等待触发条件/关键字命中的超时；超时继续下一步")
+
+        # ---- 计数循环页 ----
+        self.lp_start_cb = QComboBox()
+        self.lp_start_cb.setToolTip("循环起点：已有标签或步骤序号")
+        self.lp_count_sb = QSpinBox(); self.lp_count_sb.setRange(0, 999999)
+        self.lp_count_sb.setValue(3)
+        self.lp_count_sb.setToolTip("循环次数；0 = 无限循环")
+
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
 
@@ -1157,6 +1239,21 @@ class StepDialog(QDialog):
         cf.addRow("检测超时", self.cap_timeout_sb)
         self._pages["captcha"] = p_cap
 
+        p_branch = QWidget()
+        bf = QFormLayout(p_branch)
+        bf.addRow("触发条件(可空)", self.br_cond)
+        bf.addRow("关键字列表", self.br_kw_list)
+        bf.addRow(br_kw_btns)
+        bf.addRow("命中后延时", self.br_delay_sb)
+        bf.addRow("等待超时", self.br_timeout_sb)
+        self._pages["branch"] = p_branch
+
+        p_loop = QWidget()
+        lf = QFormLayout(p_loop)
+        lf.addRow("循环起点", self.lp_start_cb)
+        lf.addRow("循环次数", self.lp_count_sb)
+        self._pages["loop"] = p_loop
+
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
             self.stack.addWidget(self._pages[code])
@@ -1187,7 +1284,7 @@ class StepDialog(QDialog):
 
     def _populate_targets(self) -> None:
         for cb in (self.jump_target_cb, self.if_then_target, self.if_else_target,
-                   self.status_then_target, self.status_else_target):
+                   self.status_then_target, self.status_else_target, self.lp_start_cb):
             cb.clear()
             for val, lab in self._target_options():
                 cb.addItem(lab, val)
@@ -1262,6 +1359,20 @@ class StepDialog(QDialog):
             self.cap_var_ed.setText(s.get("var", "") or "")
             self.cap_timeout_sb.setValue(self._timeout_ms(s))
 
+        # 判断分支步骤
+        if t == "branch":
+            self.br_cond.set_conditions(s.get("conditions") or [])
+            self.br_cond.set_relation(s.get("relation", "or"))
+            self._branch_keywords = [dict(k) for k in (s.get("keywords") or [])]
+            self._br_kw_refresh()
+            self.br_delay_sb.setValue(int(s.get("delay_ms", 0)))
+            self.br_timeout_sb.setValue(self._timeout_ms(s))
+
+        # 计数循环步骤
+        if t == "loop":
+            self.lp_start_cb.setCurrentIndex(max(0, self.lp_start_cb.findData(str(s.get("start", "")))))
+            self.lp_count_sb.setValue(int(s.get("count", 0)))
+
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
             return
@@ -1286,6 +1397,106 @@ class StepDialog(QDialog):
 
     def _reverse_cmd(self) -> None:
         self.cmd_ed.setText(reverse_commands(self.cmd_ed.text()))
+
+    # ---- 判断分支关键字编辑 ----
+    def _br_kw_add(self) -> None:
+        kw = self._br_kw_dlg()
+        if kw:
+            self._branch_keywords.append(kw)
+            self._br_kw_refresh()
+
+    def _br_kw_edit(self, _idx) -> None:
+        row = self.br_kw_list.currentRow()
+        if row < 0 or row >= len(self._branch_keywords):
+            return
+        kw = self._br_kw_dlg(self._branch_keywords[row])
+        if kw:
+            self._branch_keywords[row] = kw
+            self._br_kw_refresh()
+
+    def _br_kw_del(self) -> None:
+        row = self.br_kw_list.currentRow()
+        if row >= 0 and row < len(self._branch_keywords):
+            self._branch_keywords.pop(row)
+            self._br_kw_refresh()
+
+    def _br_kw_refresh(self) -> None:
+        self.br_kw_list.clear()
+        for kw in self._branch_keywords:
+            self.br_kw_list.addItem(self._br_kw_desc(kw))
+
+    def _br_kw_desc(self, kw: dict) -> str:
+        k = kw.get("keyword", "")
+        a = kw.get("action") or {}
+        t = a.get("type")
+        if t == "cmd":
+            return f"含「{k}」→ 命令: {a.get('command', '')}"
+        if t == "jump":
+            return f"含「{k}」→ 跳转: {a.get('target', '')}"
+        if t == "set":
+            return f"含「{k}」→ 赋值: {a.get('var', '')}={a.get('value', '')}"
+        return f"含「{k}」→ (无动作)"
+
+    def _br_kw_dlg(self, kw: dict | None = None) -> dict | None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("关键字")
+        kw_ed = QLineEdit(kw.get("keyword", "") if kw else "")
+        kw_ed.setPlaceholderText("命中行需包含的关键字")
+        act_type = QComboBox()
+        for code, lab in [("cmd", "发送命令"), ("jump", "跳转步骤/标签"), ("set", "变量赋值")]:
+            act_type.addItem(lab, code)
+        cmd_ed = QLineEdit(); cmd_ed.setPlaceholderText("命令（可含 {变量}）")
+        tgt_cb = QComboBox()
+        for val, lab in self._target_options():
+            tgt_cb.addItem(lab, val)
+        set_ed = QLineEdit(); set_ed.setPlaceholderText("{变量}=值")
+        form = QFormLayout()
+        form.addRow("关键字", kw_ed)
+        form.addRow("动作类型", act_type)
+        form.addRow("命令", cmd_ed)
+        form.addRow("跳转到", tgt_cb)
+        form.addRow("赋值", set_ed)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        lay = QVBoxLayout(dlg); lay.addLayout(form); lay.addWidget(box)
+
+        def sync(idx: int) -> None:
+            t = act_type.itemData(idx)
+            cmd_ed.setVisible(t == "cmd")
+            tgt_cb.setVisible(t == "jump")
+            set_ed.setVisible(t == "set")
+
+        act_type.currentIndexChanged.connect(sync)
+        if kw:
+            a = kw.get("action") or {}
+            at = a.get("type")
+            act_type.setCurrentIndex(max(0, act_type.findData(at if at in ("cmd", "jump", "set") else "cmd")))
+            cmd_ed.setText(a.get("command", "") if at == "cmd" else "")
+            tgt_cb.setCurrentIndex(max(0, tgt_cb.findData(str(a.get("target", "")))))
+            if at == "set":
+                set_ed.setText(f"{a.get('var', '')}={a.get('value', '')}")
+        sync(act_type.currentIndex())
+        if not dlg.exec():
+            return None
+        k = kw_ed.text().strip()
+        if not k:
+            return None
+        t = act_type.currentData()
+        if t == "cmd":
+            action = {"type": "cmd", "command": cmd_ed.text().strip()}
+        elif t == "jump":
+            action = {"type": "jump", "target": tgt_cb.currentData() or ""}
+        elif t == "set":
+            txt = set_ed.text().strip()
+            if "=" in txt:
+                var, val = txt.split("=", 1)
+            else:
+                var, val = txt, ""
+            action = {"type": "set", "var": var.strip(), "value": val.strip()}
+        else:
+            action = {}
+        return {"keyword": k, "action": action}
 
     # ---- 收集 ----
     def _collect_action(self, type_cb: QComboBox, ed: QLineEdit) -> dict | None:
@@ -1366,6 +1577,15 @@ class StepDialog(QDialog):
             s["command"] = self.cap_cmd_ed.text().strip()
             s["var"] = self.cap_var_ed.text().strip() or "captcha"
             s["timeout_ms"] = self.cap_timeout_sb.value()
+        elif t == "branch":
+            s["relation"] = self.br_cond.relation()
+            s["conditions"] = list(self.br_cond.conditions)
+            s["keywords"] = [dict(k) for k in self._branch_keywords]
+            s["delay_ms"] = self.br_delay_sb.value()
+            s["timeout_ms"] = self.br_timeout_sb.value()
+        elif t == "loop":
+            s["start"] = self.lp_start_cb.currentData() or ""
+            s["count"] = self.lp_count_sb.value()
         self._step = s
         self.accept()
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QActionGroup
+from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QResizeEvent
 from PyQt6.QtWidgets import (QCheckBox, QDialog, QDockWidget, QLabel, QMainWindow,
-                             QMessageBox, QProgressBar, QTabWidget, QToolBar,
+                             QMessageBox, QProgressBar, QSizePolicy, QTabWidget, QToolBar,
                              QVBoxLayout, QWidget)
 
 from xkxclient.core import config as cfg
@@ -27,6 +27,25 @@ from xkxclient.ui.tabs import AccountTab
 from xkxclient.ui.theme import PALETTES, apply as apply_theme
 from xkxclient.ui.tray import AppTray
 from xkxclient.ui.xiuxiandock import XiuxianDock
+
+
+class ResizableDock(QDockWidget):
+    """PyQt6 QDockWidget 浮动时内部 widget 不跟随窗口缩放，重写 resizeEvent 同步。
+
+    停靠时 QDockWidget 由 QMainWindow 布局管理，尺寸由内容推导；浮动时作为独立
+    窗口，需手动把内容 widget 铺满内部可用区域，否则拖拽边缘无法改变面板宽度。
+    """
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        w = self.widget()
+        if w is None:
+            return
+        if self.isFloating():
+            # 浮动窗口：内容铺满内部可用区域，宽度任意（内部布局按可用宽度流式重排）
+            r = self.contentsRect()
+            if r.width() > 0 and r.height() > 0:
+                w.resize(r.size())
 
 
 class MainWindow(QMainWindow):
@@ -78,6 +97,9 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.look_dock)
 
         self._cur_tab: AccountTab | None = None
+        self._docks_restored = False
+        self._layout_healed = False
+        self._layout_diag = False
         ShortcutManager.instance().attach(self)
         self._build_menus()
         self._build_toolbar()
@@ -110,7 +132,7 @@ class MainWindow(QMainWindow):
 
     # ---- 装配工具 ----
     def _make_dock(self, title: str, widget: QWidget) -> QDockWidget:
-        dock = QDockWidget(title, self)
+        dock = ResizableDock(title, self)
         dock.setWidget(widget)
         dock.setObjectName(f"dock_{title}")
         return dock
@@ -129,8 +151,8 @@ class MainWindow(QMainWindow):
         em = bar.addMenu("编辑")
         em.addAction("查找…", self._show_find)
         em.addAction("字体设置…", self._open_font)
-        em.addAction("清洁画面", self._clean_screen)
-        em.addAction("清空输出", self._clear_output)
+        em.addAction("清屏", self._clean_screen)
+        em.addAction("清空历史", self._clear_output)
 
         vm = bar.addMenu("查看")
         vm.addAction("触发器…", lambda: self._open_editor("trigger"))
@@ -138,6 +160,7 @@ class MainWindow(QMainWindow):
         vm.addAction("定时器…", lambda: self._open_editor("timer"))
         vm.addAction("宏…", lambda: self._open_editor("macro"))
         vm.addAction("脚本…", lambda: self._open_editor("script"))
+        vm.addAction("屏显屏蔽…", self._open_screen_block)
         vm.addSeparator()
         vm.addAction("命令速查", self._toggle_dock(self.commands_dock))
         vm.addAction("DSL 手册", self._toggle_dock(self.dsl_dock))
@@ -167,18 +190,22 @@ class MainWindow(QMainWindow):
             self._theme_actions[key] = act
             tm_themes.addAction(act)
         vm.addSeparator()
+        vm.addAction("重置窗口布局", self._reset_layout)
         vm.addAction("世界地图", self._open_world_map)
         vm.addAction("全屏", self._toggle_fullscreen)
 
         tm = bar.addMenu("工具")
         tm.addAction("编码…", self._open_encoding)
         tm.addAction("fullme 2×2（开 4 次）", self._full_me_4)
+        tm.addAction("自动拾取…", self._open_auto_pickup)
         tm.addAction("服务器环境变量…", self._open_env_settings)
         tm.addAction("快捷键设置…", lambda: ShortcutDialog(self).exec())
 
         am = bar.addMenu("账号")
         am.addAction("新建标签…", self._new_connection)
         am.addAction("关闭当前标签", self._close_current)
+        am.addSeparator()
+        am.addAction("编辑账户信息…", self._manage_accounts)
 
         sm = bar.addMenu("脚本")
         sm.addAction("Lua 脚本…", lambda: self._open_editor("script"))
@@ -191,6 +218,8 @@ class MainWindow(QMainWindow):
         tb = QToolBar("自动化", self)
         tb.setObjectName("automation_toolbar")
         tb.setMovable(False)
+        tb.addAction("🗺 世界地图", self._open_world_map)
+        tb.addSeparator()
         tb.addAction("📋 触发器", lambda: self._open_editor("trigger"))
         tb.addAction("🔗 别名", lambda: self._open_editor("alias"))
         tb.addAction("⏱ 定时器", lambda: self._open_editor("timer"))
@@ -211,6 +240,12 @@ class MainWindow(QMainWindow):
         tb.addAction("▶ 宏控制", self._toggle_dock(self.macro_dock))
         tb.addAction("🔍 查找", self._show_find)
         tb.addAction("📖 命令速查", self._toggle_dock(self.commands_dock))
+        # 最右侧：屏显屏蔽便捷按钮（弹性占位把它推到工具栏右端）
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addAction("🛡 屏显屏蔽", self._open_screen_block)
+        tb.addAction("🪣 自动拾取", self._open_auto_pickup)
         self.addToolBar(tb)
 
     def _build_shortcuts(self) -> None:
@@ -333,6 +368,7 @@ class MainWindow(QMainWindow):
 
     def _on_login_done(self, payload: dict) -> None:
         self.status.set_connection(f"{payload.get('account')} 登录成功")
+        self._layout_diag = True
         if self._cur_tab is not None and self._cur_tab.account_id == payload.get("account"):
             self.skills_dock_widget().refresh()
 
@@ -422,6 +458,12 @@ class MainWindow(QMainWindow):
         self._login_window = LoginWindow(self.app, self)
         self._login_window.show()
 
+    def _manage_accounts(self) -> None:
+        """账号菜单：已存账号的增/删/改（写 accounts.json）。"""
+        from xkxclient.ui.login import AccountManagerDialog
+
+        AccountManagerDialog(cfg.ConfigManager.instance(), self).exec()
+
     def _command_fill(self, name: str) -> None:
         tab = self._tab()
         if tab:
@@ -474,6 +516,22 @@ class MainWindow(QMainWindow):
         if tab:
             EnvSettingsDialog(tab.session, self).exec()
 
+    def _open_screen_block(self) -> None:
+        """查看→屏显屏蔽：管理主屏输出屏蔽规则（包含/正则）。"""
+        from xkxclient.ui.screenblock import ScreenBlockDialog
+
+        tab = self._tab()
+        session = tab.session if tab else None
+        ScreenBlockDialog(session, self).exec()
+
+    def _open_auto_pickup(self) -> None:
+        """工具栏→自动拾取：设置常驻自动拾取（物品中文名/英文名）。"""
+        from xkxclient.ui.pickup import AutoPickupDialog
+
+        tab = self._tab()
+        session = tab.session if tab else None
+        AutoPickupDialog(session, self).exec()
+
     def _toggle_chat(self) -> None:
         pass  # B5e：聊天栏恒开，无总开关
 
@@ -510,13 +568,13 @@ class MainWindow(QMainWindow):
             tab.output._open_font_dialog()
 
     def _clean_screen(self) -> None:
-        """清洁画面（Ctrl+Shift+C）：清空可见输出，历史保留。"""
+        """清屏（Ctrl+Shift+C）：清空可见输出，历史保留。"""
         tab = self._tab()
         if tab:
             tab.output.clear()
 
     def _clear_output(self) -> None:
-        """清空输出（Ctrl+L）：连同历史一并清空。"""
+        """清空历史（Ctrl+L）：连同历史一并清空。"""
         tab = self._tab()
         if tab:
             tab.output.clear_history()
@@ -600,10 +658,111 @@ class MainWindow(QMainWindow):
             self.restoreState(bytes.fromhex(raw))
         except (ValueError, TypeError):
             pass
+        # 登录前主窗口未显示：仅隐藏浮动 dock（它是独立顶层窗口，停靠 dock 随
+        # 主窗口隐藏不会显示）。避免 hide 停靠 dock 打乱 QMainWindow 停靠布局。
+        if not self._docks_restored:
+            for d in self.findChildren(QDockWidget):
+                if d.isFloating():
+                    d.setVisible(False)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not getattr(self, "_docks_restored", False):
+            self._docks_restored = True
+            # 主窗口显示后恢复浮动 dock 可见性（停靠 dock 由主窗口 show 自动布局，
+            # 不应重新 restoreState——窗口显示过程中重放布局会把 dock 排到未就绪的
+            # 负坐标几何，导致控件被撑出窗口）。
+            for d in self.findChildren(QDockWidget):
+                if d.isFloating():
+                    d.setVisible(True)
+            # 恢复后强制重算布局，避免 dock 几何与窗口尺寸不同步
+            QTimer.singleShot(0, self._relayout)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # 兜底：布局偶尔失效时强制激活，保证控件随窗口缩放
+        QTimer.singleShot(0, self._relayout)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        # 最大化/还原等窗口状态变化后，等窗口稳定再强制重算布局
+        if event.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(80, self._relayout)
+
+    def _relayout(self) -> None:
+        # 仅请求重算，不强制 activate（QMainWindow 布局内部管理 dock，
+        # 强制 activate 可能在未稳定时固化错误几何）。
+        self.updateGeometry()
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.updateGeometry()
+            if cw.layout() is not None:
+                cw.layout().invalidate()
+                cw.layout().activate()
+        for d in self.findChildren(QDockWidget):
+            d.updateGeometry()
+        self._heal_dock_layout()
+        if getattr(self, "_layout_diag", False):
+            try:
+                import xkxclient.core.config as _c
+                with open(_c.ConfigManager.instance().root / "layout_diag.log", "a", encoding="utf-8") as f:
+                    f.write("state=%s max=%s win=%dx%d central=%s\n" % (
+                        self.windowState(), self.isMaximized(), self.width(), self.height(),
+                        self.centralWidget().geometry().getRect() if self.centralWidget() else None))
+                    for d in self.findChildren(QDockWidget):
+                        tabs = []
+                        try:
+                            tabs = [t.objectName() for t in self.tabifiedDockWidgets(d)]
+                        except Exception:
+                            pass
+                        f.write("  dock[%s] float=%s vis=%s pos=%s geo=%s tab=%s\n" % (
+                            d.objectName(), d.isFloating(), d.isVisible(),
+                            d.pos().x(), d.pos().y(), d.geometry().getRect(), tabs))
+            except Exception:
+                pass
+
+    def _heal_dock_layout(self) -> None:
+        """自愈：停靠 dock 若被排到主窗口可视区外（负坐标），重新应用布局纠正。
+
+        偶发竞态下 QMainWindow 可能把 dock 排到负坐标（控件被撑出窗口），
+        检测到异常时重新 restoreState 一次，且只在本次显示期间纠正一次避免死循环。
+        """
+        if getattr(self, "_layout_healed", False):
+            return
+        if not self.isVisible():
+            return
+        vw = self.width()
+        bad = False
+        for d in self.findChildren(QDockWidget):
+            if not d.isFloating() and d.isVisible():
+                g = d.geometry()
+                if g.x() < -80 or g.y() < -80 or g.x() > vw:
+                    bad = True
+                    break
+        if not bad:
+            return
+        self._layout_healed = True
+        try:
+            raw = cfg.ConfigManager.instance().get("layout_state")
+            if not (isinstance(raw, str) and raw):
+                raw = self._DEFAULT_LAYOUT
+            self.restoreState(bytes.fromhex(raw))
+        except (ValueError, TypeError):
+            pass
+        QTimer.singleShot(50, self._relayout)
 
     def save_layout(self) -> None:
         state = self.saveState()
         cfg.ConfigManager.instance().set("layout_state", bytes(state).hex())
+
+    def _reset_layout(self) -> None:
+        """重置所有窗口布局为客户端默认布局：清除已存布局并恢复默认。"""
+        cfg.ConfigManager.instance().set("layout_state", "")
+        try:
+            self.restoreState(bytes.fromhex(self._DEFAULT_LAYOUT))
+        except (ValueError, TypeError):
+            pass
+        self.status.showMessage("窗口布局已重置为默认", 3000)
 
     def closeEvent(self, event) -> None:
         # 已在执行退出流程（托盘"退出"）时直接放行，不再询问

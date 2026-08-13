@@ -18,7 +18,9 @@ from xkxclient.core.state import CharacterState
 from xkxclient.net.connection import Connection
 from xkxclient.parse.look import LookParser
 
-_GMCP_SUBSCRIBE = ["Status", "Move", "System", "Combat", "Buff"]
+# 登录后统一发送一次的状态/频道开启指令（含 buff/move/combat/status + hp/score/look）
+_LOGIN_TUNES = ("tune gmcp buff on;tune gmcp move on;tune gmcp combat on;"
+                "tune gmcp status on;hp;score;look")
 
 # 「命令进入缓冲」提示（服务端命令缓冲限流，见 wiki about_cmdbuffer）
 _BUF_PROMPTS = ("命令进入缓冲", "命令缓冲", "指令进入缓冲")
@@ -91,6 +93,7 @@ class AccountSession(QObject):
         from xkxclient.automation.alias import AliasEngine
         from xkxclient.automation.combat import CombatEngine
         from xkxclient.automation.macro import MacroEngine
+        from xkxclient.automation.pickup import AutoPickupEngine
         from xkxclient.automation.throttle import CommandThrottle
         from xkxclient.automation.timer import TimerEngine
         from xkxclient.automation.trigger import TriggerEngine
@@ -100,6 +103,7 @@ class AccountSession(QObject):
         self.timers = TimerEngine(app.bus, self)
         self.macros = MacroEngine(app.bus, self)
         self.combat = CombatEngine(self)
+        self.pickup = AutoPickupEngine(app.bus, self)
         self.throttle = CommandThrottle(self.connection, self.account_id, app.bus)
         # B9 全局开关：读配置初值
         self.triggers.master_on = bool(ConfigManager.instance().get("automation.trigger_on", True))
@@ -120,6 +124,9 @@ class AccountSession(QObject):
         self.skills_dock = None
         self._capture_look = False
         self._look_buf = ""
+
+        # 屏显屏蔽：按配置规则（包含/正则）吞掉主屏输出行（聊天栏/触发器不受影响）
+        self._screen_block = self._load_screen_block()
 
         # node 命令捕获：表格行拦截不上主输出（仅表格行），带 5s 超时兜底
         self._node_capture = False
@@ -500,7 +507,37 @@ class AccountSession(QObject):
                 return  # 阻断频道：聊天栏与主输出都不显示
             self.channel_text.emit(channel, spans, highlight)
             return  # 只进聊天栏，不再进主输出
+        if self._is_screen_blocked(text):
+            return  # 屏显屏蔽：命中规则的行不进主输出
         self.line_displayed.emit(spans, highlight)
+
+    def _load_screen_block(self) -> list[dict]:
+        try:
+            rules = ConfigManager.instance().get("screen_block") or []
+            return [dict(r) for r in rules if isinstance(r, dict)]
+        except Exception:
+            return []
+
+    def reload_screen_block(self) -> None:
+        self._screen_block = self._load_screen_block()
+
+    def _is_screen_blocked(self, text: str) -> bool:
+        """命中任一屏蔽规则则返回 True（contains=关键字包含；regex=正则匹配）。"""
+        for r in self._screen_block:
+            pat = r.get("pattern") or ""
+            if not pat:
+                continue
+            mt = r.get("match_type", "contains")
+            try:
+                if mt == "regex":
+                    if re.search(pat, text):
+                        return True
+                else:
+                    if pat in text:
+                        return True
+            except re.error:
+                continue
+        return False
 
     def channel_of(self, text: str) -> str | None:
         if text.startswith("【") and "】" in text and text[1:2] != "】":
@@ -663,12 +700,15 @@ class AccountSession(QObject):
         if not self._capture_skills:
             return False
         if not self._is_skill_table_line(text):
+            self._skills_debug(f"REJECT: {text[:40]!r}")
             return False
+        self._skills_debug(f"ACCEPT: {text[:40]!r}")
         self._skills_buf += text + "\n"
         if ("技能槽" in text or "空余" in text) or \
            (self._skills_started and time.time() - self._skills_started > 8.0) or \
            ("└" in text or "┘" in text):
             self._capture_skills = False
+            self._skills_debug(f"FINISH buf_lines={len(self._skills_buf.strip().splitlines())} dock={self.skills_dock is not None}")
             if self.skills_dock is not None:
                 self.skills_dock.on_skills(self._skills_buf)
             self._skills_buf = ""
@@ -687,7 +727,16 @@ class AccountSession(QObject):
         self._capture_skills = True
         self._skills_started = time.time()
         self._skills_buf = ""
+        self._skills_debug(f"send_skills armed @{self._skills_started:.1f}")
         self.connection.send_line("skills")
+
+    def _skills_debug(self, msg: str) -> None:
+        try:
+            cfg = ConfigManager.instance()
+            with open(cfg.root / "skills_capture.log", "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
 
     def _send_look(self) -> None:
         self.connection.send_line("look")
@@ -1040,14 +1089,12 @@ class LoginMachine:
             if cmd.strip():
                 self.session.connection.send_line(cmd)
         self.session.app.bus.publish("login.done", account=self.session.account_id)
-        # C1：登录后订阅 GMCP 频道（tune gmcp <Name> on）
-        for ch in _GMCP_SUBSCRIBE:
-            self._schedule_send(f"tune gmcp {ch} on", 2500)
         # 登录后自动 look 一次，获取房间出口（GMCP.Move 仅在移动后推送，
         # 刚登录时方向按钮靠 look 解析的出口启用）
         self.session._capture_look = True
         self.session._look_buf = ""
-        self._schedule_send("look", 3200)
+        # 登录后统一发送一次状态/频道指令，确保所需状态与频道正常开启
+        self.session.connection.send_line(_LOGIN_TUNES)
 
     def dispose(self) -> None:
         """断开/关闭时调用：取消挂起的定时器，避免退出时 QTimer 竞争崩溃。"""

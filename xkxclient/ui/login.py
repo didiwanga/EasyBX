@@ -9,6 +9,9 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
@@ -55,6 +58,132 @@ class ServerDialog(QDialog):
         except ValueError:
             port = 8080
         return {"name": name, "host": host, "port": port, "encoding": self.enc_cb.currentText()}
+
+
+class AccountEditDialog(QDialog):
+    """账号增改：账号(登录ID/下拉名)、用户名、密码、登录后命令、自动登录。"""
+
+    def __init__(self, account_id: str = "", data: dict | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("账号信息")
+        self.id_ed = QLineEdit(account_id)
+        self.id_ed.setPlaceholderText("客户端显示名（登录ID）")
+        self.user_ed = QLineEdit((data or {}).get("username", ""))
+        self.user_ed.setPlaceholderText("游戏内用户名")
+        self.pass_ed = QLineEdit()
+        self.pass_ed.setEchoMode(QLineEdit.EchoMode.Password)
+        pwd = decrypt_password(str((data or {}).get("password", "") or ""))
+        if pwd:
+            self.pass_ed.setText(pwd)
+        init_cmds = (data or {}).get("init_cmds") or []
+        self.init_ed = QLineEdit(
+            ";".join(init_cmds) if isinstance(init_cmds, list) else str(init_cmds))
+        self.auto_cb = QCheckBox("自动登录")
+        self.auto_cb.setChecked(bool((data or {}).get("autologin", True)))
+
+        show_btn = QPushButton("显示")
+        show_btn.setCheckable(True)
+        show_btn.setFixedWidth(52)
+        show_btn.toggled.connect(lambda on: self.pass_ed.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+
+        form = QFormLayout()
+        form.addRow("账号", self.id_ed)
+        form.addRow("用户名", self.user_ed)
+        pw_row = QHBoxLayout()
+        pw_row.addWidget(self.pass_ed, 1)
+        pw_row.addWidget(show_btn)
+        form.addRow("密码", pw_row)
+        form.addRow("登录后命令", self.init_ed)
+        form.addRow(self.auto_cb)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(box)
+
+    def result(self) -> tuple[str, dict] | None:
+        account_id = self.id_ed.text().strip()
+        username = self.user_ed.text().strip()
+        if not account_id or not username:
+            return None
+        data = {
+            "username": username,
+            "password": encrypt_password(self.pass_ed.text().strip()),
+            "init_cmds": [c for c in self.init_ed.text().split(";") if c.strip()],
+            "autologin": self.auto_cb.isChecked(),
+        }
+        return account_id, data
+
+
+class AccountManagerDialog(QDialog):
+    """账号管理：已存账号增/删/改（写入 accounts.json）。"""
+
+    def __init__(self, config, parent=None) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("账号管理")
+        self.setMinimumWidth(320)
+        self.list = QListWidget()
+        add_btn = QPushButton("添加")
+        edit_btn = QPushButton("编辑")
+        del_btn = QPushButton("删除")
+        add_btn.clicked.connect(self._add)
+        edit_btn.clicked.connect(self._edit)
+        del_btn.clicked.connect(self._delete)
+        self.list.itemDoubleClicked.connect(lambda _: self._edit())
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(del_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.list, 1)
+        lay.addLayout(btn_row)
+        lay.addWidget(close_btn)
+        self._reload()
+
+    def _reload(self) -> None:
+        self.list.clear()
+        for aid in self.config.accounts().keys():
+            QListWidgetItem(aid, self.list)
+
+    def _selected(self) -> str | None:
+        it = self.list.currentItem()
+        return it.text() if it else None
+
+    def _add(self) -> None:
+        dlg = AccountEditDialog(parent=self)
+        if dlg.exec() and dlg.result():
+            aid, data = dlg.result()
+            self.config.save_account(aid, data)
+            self._reload()
+            self.list.setCurrentRow(max(0, self.list.count() - 1))
+
+    def _edit(self) -> None:
+        aid = self._selected()
+        if not aid:
+            return
+        dlg = AccountEditDialog(aid, self.config.accounts().get(aid), self)
+        if dlg.exec() and dlg.result():
+            new_aid, data = dlg.result()
+            if new_aid != aid:
+                self.config.remove_account(aid)
+            self.config.save_account(new_aid, data)
+            self._reload()
+
+    def _delete(self) -> None:
+        aid = self._selected()
+        if not aid:
+            return
+        ret = QMessageBox.question(self, "删除账号", f"确定删除账号「{aid}」？",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.Yes:
+            self.config.remove_account(aid)
+            self._reload()
 
 
 class LoginWindow(QDialog):
@@ -137,6 +266,23 @@ class LoginWindow(QDialog):
         row.addStretch(1)
         row.addWidget(self.connect_btn)
         lay.addLayout(row)
+        self._autofill_last()
+
+    # ---- 上次登录自动回填 ----
+    def _autofill_last(self) -> None:
+        """打开登录窗即回填上一次成功连接使用的账号密码。"""
+        last = self.config.get("login.last") or {}
+        last_id = (last.get("account_id") or "").strip()
+        if not last_id:
+            return
+        if last_id in self.config.accounts():
+            self.account_combo.setCurrentText(last_id)   # 触发 _fill_creds 回填全部
+        else:
+            self.account_combo.setCurrentText(last_id)
+            self.user_edit.setText(str(last.get("username", "")))
+            pwd = decrypt_password(str(last.get("password", "") or ""))
+            if pwd:
+                self.pass_edit.setText(pwd)
 
     # ---- 服务器 ----
     def _servers_changed(self) -> None:
@@ -211,6 +357,11 @@ class LoginWindow(QDialog):
                 "init_cmds": init_cmds,
                 "autologin": self.auto_cb.isChecked(),
             })
+        self.config.set("login.last", {
+            "account_id": account_id,
+            "username": username,
+            "password": encrypt_password(password),
+        })
 
         session = self.app.session(account_id)
         session.connect_to(srv["host"], srv["port"], encoding=self.enc_cb.currentText(),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMenu,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -29,31 +31,123 @@ _QUICK_PRESETS = [
 
 
 class QuickActionsDock(QWidget):
-    """B9 快捷动作：按钮形式（标签只写作用），预设 + 用户自定义（本地配置）。"""
+    """B9 快捷动作：按钮形式（标签只写作用），预设 + 用户自定义（本地配置）。
+    支持拖拽按钮调整布局顺序（顺序持久化到 config `quick_actions_order`）。"""
 
     def __init__(self, session, parent=None) -> None:
         super().__init__(parent)
         self.session = session
-        self.setMinimumWidth(150)
+        self.setMinimumWidth(120)
+        # 允许横向伸缩：浮动 dock 缩放时内容跟随窗口宽度
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
-        lay.addWidget(QLabel("快捷动作"))
-        self.btn_grid = QGridLayout()
-        self.btn_grid.setSpacing(2)
-        lay.addLayout(self.btn_grid, 1)
+        lay.addWidget(QLabel("快捷动作（拖拽可排序）"))
+
+        # 按钮区放进滚动区：高度不足时竖向滚动，按钮不被遮蔽
+        self._flow_host = QWidget()
+        self._flow_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._flow_host_lay = QVBoxLayout(self._flow_host)
+        self._flow_host_lay.setContentsMargins(0, 0, 0, 0)
+        self.btn_flow = FlowLayout(hspacing=4, vspacing=4)
+        self._flow_host_lay.addLayout(self.btn_flow)
+        self._flow_host.installEventFilter(self)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidget(self._flow_host)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        lay.addWidget(self.scroll, 1)
+
         self.add_btn = QPushButton("+ 添加")
         self.add_btn.clicked.connect(self._on_add)
         lay.addWidget(self.add_btn)
-        self._custom: dict[QPushButton, int] = {}   # 用户自定义按钮 → 配置索引
+        self._custom_btns: dict[QPushButton, int] = {}
+        self._drag_btn: QPushButton | None = None   # 当前拖拽的按钮
+        self._drag_start: object | None = None      # 按下时鼠标位置
+        self._dragging = False
+        self._applying_width = False
         self._rebuild()
+
+    def _btn_width(self) -> int:
+        """按钮自适应宽度：横排铺满可用宽度，不残留右侧空白。
+
+        规则：按钮宽度在 [最小(3中文), 最大(8中文)] 之间；随窗口变宽而增大，
+        达到 8 中文上限后，若可用宽度已能再容纳一个最小宽按钮，则缩回 8 中文
+        并让横排多排一个按钮（每排至少 2 个）。
+        """
+        fm = self.fontMetrics()
+        max_w = fm.horizontalAdvance("中中中中中中中中") + 24
+        min_w = fm.horizontalAdvance("中中中") + 16
+        spacing = 4
+        avail = self.width() - 16
+        if avail < 2 * min_w + spacing:
+            return max(min_w, (avail - spacing) // 2)
+        n = 2
+        while True:
+            w = (avail - (n - 1) * spacing) // n
+            if w >= max_w:
+                # 本排 n 个按钮即使到 8 中文也放不满当前行：
+                # 若能再容纳一个最小宽按钮则加列，否则固定为 8 中文
+                if avail >= (n + 1) * min_w + n * spacing:
+                    n += 1
+                    continue
+                return max_w
+            if w <= min_w:
+                # 本排放不下 n 个最小宽按钮：减少列数（至少 2）
+                if n > 2:
+                    n -= 1
+                    continue
+                return max(min_w, w)
+            return w
 
     def bind(self, session) -> None:
         self.session = session
         self._rebuild()
 
+    # ---- 顺序持久化 ----
+    def _load_order(self, n_custom: int) -> list[str]:
+        """按钮顺序 key 列表：p:{i} 预设 / c:{j} 自定义。已保存的排前，缺失的按默认追加。"""
+        saved = []
+        raw = self.session.app.config.get("quick_actions_order") if self.session else None
+        if isinstance(raw, list):
+            saved = [str(k) for k in raw]
+        order: list[str] = []
+        seen: set[str] = set()
+        for k in saved:
+            if k in seen:
+                continue
+            if k.startswith("c:"):
+                try:
+                    if 0 <= int(k[2:]) < n_custom:
+                        order.append(k); seen.add(k)
+                except ValueError:
+                    continue
+            elif k.startswith("p:"):
+                try:
+                    if 0 <= int(k[2:]) < len(_QUICK_PRESETS):
+                        order.append(k); seen.add(k)
+                except ValueError:
+                    continue
+        for i in range(len(_QUICK_PRESETS)):
+            k = f"p:{i}"
+            if k not in seen:
+                order.append(k); seen.add(k)
+        for j in range(n_custom):
+            k = f"c:{j}"
+            if k not in seen:
+                order.append(k); seen.add(k)
+        return order
+
+    def _save_order(self, order: list[str]) -> None:
+        if self.session is not None:
+            self.session.app.config.set("quick_actions_order", list(order))
+
     def _rebuild(self) -> None:
-        while self.btn_grid.count():
-            item = self.btn_grid.takeAt(0)
+        while self.btn_flow.count():
+            item = self.btn_flow.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
@@ -63,59 +157,192 @@ class QuickActionsDock(QWidget):
             raw = self.session.app.config.get("quick_actions")
             if isinstance(raw, list):
                 custom = [r for r in raw if isinstance(r, list) and len(r) == 2]
+        order = self._load_order(len(custom))
+        bw = self._btn_width()
+        by_key: dict[str, QPushButton] = {}
         for i, (label, cmd) in enumerate(_QUICK_PRESETS):
             btn = QPushButton(label)
             btn.setToolTip(cmd)
+            btn.setFixedWidth(bw)
             btn.clicked.connect(lambda _=False, c=cmd: self._fire(c))
-            self.btn_grid.addWidget(btn, i // 2, i % 2)
-        base = len(_QUICK_PRESETS)
+            by_key[f"p:{i}"] = btn
         for j, row in enumerate(custom):
             btn = QPushButton(str(row[0]))
             btn.setToolTip(str(row[1]))
+            btn.setFixedWidth(bw)
             btn.clicked.connect(lambda _=False, c=str(row[1]): self._fire(c))
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             btn.customContextMenuRequested.connect(
-                lambda _pos, b=btn, idx=base + j: self._show_btn_menu(b, idx))
-            self._custom_btns[btn] = base + j
-            self.btn_grid.addWidget(btn, (base + j) // 2, (base + j) % 2)
-        self.btn_grid.setColumnStretch(0, 1)
-        self.btn_grid.setColumnStretch(1, 1)
-        rows = (base + len(custom) + 1) // 2
-        self.btn_grid.setRowStretch(rows + 1, 1)
+                lambda _pos, b=btn, idx=j: self._show_btn_menu(b, idx))
+            self._custom_btns[btn] = j
+            by_key[f"c:{j}"] = btn
+        for k in order:
+            btn = by_key.get(k)
+            if btn is None:
+                continue
+            btn.installEventFilter(self)
+            self.btn_flow.addWidget(btn)
+        self._apply_btn_widths()
+
+    def _apply_btn_widths(self) -> None:
+        """按当前可用宽度刷新所有按钮宽度（每排至少 2 个、最大 8 中文）。"""
+        if getattr(self, "_applying_width", False):
+            return
+        self._applying_width = True
+        try:
+            bw = self._btn_width()
+            for i in range(self.btn_flow.count()):
+                item = self.btn_flow.itemAt(i)
+                w = item.widget() if item else None
+                if isinstance(w, QPushButton):
+                    w.setFixedWidth(bw)
+        finally:
+            self._applying_width = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # 延迟到子控件布局完成后，按实际按钮区宽度刷新按钮尺寸
+        QTimer.singleShot(0, self._apply_btn_widths)
+
+    # ---- 拖拽排序 ----
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._flow_host and event.type() == QEvent.Type.Resize:
+            # 按钮区容器宽度变化：刷新按钮宽度
+            self._apply_btn_widths()
+            return super().eventFilter(obj, event)
+        if not isinstance(obj, QPushButton):
+            return super().eventFilter(obj, event)
+        et = event.type()
+        if et == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_btn = obj
+                self._drag_start = event.position()
+                self._dragging = False
+            return super().eventFilter(obj, event)
+        if et == QEvent.Type.MouseMove:
+            if obj is self._drag_btn and self._drag_start is not None and not self._dragging:
+                d = event.position() - self._drag_start
+                if d.manhattanLength() > QApplication.startDragDistance():
+                    self._dragging = True
+            if self._dragging:
+                return True   # 拖拽期间吞掉移动事件，避免干扰
+            return super().eventFilter(obj, event)
+        if et == QEvent.Type.MouseButtonRelease:
+            if obj is self._drag_btn and self._dragging:
+                # 延迟到事件处理结束后再重建，避免拖拽期间删除正在处理事件的控件导致闪退
+                QTimer.singleShot(0, lambda b=obj, p=event.globalPosition().toPoint(): self._drop_at(b, p))
+                self._drag_btn = None
+                self._drag_start = None
+                self._dragging = False
+                return True   # 吞掉释放，避免触发按钮点击
+            if obj is self._drag_btn:
+                self._drag_btn = None
+                self._drag_start = None
+                self._dragging = False
+            return super().eventFilter(obj, event)
+        return super().eventFilter(obj, event)
+
+    def _drop_at(self, btn: QPushButton, global_pos) -> None:
+        """把 btn 插入到鼠标释放时所在按钮的位置，并持久化顺序。"""
+        target = self._btn_at(global_pos)
+        if target is None or target is btn:
+            return
+        custom = []
+        if self.session is not None:
+            raw = self.session.app.config.get("quick_actions")
+            if isinstance(raw, list):
+                custom = [r for r in raw if isinstance(r, list) and len(r) == 2]
+        order = self._load_order(len(custom))
+        try:
+            si = order.index(self._key_of(btn))
+            di = order.index(self._key_of(target))
+        except ValueError:
+            return
+        if si == di:
+            return
+        k = order.pop(si)
+        di2 = order.index(self._key_of(target))   # pop 后重新定位
+        order.insert(di2, k)
+        self._save_order(order)
+        self._rebuild()
+
+    def _btn_at(self, global_pos) -> QPushButton | None:
+        for i in range(self.btn_flow.count()):
+            item = self.btn_flow.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, QPushButton):
+                if w.rect().contains(w.mapFromGlobal(global_pos)):
+                    return w
+        return None
+
+    def _key_of(self, btn: QPushButton) -> str:
+        for b, j in self._custom_btns.items():
+            if b is btn:
+                return f"c:{j}"
+        return self._key_of_preset(btn)
+
+    @staticmethod
+    def _key_of_preset(btn: QPushButton) -> str:
+        for i, (label, _cmd) in enumerate(_QUICK_PRESETS):
+            if btn.text() == label:
+                return f"p:{i}"
+        return ""
 
     def _show_btn_menu(self, btn: QPushButton, idx: int) -> None:
-        """右键菜单：删除用户自定义按钮。"""
+        """右键菜单：编辑 / 删除用户自定义按钮。"""
         if self.session is None:
             return
         menu = QMenu(self)
+        menu.addAction("编辑该按钮", lambda: self._edit_btn(idx))
         menu.addAction("删除该按钮", lambda: self._delete_btn(idx))
         menu.addSeparator()
         menu.addAction("取消")
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _edit_btn(self, idx: int) -> None:
+        if self.session is None:
+            return
+        custom = [r for r in (self.session.app.config.get("quick_actions") or [])
+                  if isinstance(r, list) and len(r) == 2]
+        if not (0 <= idx < len(custom)):
+            return
+        name = str(custom[idx][0])
+        cmd = str(custom[idx][1])
+        res = self._dlg_action(name, cmd, title="编辑快捷动作")
+        if res:
+            custom[idx] = [res[0], res[1]]
+            self.session.app.config.set("quick_actions", custom)
+            self._rebuild()
 
     def _delete_btn(self, idx: int) -> None:
         if self.session is None:
             return
         custom = [r for r in (self.session.app.config.get("quick_actions") or [])
                   if isinstance(r, list) and len(r) == 2]
-        if 0 <= (base := idx - len(_QUICK_PRESETS)) < len(custom):
-            custom.pop(base)
+        if 0 <= idx < len(custom):
+            custom.pop(idx)
         self.session.app.config.set("quick_actions", custom)
+        # 清理顺序里失效的自定义 key（索引后移，旧 c:{idx} 应删除）
+        order = [k for k in (self.session.app.config.get("quick_actions_order") or [])
+                 if not (isinstance(k, str) and k.startswith("c:"))]
+        order.extend(f"c:{j}" for j in range(len(custom)))
+        self.session.app.config.set("quick_actions_order", order)
         self._rebuild()
 
     def _fire(self, cmd: str) -> None:
         if self.session is not None:
             self.session.send(cmd)
 
-    def _on_add(self) -> None:
-        if self.session is None:
-            return
+    def _dlg_action(self, name: str = "", cmd: str = "", title: str = "快捷动作") -> tuple[str, str] | None:
+        """名称 + 命令 输入对话框；返回 (名称, 命令)，取消返回 None。"""
         from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit
         from PyQt6.QtWidgets import QDialogButtonBox
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("添加快捷动作")
+        dlg.setWindowTitle(title)
         name_ed, cmd_ed = QLineEdit(), QLineEdit()
+        name_ed.setText(name)
+        cmd_ed.setText(cmd)
         form = QFormLayout()
         form.addRow("名称", name_ed)
         form.addRow("命令", cmd_ed)
@@ -126,8 +353,16 @@ class QuickActionsDock(QWidget):
         lay.addLayout(form)
         lay.addWidget(box)
         if dlg.exec() and name_ed.text().strip() and cmd_ed.text().strip():
+            return (name_ed.text().strip(), cmd_ed.text().strip())
+        return None
+
+    def _on_add(self) -> None:
+        if self.session is None:
+            return
+        res = self._dlg_action(title="添加快捷动作")
+        if res:
             custom = list(self.session.app.config.get("quick_actions") or [])
-            custom.append([name_ed.text().strip(), cmd_ed.text().strip()])
+            custom.append([res[0], res[1]])
             self.session.app.config.set("quick_actions", custom)
             self._rebuild()
 
@@ -185,39 +420,53 @@ def normalize_exits(exits: list[str]) -> dict[str, str]:
     return mapped
 
 
-_ARROW_CHAIN = {
-    Qt.Key.Key_Up: ("n", "u", "d"),
-    Qt.Key.Key_Down: ("s", "d", "u"),
-    Qt.Key.Key_Left: ("w", "u", "d"),
-    Qt.Key.Key_Right: ("e", "u", "d"),
+_ARROW_SHORT = {
+    "north": "n", "northeast": "ne", "northwest": "nw",
+    "south": "s", "southeast": "se", "southwest": "sw",
+    "east": "e", "west": "w",
+    "northup": "nu", "northdown": "nd",
+    "southup": "su", "southdown": "sd",
+    "eastup": "eu", "eastdown": "ed",
+    "westup": "wu", "westdown": "wd",
+    "up": "up", "down": "down", "enter": "enter", "out": "out",
 }
-_ARROW_ORDER = [Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Right]
+
+
+def arrow_short(x: str) -> str:
+    """完整出口名 → 方向键短键：保留上下合成标记(nu/nd/su/sd/eu/ed/wu/wd/neu…)。"""
+    if x in _ARROW_SHORT:
+        return _ARROW_SHORT[x]
+    for suf in _EXIT_SUFFIXES:
+        if x.endswith(suf):
+            base = x[:-len(suf)]
+            if base in _EXIT_SHORT and _EXIT_SHORT[base] in _EIGHT_DIRS:
+                return _EXIT_SHORT[base] + suf[0]
+    return x
+
+
+_ARROW_CHAIN = {
+    Qt.Key.Key_Up: ("n", "nw", "ne", "nu", "nd", "up", "enter"),
+    Qt.Key.Key_Down: ("s", "sw", "se", "su", "sd", "down", "out"),
+    Qt.Key.Key_Left: ("w", "nw", "sw", "wu", "wd"),
+    Qt.Key.Key_Right: ("e", "ne", "se", "eu", "ed"),
+}
 
 
 def arrow_move(exits: list[str], key) -> str | None:
-    """智能回退：优先四向(n/s/e/w)，缺位补 u/d，再补其余可用；无出口返回 None。返回真实出口名。"""
-    mapped = normalize_exits(exits)
-    if not mapped:
+    """逐键顺序候选：按该方向键固定链取第一个真实出口（如 上=n→nw→ne→nu→nd→up→enter）；
+    无匹配返回 None。返回真实出口全名。"""
+    chain = _ARROW_CHAIN.get(key)
+    if not chain:
         return None
-    used: set[str] = set()
-    assigned: dict = {}
-    for k in _ARROW_ORDER:
-        for cand in _ARROW_CHAIN[k]:
-            if cand in mapped and cand not in used:
-                assigned[k] = cand
-                used.add(cand)
-                break
-    for k in _ARROW_ORDER:
-        if k in assigned:
-            continue
-        hit = next((c for c in _ARROW_CHAIN[k] if c in mapped), None)
-        assigned[k] = hit or next(iter(mapped))
-    cand = assigned.get(key)
-    return mapped.get(cand) if cand else None
+    avail = {arrow_short(x): x for x in exits or []}
+    for cand in chain:
+        if cand in avail:
+            return avail[cand]
+    return None
 
 
 class MoveControlDock(QWidget):
-    """B9 移动控制：3×3 方向格 + up/down/enter/out，由 GMCP.Move 的 exits 驱动。"""
+    """B9 移动控制：3×3 方向格 + up/down/enter/out + 其他出口动态按钮，由 GMCP.Move 的 exits 驱动。"""
 
     def __init__(self, session, parent=None) -> None:
         super().__init__(parent)
@@ -237,7 +486,7 @@ class MoveControlDock(QWidget):
                     btn = QPushButton(_dir_icon(name), "")
                     btn.setIconSize(QSize(18, 18))
                     btn.clicked.connect(lambda _=False, d=name: self._move(d))
-                    btn.setProperty("dirBtn", True)
+                btn.setProperty("dirBtn", True)
                 btn.setFixedSize(42, 32)
                 grid.addWidget(btn, r, c)
                 if name != "look":
@@ -245,28 +494,27 @@ class MoveControlDock(QWidget):
         lay.addLayout(grid)
         row2 = QHBoxLayout()
         for name in _ROW2:
-            if name in ("u", "d"):
-                btn = QPushButton({"u": "上", "d": "下"}[name])
-                btn.setProperty("dirBtn", True)
-            else:
-                btn = QPushButton({"enter": "进", "out": "出"}[name])
+            btn = QPushButton({"u": "上", "d": "下", "enter": "进", "out": "出"}[name])
+            btn.setProperty("dirBtn", True)
             btn.clicked.connect(lambda _=False, d=name: self._move(d))
             self._btns[name] = btn
             row2.addWidget(btn)
         lay.addLayout(row2)
 
-        # 出口编号按钮：1-10，对应房间出口顺序（简写显示，点击发送完整出口名）
-        self._num_btns: list[QPushButton] = []
-        num_lay = FlowLayout(hspacing=4, vspacing=4)
-        for i in range(1, 11):
-            btn = QPushButton(str(i))
-            btn.setProperty("numBtn", True)
-            btn.setFixedSize(26, 26)
-            btn.setToolTip(f"第 {i} 个出口")
-            btn.clicked.connect(lambda _=False, idx=i - 1: self._move_num(idx))
-            self._num_btns.append(btn)
-            num_lay.addWidget(btn)
-        lay.addLayout(num_lay)
+        # 其他出口区：除八方向/上下/进出外的出口（含纯数字出口）动态按钮，
+        # 有几个显示几个；无此类出口时整区隐藏。
+        self._extra_group = QWidget(self)
+        eg = QVBoxLayout(self._extra_group)
+        eg.setContentsMargins(0, 2, 0, 0)
+        eg.setSpacing(2)
+        self._extra_label = QLabel("其他出口")
+        self._extra_label.setStyleSheet("color:#808080; font-size:11px;")
+        self._extra_lay = FlowLayout(hspacing=4, vspacing=4)
+        eg.addWidget(self._extra_label)
+        eg.addLayout(self._extra_lay)
+        self._extra_btns: list[QPushButton] = []
+        self._extra_group.hide()
+        lay.addWidget(self._extra_group)
 
         lay.addStretch(1)
         self._cur_exits: list[str] = []
@@ -287,10 +535,40 @@ class MoveControlDock(QWidget):
         else:
             self.session.send(d)
 
-    def _move_num(self, idx: int) -> None:
+    def _move_extra(self, name: str) -> None:
         if self.session is None:
             return
-        self.session.send(str(idx + 1))
+        self.session.send(name)
+
+    def _clear_extra(self) -> None:
+        while self._extra_lay.count():
+            it = self._extra_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._extra_btns = []
+
+    def _refresh_extras(self) -> None:
+        """其他出口区重建：显示未映射到八方向/u/d/enter/out 的出口按钮。"""
+        self._clear_extra()
+        covered = set(_EIGHT_DIRS) | {"u", "d", "enter", "out"}
+        mapped_shorts: dict[str, str] = {}
+        for short, full in normalize_exits(self._cur_exits).items():
+            mapped_shorts[full] = short
+        extras = [x for x in self._cur_exits if mapped_shorts.get(x, x) not in covered]
+        if not extras:
+            self._extra_group.hide()
+            return
+        for x in extras:
+            btn = QPushButton(x)
+            btn.setProperty("dirBtn", True)
+            btn.setToolTip(f"出口 {x}")
+            btn.clicked.connect(lambda _=False, d=x: self._move_extra(d))
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            self._extra_btns.append(btn)
+            self._extra_lay.addWidget(btn)
+        self._extra_group.show()
 
     def set_exits(self, exits: list[str]) -> None:
         self._cur_exits = list(exits or [])
@@ -302,9 +580,7 @@ class MoveControlDock(QWidget):
                 self._btn_exit.setdefault(short, full)
         for name, btn in self._btns.items():
             btn.setEnabled(name in avail)
-        n = min(len(self._cur_exits), 10)
-        for i, btn in enumerate(self._num_btns):
-            btn.setEnabled(str(i + 1) in self._cur_exits)
+        self._refresh_extras()
 
 
 class MacroControlDock(QWidget):

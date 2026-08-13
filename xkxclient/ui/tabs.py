@@ -264,11 +264,14 @@ class AccountTab(QWidget):
         lay.addWidget(self.split)
 
         self.output.new_trigger_requested.connect(self._new_trigger)
-        self.output.filter_add_requested.connect(self._add_filter)
+        self.output.screen_block_add_requested.connect(self._add_screen_block)
         self.output.search_requested.connect(lambda t: self.show_find())
+        self.output.command_fill_requested.connect(self._fill_command)
+        self.output.command_send_requested.connect(self._send_command)
+        self.output.look_send_requested.connect(self._look_selection)
+        self.output.ask_fill_requested.connect(self._ask_fill)
         self.output.autopage_hit.connect(self._on_autopage)
         self.output.clicked_blank.connect(self._refocus_input)
-        self.chat.channel_toggled.connect(self.session.set_channel)
         self._sync_channels()
 
     def _refocus_input(self) -> None:
@@ -305,9 +308,49 @@ class AccountTab(QWidget):
                 pass
         dlg.show()
 
-    def _add_filter(self, sel: str) -> None:
-        self.session.app.bus.publish("ui.message", account=self.account_id,
-                                     message=f"已添加到过滤器: {sel}")
+    def _add_screen_block(self, sel: str) -> None:
+        """右键「添加到屏显屏蔽」：选中文本作为包含关键字规则写入 screen_block 配置，
+        立即生效，并提示可在 查看→屏显屏蔽 中编辑/删除。"""
+        sel = (sel or "").strip()
+        if not sel:
+            return
+        from xkxclient.core.config import ConfigManager
+        cfg = ConfigManager.instance()
+        rules = [dict(r) for r in (cfg.get("screen_block") or []) if isinstance(r, dict)]
+        if any(r.get("match_type", "contains") == "contains" and r.get("pattern") == sel
+               for r in rules):
+            msg = f"已存在于屏显屏蔽: {sel}"
+        else:
+            rules.append({"match_type": "contains", "pattern": sel})
+            cfg.set("screen_block", rules)
+            self.session.reload_screen_block()
+            msg = f"已添加到屏显屏蔽: {sel}（查看→屏显屏蔽 可编辑/删除）"
+        self.session.app.bus.publish("ui.message", account=self.account_id, message=msg)
+
+    def _fill_command(self, text: str) -> None:
+        """右键「填写命令」：选中文本填入命令框，不发命令。"""
+        self.input_line.setText(text)
+        self.input_line.setCursorPosition(len(text))
+        self.input_line._tab_cands = []
+        self.input_line.setFocus()
+
+    def _send_command(self, text: str) -> None:
+        """右键「发送命令」：填入命令框并立即执行。"""
+        self.input_line.setText(text)
+        self.input_line.setCursorPosition(len(text))
+        self.input_line._on_return()
+        self.input_line.setFocus()
+
+    def _look_selection(self, text: str) -> None:
+        """右键「看」：直接发送 look + 选中文本。"""
+        self.session.send(f"look {text}")
+
+    def _ask_fill(self, text: str) -> None:
+        """右键「NPC对话」：填入 ask + 选中文本 + about，等待补充提问词。"""
+        self.input_line.setText(f"ask {text} about ")
+        self.input_line.setCursorPosition(len(f"ask {text} about "))
+        self.input_line._tab_cands = []
+        self.input_line.setFocus()
 
     def _on_autopage(self, _pages: int) -> None:
         # 自动翻页：发空命令继续分页（B5-3）

@@ -189,9 +189,6 @@ QPushButton:disabled {{ color: {dim}; background: {panel}; border-color: {border
 QPushButton:focus {{ outline: none; }}
 QPushButton[dirBtn="true"] {{ background: {btn_hover}; border: 1px solid {accent}; color: {btn_text}; }}
 QPushButton[dirBtn="true"]:disabled {{ background: {panel}; border: 1px solid {border}; color: {dim}; }}
-QPushButton[numBtn="true"] {{ background: {btn}; border: 1px solid {btn_border}; border-radius: 4px; padding: 0px; color: {btn_text}; }}
-QPushButton[numBtn="true"]:hover {{ background: {btn_hover}; }}
-QPushButton[numBtn="true"]:disabled {{ background: {panel}; border: 1px solid {border}; color: {dim}; }}
 QLineEdit {{
     background: {field}; color: {text}; border: 1px solid {border};
     border-radius: 5px; padding: 4px 8px; }}

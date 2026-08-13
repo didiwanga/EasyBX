@@ -39,6 +39,7 @@ class MacroEngine(QObject):
         self._active: dict[str, Macro] = {}
         self._pos: dict[str, int] = {}
         self._timers: dict[str, QTimer] = {}
+        self._loop_count: dict[str, int] = {}   # 计数循环：当前循环次数
         self._waiting: tuple[str, int] | None = None
         self._paused: set[str] = set()       # 被暂停的宏名
         self._wait_input_timer: QTimer | None = None
@@ -98,6 +99,7 @@ class MacroEngine(QObject):
             return False
         self._active[name] = m
         self._pos[name] = 0
+        self._loop_count[name] = 0
         self._paused.discard(name)
         self.bus.publish("macro.start", account=self.session.account_id, name=name)
         self._step(name)
@@ -146,6 +148,7 @@ class MacroEngine(QObject):
         names = list(self._active.keys())
         self._active.clear()
         self._pos.clear()
+        self._loop_count.clear()
         self._paused.clear()
         self._waiting = None
         if names:
@@ -205,6 +208,10 @@ class MacroEngine(QObject):
             self._wait_trigger(name, step, pos)
         elif t == "captcha":
             self._wait_captcha(name, step, pos)
+        elif t == "loop":
+            self._loop(name, step, pos)
+        elif t == "branch":
+            self._branch(name, step, pos)
         else:
             self._goto(name, pos + 1)
 
@@ -452,6 +459,7 @@ class MacroEngine(QObject):
     def _halt(self, name: str) -> None:
         self._active.pop(name, None)
         self._pos.pop(name, None)
+        self._loop_count.pop(name, None)
         self._paused.discard(name)
         self._timers.pop(name, None)
         if self._waiting and self._waiting[0] == name:
@@ -477,6 +485,17 @@ class MacroEngine(QObject):
                 target = m.labels.get(target, 0)
         self._pos[name] = int(target)
         self._step(name)
+
+    def _goto_later(self, name: str, target, ms: int = 0) -> None:
+        """异步跳转：解析目标后经 QTimer 触发，避免同步递归（计数循环/跳转分支）。"""
+        m = self._active.get(name)
+        if m and isinstance(target, str):
+            if target.isdigit():
+                target = max(0, int(target) - 1)
+            else:
+                target = m.labels.get(target, 0)
+        idx = int(target)
+        self._chain(name, ms, idx)
 
     def _match(self, cond: dict) -> bool:
         ctype = cond.get("type") or cond.get("match_type")  # 兼容跳转(type) 与 判断条件列表(match_type)
@@ -566,6 +585,107 @@ class MacroEngine(QObject):
         if target in (None, ""):
             target = pos + 1
         self._goto(name, target)
+
+    def _loop(self, name: str, step: dict, pos: int) -> None:
+        """计数循环步骤：以 `start`（步骤序号/标签）为循环起点，`count` 为次数。
+
+        执行到本步时计数 +1：若尚未达到 count（count=0 视为无限），跳回起点继续；
+        达到 count 后向下继续执行。
+        """
+        count = int(step.get("count") or 0)
+        start = step.get("start") or ""
+        cur = self._loop_count.get(name, 0) + 1
+        self._loop_count[name] = cur
+        if count <= 0 or cur < count:
+            if start in (None, ""):
+                self._goto(name, pos + 1)
+            else:
+                # 异步跳回起点：避免无限/高频循环同步递归爆栈
+                self._goto_later(name, start)
+        else:
+            self._goto(name, pos + 1)
+
+    def _branch(self, name: str, step: dict, pos: int) -> None:
+        """判断分支步骤：等待触发条件命中（阻塞，同触发器步骤），从命中行搜寻关键字。
+
+        - `conditions` 非空：等待条件命中（与/或）；为空时跳过条件判断，关键字即触发条件。
+        - 多个关键字为「或」关系：按顺序取第一个在命中行出现的关键字执行对应动作。
+        - 每个关键字动作：cmd(发送命令) / jump(跳转步骤/标签) / set(变量赋值)。
+        - `delay_ms`：命中后延时执行动作；`timeout_ms`：等待超时，超时继续下一步。
+        """
+        conds = step.get("conditions")
+        keywords = step.get("keywords") or []
+        relation = step.get("relation", "or")
+        delay_ms = int(step.get("delay_ms") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+
+        def match_conds(line: str) -> bool:
+            if not conds:
+                return True
+            if relation == "and":
+                return all(self._match(c) for c in conds)
+            return any(self._match(c) for c in conds)
+
+        def find_keyword(line: str) -> dict | None:
+            for kw in keywords:
+                text = substitute(str(kw.get("keyword", "")), self.session.vars)
+                if text and text in line:
+                    return kw
+            return None
+
+        def on_line(payload: dict) -> None:
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            line = payload.get("line") or ""
+            if not match_conds(line):
+                return
+            kw = find_keyword(line)
+            if kw is None:
+                return
+            # 命中：先取消订阅，避免后续行重复触发
+            if self._trigger_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
+            action = kw.get("action") or {}
+            if delay_ms > 0:
+                tm = QTimer(self)
+                tm.setSingleShot(True)
+                tm.timeout.connect(lambda: self._exec_branch_action(name, action, pos))
+                tm.start(delay_ms)
+                self._timers[name] = tm
+            else:
+                self._exec_branch_action(name, action, pos)
+
+        self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+        if timeout_ms > 0:
+            self._trigger_timer = QTimer(self)
+            self._trigger_timer.setSingleShot(True)
+            self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos))
+            self._trigger_timer.start(timeout_ms)
+
+    def _exec_branch_action(self, name: str, action: dict, pos: int) -> None:
+        """判断分支关键字动作：cmd / jump / set。jump 后不再继续本步骤链。"""
+        t = action.get("type")
+        if t == "cmd":
+            for cmd in split_commands(substitute(action.get("command", ""), self.session.vars)):
+                self.session.send_auto(cmd)
+            self._goto(name, pos + 1)
+        elif t == "jump":
+            target = action.get("target")
+            # 异步跳转：避免命中关键字后回跳本步造成同步递归
+            self._goto_later(name, target if target not in (None, "") else pos + 1)
+        elif t == "set":
+            var = self._varname(action.get("var", ""))
+            if var:
+                self.session.vars[var] = substitute(str(action.get("value", "")), self.session.vars)
+            self._goto(name, pos + 1)
+        else:
+            self._goto(name, pos + 1)
 
     def _status(self, name: str, step: dict, pos: int) -> None:
         """状态步骤（B3b 新增 ⑧）：判断 GMCP 状态属性是否满足比较条件。

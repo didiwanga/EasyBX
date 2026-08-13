@@ -3,6 +3,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
+    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -27,14 +28,20 @@ class SkillsDock(QWidget):
         hdr = self.tree.header()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.itemClicked.connect(self._on_click)
+        self.refresh_btn = QPushButton("刷新技能")
+        self.refresh_btn.setToolTip("发送 skills 命令刷新技能面板")
+        self.refresh_btn.clicked.connect(self.refresh)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.addWidget(self.slot_label)
+        lay.addWidget(self.refresh_btn)
         lay.addWidget(self.tree, 1)
 
     def refresh(self) -> None:
         if self.session is not None and self.session.connected and self.session.logged_in:
+            if getattr(self.session, "_debug_skills", False):
+                self.session._skills_debug("refresh button clicked")
             self.session.send_skills()
 
     def bind(self, session) -> None:

@@ -26,6 +26,7 @@ class MapWindow(QWidget):
         self._scale = 1.0
         self._drag: QPoint | None = None
         self._view_focus: tuple[int, int, float] | None = None
+        self._scaled_once = False      # 首次显示时按窗口等比适配一次
 
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -42,6 +43,30 @@ class MapWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(self.scroll, 1)
         layout.addWidget(self.reset_btn)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._scaled_once:
+            self._scaled_once = True
+            self._fit_to_window()
+
+    def _fit_to_window(self) -> None:
+        """窗口打开时默认等比缩放至窗口大小：地图完整可见。
+
+        下界 0.05（极小地图不放大失真）；上限 2.0（不过度放大点阵地图）。
+        """
+        if self._pixmap is None:
+            return
+        vp = self.scroll.viewport().size()
+        if vp.width() <= 0 or vp.height() <= 0:
+            return
+        s = min(vp.width() / self._pixmap.width(),
+                vp.height() / self._pixmap.height())
+        self._scale = max(0.05, min(s, 2.0))
+        self._view_focus = None
+        self._refresh()
+        self.scroll.verticalScrollBar().setValue(0)
+        self.scroll.horizontalScrollBar().setValue(0)
 
     def eventFilter(self, obj, event) -> bool:
         """拦截滚动区滚轮事件：始终缩放，不滚动内容。"""
@@ -106,8 +131,5 @@ class MapWindow(QWidget):
         self.unsetCursor()
 
     def _reset(self) -> None:
-        self._scale = 1.0
-        self._view_focus = None
-        self._refresh()
-        self.scroll.verticalScrollBar().setValue(0)
-        self.scroll.horizontalScrollBar().setValue(0)
+        """重置：将地图等比缩放至窗口尺寸。"""
+        self._fit_to_window()

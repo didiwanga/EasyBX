@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
@@ -95,6 +95,9 @@ class FullmeGridWindow(QDialog):
 
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._nam = QNetworkAccessManager(self)
+        # fullme 服务器公网直连即可，不走系统代理：系统代理（VPN/加速器/企业代理）
+        # 会导致 Qt 的 DNS 解析偶尔失败（界面显示「无法解析地址」）。
+        self._nam.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
         self._replies: list[QNetworkReply] = []
         self._label_urls: dict[QLabel, str] = {}
         for label in self._labels:
@@ -150,28 +153,41 @@ class FullmeGridWindow(QDialog):
             self._result_timer.stop()
             self._result_timer = None
 
-    def _load_into(self, nam, url: str, label: QLabel) -> None:
+    def _load_into(self, nam, url: str, label: QLabel, attempt: int = 0) -> None:
         req = QNetworkRequest(QUrl(url))
         req.setRawHeader(b"User-Agent", b"Mozilla/5.0 (compatible; EasyBXb)")
         # 同一链接独立打开 4 次：禁用缓存，确保每次都是真实重新请求
         from PyQt6.QtNetwork import QNetworkRequest as _NR
         req.setAttribute(_NR.Attribute.CacheLoadControlAttribute,
                          _NR.CacheLoadControl.AlwaysNetwork)
+        # 10s 传输超时：DNS 抖动/连接慢时不至于无限期卡「加载中…」
+        req.setTransferTimeout(10000)
         reply = nam.get(req)
         self._replies.append(reply)  # 持有引用，防止 reply 被 GC 导致信号不触发
-        reply.finished.connect(lambda: self._on_reply(reply, label))
+        reply.finished.connect(lambda: self._on_reply(reply, label, attempt))
 
-        # 兜底：10s 未完成显示超时，避免一直停在「加载中…」
-        def timeout():
-            if not reply.isFinished():
-                reply.abort()
-                label.setText("加载超时")
+    def _retry_load(self, nam, url: str, label: QLabel, attempt: int) -> None:
+        # DNS/网络偶发失败自动重试（初始请求后再重试 2 次），避免一闪而过的「无法解析地址」
+        if attempt >= 2:
+            return
+        backoff = [0, 500][attempt]
+        QTimer.singleShot(backoff, lambda: self._load_into(nam, url, label, attempt + 1))
 
-        QTimer.singleShot(10000, timeout)
-
-    def _on_reply(self, reply: QNetworkReply, label: QLabel) -> None:
+    def _on_reply(self, reply: QNetworkReply, label: QLabel, attempt: int = 0) -> None:
         url = label.property("url") or ""
+        try:
+            self._replies.remove(reply)
+        except ValueError:
+            pass
         if reply.error() != QNetworkReply.NetworkError.NoError:
+            # 仅窗口关闭/主动 abort（OperationCanceledError）不重试；
+            # DNS/主机/连接失败/超时等偶发网络错误自动重试，避免一闪而过的「无法解析地址」
+            from PyQt6.QtNetwork import QNetworkReply as _NR
+            err = reply.error()
+            if err != _NR.NetworkError.OperationCanceledError:
+                if attempt < 3:
+                    self._retry_load(self._nam, url, label, attempt)
+                    return
             label.setText(f"加载失败\n{reply.errorString()}")
             return
         data = bytes(reply.readAll())
