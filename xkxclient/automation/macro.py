@@ -15,6 +15,11 @@ from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
 # 只有 GMCP.Move result=false（撞墙/真失败）才触发失败回退。
 _MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动")
 
+# 泼皮等 NPC 拦路造成的 busy 通常持续 2-5 秒：拦路/失败后等待确认或停顿重试的时长。
+# 太短会在 busy 未结束时重发而反复失败；3-5 秒停顿后 busy 结束即可正常推进下一步。
+_BLOCK_WAIT_MS = 5000   # 移动异常后等待 GMCP.Move 确认（true=成功）的窗口
+_RETRY_WAIT_MS = 5000   # 确认失败后原地重发前的停顿（覆盖 busy 周期）
+
 # 方向取反（完整方向 + 常用短名）
 _REV_DIRS = dict(_MAP_OPPOSITE)
 _REV_DIRS.update({
@@ -712,7 +717,7 @@ class MacroEngine(QObject):
                 # 移动异常特征行只作提示：延迟等待 GMCP.Move 确认（true=成功/false=失败）
                 if any(p in line for p in _MOVE_ABNORMAL_PATTERNS) and not block_pending[0]:
                     # 泼皮等 NPC 瞬时拦路/busy：移动通常仍会成功，等待 GMCP.Move 确认，
-                    # 若一段时间内 GMCP 未推 true/false 则超时后按失败重试。
+                    # 若确认窗口内 GMCP 未推 true 则超时后按失败重试（busy 结束后重发即成功）。
                     block_pending[0] = True
                     if wait_timer[0] is not None:
                         wait_timer[0].stop()
@@ -720,7 +725,7 @@ class MacroEngine(QObject):
                     block_timer[0] = QTimer(self)
                     block_timer[0].setSingleShot(True)
                     block_timer[0].timeout.connect(lambda: on_block_timeout(idx))
-                    block_timer[0].start(1200)
+                    block_timer[0].start(_BLOCK_WAIT_MS)
                     return
                 if eval_line(line):
                     waited[0] = True
@@ -779,7 +784,7 @@ class MacroEngine(QObject):
                 next_or_finish(idx + 1)
 
             def on_block_timeout(idx: int) -> None:
-                # 拦路后 1200ms 内既无 GMCP 确认也无触发文本：按移动失败处理
+                # 确认窗口内既无 GMCP true 也无触发文本：按移动失败处理（原地重发）
                 if done[0] or waited[0]:
                     return
                 block_timer[0] = None
@@ -812,11 +817,12 @@ class MacroEngine(QObject):
             if n > retry_max:
                 next_or_finish(idx + 1)
                 return
-            # 原地延时重发原命令（走完整 wait：订阅触发 + GMCP）
+            # 原地延时重发原命令（走完整 wait：订阅触发 + GMCP）。
+            # 停顿 _RETRY_WAIT_MS 覆盖泼皮 busy 周期：busy 结束后重发即成功。
             tm = QTimer(self)
             tm.setSingleShot(True)
             tm.timeout.connect(lambda: send(idx))
-            tm.start(max(800, delay_ms))
+            tm.start(max(_RETRY_WAIT_MS, delay_ms))
             self._timers[name] = tm
 
         def finish() -> None:
