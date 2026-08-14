@@ -22,7 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QUrl
+from PyQt6.QtCore import Qt, QObject, QUrl
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
@@ -268,7 +268,7 @@ class UpdateManager(QObject):
 
         self._progress = QProgressDialog("正在下载新版本…", "取消", 0, 100)
         self._progress.setWindowTitle("更新 EasyBXb")
-        self._progress.setWindowModality(QProgressDialog.WindowModality.WindowModal)
+        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(300)
         self._progress.setAutoClose(True)
         self._progress.setAutoReset(True)
