@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QUrl
-from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
 from xkxclient.version import VERSION, UPDATE_DOWNLOAD_URL, UPDATE_MANIFEST_URL, is_newer
@@ -201,10 +201,16 @@ class UpdateManager(QObject):
         # 下载使用独立 NAM：manifest 处理器绑定在本 NAM 的 finished 上，
         # 若共用会把 exe 下载完成信号也当 manifest 处理，readAll 读走数据导致写空文件。
         self._dl_nam = QNetworkAccessManager(self)
+        # 强制直连（NoProxy）：下载走阿里云国内服务器，避免用户全局代理
+        # 劫持/中断 44MB 大文件（manifest 小文件能走国内路由，exe 却被代理挂起）。
+        no_proxy = QNetworkProxy(QNetworkProxy.ProxyType.NoProxy)
+        self.nam.setProxy(no_proxy)
+        self._dl_nam.setProxy(no_proxy)
 
     # ---- 入口 ----
     def start(self) -> None:
         _cleanup_stale_update_dir()
+        _log("start: checking manifest")
         req = QNetworkRequest(QUrl(UPDATE_MANIFEST_URL))
         req.setTransferTimeout(10_000)
         self.nam.get(req)
@@ -213,13 +219,19 @@ class UpdateManager(QObject):
     def _on_reply(self, reply: QNetworkReply) -> None:
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
+                _log(f"manifest error: {reply.error()}")
                 return
-            data = load_manifest(bytes(reply.readAll()).decode("utf-8", errors="replace"))
+            raw = bytes(reply.readAll())
+            _log(f"manifest received: {len(raw)} bytes")
+            data = load_manifest(raw.decode("utf-8", errors="replace"))
             if not data:
+                _log("manifest parse failed")
                 return
             if not is_newer(data.get("version", ""), VERSION):
+                _log(f"no newer version: server={data.get('version')} local={VERSION}")
                 return
             self._manifest = data
+            _log(f"new version found: {data.get('version')}")
             self._prompt_update(data)
         finally:
             reply.deleteLater()
@@ -236,11 +248,15 @@ class UpdateManager(QObject):
         box.setDefaultButton(upd)
         box.exec()
         if box.clickedButton() is upd:
+            _log("user chose: update now")
             self._start_download(data)
+        else:
+            _log("user chose: later")
 
     # ---- 下载 ----
     def _start_download(self, data: dict) -> None:
         url = str(data.get("url") or UPDATE_DOWNLOAD_URL)
+        _log(f"start download: {url}")
         self._update_dir = Path(tempfile.gettempdir()) / UPDATE_DIR_NAME
         self._update_dir.mkdir(parents=True, exist_ok=True)
         self._new_path = self._update_dir / NEW_EXE_NAME
@@ -266,6 +282,7 @@ class UpdateManager(QObject):
         reply.finished.connect(self._on_download_done)
 
     def _cancel_download(self) -> None:
+        _log("download cancelled by user")
         if self._download_reply is not None:
             self._download_reply.abort()
 
@@ -273,6 +290,7 @@ class UpdateManager(QObject):
         if total > 0 and self._progress is not None:
             self._progress.setMaximum(total)
             self._progress.setValue(done)
+        _log(f"progress: {done}/{total}")
 
     def _on_download_done(self) -> None:
         reply = self._download_reply
@@ -281,17 +299,23 @@ class UpdateManager(QObject):
             self._progress.close()
             self._progress = None
         if reply is None:
+            _log("download done: reply is None")
             return
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
+                _log(f"download error: {reply.error()}")
                 QMessageBox.warning(None, "更新失败", "下载新版本失败，请稍后重试。")
                 return
             data = bytes(reply.readAll())
+            _log(f"download done: {len(data)} bytes")
             if not self._new_path or not self._write_downloaded(data):
                 return
+            _log(f"written to {self._new_path}")
             if not self._verify_md5(self._manifest.get("md5", "")):
+                _log("md5 mismatch, update cancelled")
                 QMessageBox.warning(None, "更新失败", "新版本校验未通过，已取消更新。")
                 return
+            _log("md5 ok, prompting apply")
             self._prompt_apply()
         finally:
             reply.deleteLater()
@@ -300,7 +324,8 @@ class UpdateManager(QObject):
         try:
             self._new_path.write_bytes(data)
             return True
-        except OSError:
+        except OSError as exc:
+            _log(f"write failed: {exc!r}")
             QMessageBox.warning(None, "更新失败", "写入临时文件失败，请稍后重试。")
             return False
 
@@ -325,6 +350,7 @@ class UpdateManager(QObject):
         box.setDefaultButton(ok)
         box.exec()
         if box.clickedButton() is not ok:
+            _log("user cancelled apply")
             return
         self._launch_and_quit()
 
@@ -333,6 +359,7 @@ class UpdateManager(QObject):
             return
         target = Path(sys.executable).resolve()
         args = [str(self._new_path), "--update", str(self._new_path), str(target)]
+        _log(f"launch updater: {args!r}")
         try:
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
                 subprocess, "CREATE_NO_WINDOW", 0)
