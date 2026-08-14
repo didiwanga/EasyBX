@@ -25,6 +25,7 @@ class NotepadDock(QWidget):
         super().__init__(parent)
         self.session = session
         self.bus = getattr(session, "app", None).bus if session else None
+        self._subscribed = False
         self.setMinimumWidth(220)
 
         self.editor = QTextEdit()
@@ -48,15 +49,19 @@ class NotepadDock(QWidget):
         lay.addWidget(self.editor, 1)
 
         if self.bus is not None:
-            self.bus.subscribe("notepad.add", self._on_add)
+            self._subscribe()
 
         self._load()
+
+    def _subscribe(self) -> None:
+        if self.bus is not None and not self._subscribed:
+            self.bus.subscribe("notepad.add", self._on_add)
+            self._subscribed = True
 
     def bind(self, session) -> None:
         self.session = session
         self.bus = getattr(session, "app", None).bus if session else None
-        if self.bus is not None:
-            self.bus.subscribe("notepad.add", self._on_add)
+        self._subscribe()
 
     # ---- 追加 ----
     def _on_add(self, payload: dict) -> None:
