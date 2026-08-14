@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -625,15 +626,17 @@ class _EditorBase(QDialog):
                 idx = ci
         if idx is None or not (0 <= idx < len(self.items)):
             self._on_new()   # 无当前项：新建一个再保存
-        self._persist_current()
+        if not self._persist_current():
+            return   # 校验失败（已弹提示），不发成功消息
         self._refresh()
         self.session.app.bus.publish("ui.message", account=self.session.account_id,
                                      message=f"{self._key} 已保存（可继续编辑）")
 
-    def _persist_current(self) -> None:
+    def _persist_current(self) -> bool:
         """把当前表单（名称/分组/启用/共享 + 子字段）写回 items 并落盘，不关闭窗口。
 
         优先用当前选中项；选中分组节点/无选中时用最近编辑项，避免表单改动丢失。
+        返回是否保存成功（子类 `_extra` 校验失败抛 ValueError 时返回 False）。
         """
         idx = self._edit_idx
         item = self.item_list.currentItem()
@@ -649,10 +652,14 @@ class _EditorBase(QDialog):
                  "group": self.group_ed.currentText().strip(),
                  "enabled": self.enabled_cb.isChecked(),
                  "shared": self.shared_cb.isChecked()}
-            self.items[idx] = self._apply_form(d)
+            try:
+                self.items[idx] = self._apply_form(d)
+            except ValueError:
+                return False
             if not self.name_ed.text().strip():
                 self.name_ed.setText(name)
         self._persist()
+        return True
 
     def closeEvent(self, event) -> None:
         # 关窗即保存：先把表单写回 items，再丢弃未命名且无内容的纯空白新建项后落盘
@@ -809,9 +816,9 @@ class AliasEditor(_EditorBase):
         super().__init__("别名", session, parent)
 
     def _build_form(self) -> None:
-        self.pattern_ed = QLineEdit(); self.pattern_ed.setPlaceholderText("前缀/正则")
+        self.pattern_ed = QLineEdit(); self.pattern_ed.setPlaceholderText("别名/前缀/正则")
         self.replacement_ed = QLineEdit(); self.replacement_ed.setPlaceholderText("展开命令（%1 捕获）")
-        self.form.addRow("命令前缀", self.pattern_ed)
+        self.form.addRow("别名", self.pattern_ed)
         self.form.addRow("展开为", self.replacement_ed)
 
     def _fill_extra(self, item: dict) -> None:
@@ -819,7 +826,11 @@ class AliasEditor(_EditorBase):
         self.replacement_ed.setText(item.get("replacement", ""))
 
     def _extra(self, d: dict) -> dict:
-        return {"pattern": self.pattern_ed.text(), "replacement": self.replacement_ed.text()}
+        pattern = self.pattern_ed.text()
+        if not pattern.strip():
+            QMessageBox.warning(self, "别名", "别名必填，不可留空或全部为空格。")
+            raise ValueError("pattern empty")
+        return {"pattern": pattern, "replacement": self.replacement_ed.text()}
 
     def _reload_engine(self) -> None:
         cfg = self.session.app.config
