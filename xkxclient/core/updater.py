@@ -1,0 +1,312 @@
+"""自动更新：启动时检测服务器新版本 → 下载 → 提示 → 单exe更新器替换。
+
+设计（单 exe 复用更新器）：
+- 客户端每次启动异步请求 EasyBXb_version.json（阿里云 pytools.cloud）
+- 清单格式：{"version": "1.2.1", "url": "http://pytools.cloud/EasyBXb.exe", "md5": "..."}
+- 服务器版本更新时弹窗询问，确认后下载新版 exe 到 %TEMP%\\EasyBXb_update\\
+- 下载完成（校验 MD5）后再次提示「即将关闭客户端」，确认后用子进程启动
+  自身 exe 的 ``--update`` 静默模式，主程序退出
+- ``--update`` 模式（main.py 入口，无 GUI）：等待旧进程释放目标文件 → 备份并
+  替换 → 启动新版 → 清理临时文件 → 退出。全部用标准库，静默运行。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, QUrl
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+
+from xkxclient.version import VERSION, UPDATE_DOWNLOAD_URL, UPDATE_MANIFEST_URL, is_newer
+
+UPDATE_DIR_NAME = "EasyBXb_update"
+NEW_EXE_NAME = "EasyBXb_new.exe"
+_WAIT_TIMEOUT = 60.0  # 更新器等待旧进程释放目标文件的最长时间（秒）
+_STEP_WAIT = 0.4      # 轮询间隔（秒）
+
+
+# ---------------------------------------------------------------------------
+# 纯逻辑（无 Qt 依赖，供 main.py 更新器模式与测试复用）
+# ---------------------------------------------------------------------------
+
+def load_manifest(text: str) -> dict:
+    """解析版本清单文本，返回 dict；不合法返回 {}。"""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if not str(data.get("version", "")).strip():
+        return {}
+    return data
+
+
+def _file_unlocked(path: Path) -> bool:
+    """目标 exe 是否可被独占打开（旧进程已完全释放文件锁）。"""
+    try:
+        with open(path, "ab"):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_target_free(target: Path, timeout: float = _WAIT_TIMEOUT,
+                      step: float = _STEP_WAIT) -> bool:
+    """等待旧客户端进程完全退出（目标 exe 可写）。返回是否成功。"""
+    if not target.exists():
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _file_unlocked(target):
+            return True
+        time.sleep(step)
+    return False
+
+
+def run_updater(new_exe: str, target: str, wait_timeout: float = _WAIT_TIMEOUT) -> int:
+    """更新器核心：等待旧进程退出 → 备份并替换 → 启动新版 → 清理。返回退出码。
+
+    - new_exe:  已下载到临时目录的新版 exe（即当前更新器进程自身）
+    - target:   目标安装路径（要被替换的旧客户端 exe）
+    全程静默，不依赖 Qt/GUI。
+    """
+    new_path = Path(new_exe)
+    target_path = Path(target)
+    bak_path = target_path.with_suffix(target_path.suffix + ".bak")
+
+    if not new_path.exists():
+        return 3
+
+    if not _wait_target_free(target_path, timeout=wait_timeout):
+        # 旧进程始终未退出：放弃更新，避免留下损坏/半截文件
+        return 4
+
+    # 备份旧 exe 后替换；替换失败则回滚备份
+    try:
+        if target_path.exists():
+            if bak_path.exists():
+                bak_path.unlink()
+            shutil.copy2(target_path, bak_path)
+        shutil.copy2(new_path, target_path)
+    except OSError:
+        try:
+            if bak_path.exists():
+                shutil.copy2(bak_path, target_path)
+        except OSError:
+            pass
+        return 5
+
+    # 启动新版客户端（分离进程，主更新器随即退出）
+    try:
+        subprocess.Popen([str(target_path)], close_fds=True)
+    except OSError:
+        pass
+
+    # 清理：删除备份与更新临时目录（删除失败不影响已替换结果）
+    try:
+        if bak_path.exists():
+            bak_path.unlink()
+    except OSError:
+        pass
+    try:
+        _cleanup_update_dir(new_path)
+    except OSError:
+        pass
+    return 0
+
+
+def _cleanup_update_dir(inside: Path) -> None:
+    """删除更新临时目录（new_exe 所在目录），残留交给系统临时清理兜底。
+
+    仅当目录名恰为 EasyBXb_update（本次下载产生的目录）时才删除，
+    避免误删用户磁盘上同名目录。
+    """
+    root = inside.parent
+    if root.name == UPDATE_DIR_NAME:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _cleanup_stale_update_dir() -> None:
+    """启动时清理上次更新遗留的临时目录。
+
+    更新器进程自身是 new_exe，运行期间该 exe 文件被 Windows 锁定而无法删除；
+    待其退出后文件解锁，客户端下次启动时删除即可。
+    """
+    root = Path(tempfile.gettempdir()) / UPDATE_DIR_NAME
+    if root.name == UPDATE_DIR_NAME:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Qt 交互部分：启动时检测 + 下载 + 提示
+# ---------------------------------------------------------------------------
+
+class UpdateManager(QObject):
+    """启动后异步检查新版本；发现新版则引导下载、确认、启动更新器并退出主程序。"""
+
+    def __init__(self, app, parent=None) -> None:
+        super().__init__(parent)
+        self.app = app
+        self.nam = QNetworkAccessManager(self)
+        self.nam.finished.connect(self._on_reply)
+        self._download_reply: QNetworkReply | None = None
+        self._progress: QProgressDialog | None = None
+        self._manifest: dict = {}
+        self._update_dir: Path | None = None
+        self._new_path: Path | None = None
+
+    # ---- 入口 ----
+    def start(self) -> None:
+        _cleanup_stale_update_dir()
+        req = QNetworkRequest(QUrl(UPDATE_MANIFEST_URL))
+        req.setTransferTimeout(10_000)
+        self.nam.get(req)
+
+    # ---- 检测 ----
+    def _on_reply(self, reply: QNetworkReply) -> None:
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                return
+            data = load_manifest(bytes(reply.readAll()).decode("utf-8", errors="replace"))
+            if not data:
+                return
+            if not is_newer(data.get("version", ""), VERSION):
+                return
+            self._manifest = data
+            self._prompt_update(data)
+        finally:
+            reply.deleteLater()
+
+    def _prompt_update(self, data: dict) -> None:
+        new_ver = str(data.get("version", ""))
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("发现新版本")
+        box.setText(f"EasyBXb 有新版本可用：v{VERSION} → v{new_ver}")
+        box.setInformativeText("是否现在下载并更新？")
+        upd = box.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(upd)
+        box.exec()
+        if box.clickedButton() is upd:
+            self._start_download(data)
+
+    # ---- 下载 ----
+    def _start_download(self, data: dict) -> None:
+        url = str(data.get("url") or UPDATE_DOWNLOAD_URL)
+        self._update_dir = Path(tempfile.gettempdir()) / UPDATE_DIR_NAME
+        self._update_dir.mkdir(parents=True, exist_ok=True)
+        self._new_path = self._update_dir / NEW_EXE_NAME
+        try:
+            if self._new_path.exists():
+                self._new_path.unlink()
+        except OSError:
+            pass
+
+        self._progress = QProgressDialog("正在下载新版本…", "取消", 0, 100)
+        self._progress.setWindowTitle("更新 EasyBXb")
+        self._progress.setWindowModality(QProgressDialog.WindowModality.WindowModal)
+        self._progress.setMinimumDuration(300)
+        self._progress.setAutoClose(True)
+        self._progress.setAutoReset(True)
+        self._progress.canceled.connect(self._cancel_download)
+
+        req = QNetworkRequest(QUrl(url))
+        req.setTransferTimeout(120_000)
+        reply = self.nam.get(req)
+        reply.downloadProgress.connect(self._on_progress)
+        self._download_reply = reply
+        reply.finished.connect(self._on_download_done)
+
+    def _cancel_download(self) -> None:
+        if self._download_reply is not None:
+            self._download_reply.abort()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        if total > 0 and self._progress is not None:
+            self._progress.setMaximum(total)
+            self._progress.setValue(done)
+
+    def _on_download_done(self) -> None:
+        reply = self._download_reply
+        self._download_reply = None
+        if self._progress is not None:
+            self._progress.close()
+            self._progress = None
+        if reply is None:
+            return
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                QMessageBox.warning(None, "更新失败", "下载新版本失败，请稍后重试。")
+                return
+            data = bytes(reply.readAll())
+            if not self._new_path or not self._write_downloaded(data):
+                return
+            if not self._verify_md5(self._manifest.get("md5", "")):
+                QMessageBox.warning(None, "更新失败", "新版本校验未通过，已取消更新。")
+                return
+            self._prompt_apply()
+        finally:
+            reply.deleteLater()
+
+    def _write_downloaded(self, data: bytes) -> bool:
+        try:
+            self._new_path.write_bytes(data)
+            return True
+        except OSError:
+            QMessageBox.warning(None, "更新失败", "写入临时文件失败，请稍后重试。")
+            return False
+
+    @staticmethod
+    def _verify_md5(expected: str) -> bool:
+        if not expected:
+            return True  # 清单未提供 MD5：跳过校验
+        actual = hashlib.md5(Path(
+            Path(tempfile.gettempdir()) / UPDATE_DIR_NAME / NEW_EXE_NAME
+        ).read_bytes()).hexdigest().lower()
+        return actual == str(expected).strip().lower()
+
+    # ---- 应用更新 ----
+    def _prompt_apply(self) -> None:
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("准备更新")
+        box.setText("新版本下载完成，即将关闭客户端进行更新。")
+        box.setInformativeText("更新过程中请勿关闭本窗口。更新完成后客户端会自动重新启动。")
+        ok = box.addButton("开始更新", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(ok)
+        box.exec()
+        if box.clickedButton() is not ok:
+            return
+        self._launch_and_quit()
+
+    def _launch_and_quit(self) -> None:
+        if not self._new_path:
+            return
+        target = Path(sys.executable).resolve()
+        args = [str(self._new_path), "--update", str(self._new_path), str(target)]
+        try:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(args, close_fds=True, creationflags=flags)
+        except OSError:
+            QMessageBox.warning(None, "更新失败", "无法启动更新程序，请稍后重试。")
+            return
+        # 主程序退出，让更新器接管替换
+        self.app.quit()
+
+
+def frozen() -> bool:
+    """是否打包运行（sys.frozen 为 PyInstaller 标记）。"""
+    return bool(getattr(sys, "frozen", False))

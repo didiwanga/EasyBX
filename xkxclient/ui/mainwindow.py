@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDialog, QDockWidget, QLabel, QMainWindo
 from xkxclient.core import config as cfg
 from xkxclient.core import resources
 from xkxclient.core.shortcuts import ShortcutManager
+from xkxclient.core.updater import UpdateManager, frozen
 from xkxclient.ui import editors
 from xkxclient.ui.about import AboutDialog
 from xkxclient.ui.automationdock import (MacroControlDock, MacroRecorderDock,
@@ -134,6 +135,17 @@ class MainWindow(QMainWindow):
 
         self._restore_layout()
 
+        # 自动更新：打包环境启动后异步检查服务器新版本
+        if frozen():
+            self._updater = UpdateManager(self.app, self)
+            QTimer.singleShot(2000, self._updater.start)
+
+    def _check_update_now(self) -> None:
+        """菜单「检查更新」：立即（再）检查一次服务器新版本。"""
+        if not hasattr(self, "_updater"):
+            self._updater = UpdateManager(self.app, self)
+        self._updater.start()
+
     # ---- 装配工具 ----
     def _make_dock(self, title: str, widget: QWidget) -> QDockWidget:
         dock = ResizableDock(title, self)
@@ -216,6 +228,7 @@ class MainWindow(QMainWindow):
         sm.addAction("Lua 脚本…", lambda: self._open_editor("script"))
 
         hm = bar.addMenu("帮助")
+        hm.addAction("检查更新…", self._check_update_now)
         hm.addAction("关于", self._about)
         hm.addAction("Lua 脚本手册", self._open_manual)
 

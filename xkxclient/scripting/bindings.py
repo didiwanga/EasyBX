@@ -4,9 +4,10 @@ import time
 
 from xkxclient.automation.timer import TimerDef
 from xkxclient.automation.trigger import Trigger
+from xkxclient.version import VERSION
 
 CLIENT_NAME = "EasyBXb"
-CLIENT_VERSION = "0.1.0"
+CLIENT_VERSION = VERSION
 
 
 def _opt(opts, key: str, default=None):

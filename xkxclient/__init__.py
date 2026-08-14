@@ -1,1 +1,1 @@
-__version__ = "0.1.0"
+from xkxclient.version import VERSION as __version__  # noqa: F401

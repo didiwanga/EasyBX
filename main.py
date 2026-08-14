@@ -2,6 +2,24 @@ import os
 import sys
 
 
+def _run_updater() -> bool:
+    """--update <new_exe> <target>：单exe更新器静默模式。
+
+    由主程序在「即将关闭客户端」确认后以分离进程启动，无 GUI：
+    等待旧进程释放目标文件 → 备份并替换 → 启动新版 → 清理临时文件 → 退出。
+    返回 True 表示已接管本次启动并应结束进程。
+    """
+    args = [a for a in sys.argv[1:] if a and not a.startswith("--update")]
+    if not any(a == "--update" for a in sys.argv):
+        return False
+    if len(args) < 2:
+        return True  # 参数不完整：静默退出，不触发任何界面
+    from xkxclient.core.updater import run_updater
+
+    run_updater(args[0], args[1])
+    return True  # 无论成功与否，更新器进程都静默结束
+
+
 def _self_test() -> int:
     """EASYX_SELFTEST=1 时的冻结运行时自检：装配 + Lua 执行，结果写临时日志。
 
@@ -70,6 +88,8 @@ def _self_test() -> int:
 
 
 def main() -> int:
+    if _run_updater():
+        return 0
     if os.environ.get("EASYX_SELFTEST"):
         try:
             code = _self_test()

@@ -4,8 +4,7 @@ from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QDialog
 from PyQt6.QtGui import QPixmap
 
 from xkxclient.core import resources
-
-VERSION = "0.2.0"
+from xkxclient.version import VERSION
 
 
 def version_string() -> str:

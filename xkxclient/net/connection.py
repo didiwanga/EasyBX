@@ -5,6 +5,7 @@ from PyQt6.QtNetwork import QTcpSocket
 
 from xkxclient.net import ansi
 from xkxclient.net.telnet import TelnetParser, GMCP_OPT, IAC, DO, SB, SE
+from xkxclient.version import VERSION
 
 CLIENT_ID = "EasyBXb"
 
@@ -76,7 +77,7 @@ class Connection(QObject):
         if self._gmcp_hello_sent:
             return
         self._gmcp_hello_sent = True
-        payload = b'Core.Hello {"client":"%s","version":"0.1.0"}' % CLIENT_ID.encode("utf-8")
+        payload = b'Core.Hello {"client":"%s","version":"%s"}' % (CLIENT_ID.encode("utf-8"), VERSION.encode("utf-8"))
         self.send_raw(bytes([IAC, SB, GMCP_OPT]) + payload + bytes([IAC, SE]))
 
     # ---- 内部 ----

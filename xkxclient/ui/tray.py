@@ -4,7 +4,8 @@ from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon, QMessageBox
 
 from xkxclient.core import resources
-from xkxclient.ui.about import VERSION, AboutDialog
+from xkxclient.ui.about import AboutDialog
+from xkxclient.version import VERSION
 
 
 class AppTray(QSystemTrayIcon):
