@@ -16,3 +16,16 @@ def extract_fullme_url(text: str) -> str | None:
 
 def is_fullme_related(text: str) -> bool:
     return bool(_URL_RE.search(text)) or ("fullme" in text and "验证" not in text)
+
+
+# 红包口令链接：`http://fullme.pkuxkx.net/robot.php?filename=...`，
+# 口令为不含空白的口令串（数字/字母/部分符号），用于 `hongbao <口令>` 抢红包。
+_HONGBAO_RE = re.compile(
+    r"https?://[^\s\"'<>]*?robot\.php\?[^\s\"'<>]*filename=[^ \t\r\n\u4e00-\u9fff\"'<>]+",
+    re.IGNORECASE,
+)
+
+
+def extract_hongbao_url(text: str) -> str | None:
+    m = _HONGBAO_RE.search(text)
+    return m.group(0) if m else None

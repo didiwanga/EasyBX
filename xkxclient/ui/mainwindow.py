@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
         self.app.bus.subscribe("ui.message", self._on_status_message)
         self.app.bus.subscribe("fullme.detected", self._on_fullme)
         self.app.bus.subscribe("fullme.grid", self._on_fullme_grid)
+        self.app.bus.subscribe("hongbao.detected", self._on_hongbao)
         self.app.bus.subscribe("macro.start", self._on_macro_progress)
         self.app.bus.subscribe("macro.end", self._on_macro_progress)
         self.app.bus.subscribe("macro.wait_input", self._on_macro_wait)
@@ -371,6 +372,17 @@ class MainWindow(QMainWindow):
         self._layout_diag = True
         if self._cur_tab is not None and self._cur_tab.account_id == payload.get("account"):
             self.skills_dock_widget().refresh()
+
+    def _on_hongbao(self, payload: dict) -> None:
+        if payload.get("account") != getattr(self._cur_tab, "account_id", None):
+            return
+        from xkxclient.ui.fullme import HongbaoWindow
+
+        session = self._cur_tab.session
+        w = HongbaoWindow(session, url=payload.get("url", ""))
+        w._debug_log = lambda msg: self.status.showMessage(str(msg)[:120], 5000)
+        self._hongbao_win = w
+        w.show()
 
     def _on_status_message(self, payload: dict) -> None:
         msg = str(payload.get("message", ""))

@@ -43,7 +43,13 @@ source = 'manual'   # 用户发了 fullme/手动 look 触发
   - **超时兜底**：发送后 180s 无任何回话 → 按失败处理提示重输。
 - 宏验证码窗口（CaptchaWindow）**不启用**该模式：提交即把验证码回传回调（宏赋值变量）并关窗。
 
-## 五、结构
+## 五、红包口令窗口（HongbaoWindow）
+- **检测**：服务器消息含 `robot.php?filename=<口令>`（形如「在线发出红包，请到 http://fullme.pkuxkx.net/robot.php?filename=xxx 查询口令。抢红包命令 hongbao <口令>」）。
+- **弹窗**：同一消息内红包链接优先识别，发布 `hongbao.detected`（account, url），弹出红包口令窗口；该链接不再当作 fullme 处理。
+- **交互**：图片加载同 fullme（NoProxy + 10s 超时 + 重试 2 次）；底部输入框只填口令，回车即发送 `hongbao <口令>` 并关窗（不启用等待回话模式）。
+- **入口**：`core/fullme.py::extract_hongbao_url` → `session._maybe_fullme` → `mainwindow._on_hongbao` → `ui/fullme.py::HongbaoWindow`。
+
+## 六、结构
 ```
 [4宫格验证码图]
 ───────────────
@@ -51,12 +57,13 @@ source = 'manual'   # 用户发了 fullme/手动 look 触发
 ```
 - task 窗口仅显示图，顶部保留「输入」备用（小按钮可显示输入行）。
 
-## 六、验收
+## 七、验收
 - [ ] 不落地 OCR（无任何识别）
 - [ ] 无 QWebEngine 可显示图（HTTP 下载 + `<img>` 解析降级）
 - [ ] 直连 NoProxy；10s 传输超时 + 偶发失败自动重试 2 次
 - [ ] 只填码自动拼 fullme + 回车
 - [ ] 成功自动关窗；失败提示重输（最多 3 次）；超时 180s 按失败处理
 - [ ] 宏验证码窗口提交即关窗并回传验证码
+- [ ] 红包链接弹出 HongbaoWindow，提交发送 `hongbao <口令>` 并关窗
 - [ ] manual 窗口显示底部输入行；task 来源细分显示（待补）
 - [ ] 窗口弹出/处理沿用预期

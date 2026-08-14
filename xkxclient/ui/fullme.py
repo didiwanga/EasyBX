@@ -290,3 +290,28 @@ class CaptchaWindow(FullmeGridWindow):
         if self._on_submit is not None:
             self._on_submit(code)
         self.close()
+
+
+class HongbaoWindow(FullmeGridWindow):
+    """红包口令弹窗：检测到「在线发出红包…抢红包命令hongbao <口令>」时弹出，
+    展示口令图（同 fullme 图片加载），用户输入口令回车/发送即执行 `hongbao <口令>`。
+
+    提交即发即关，不启用等待服务器回话模式。
+    """
+
+    def __init__(self, session, url: str = "", parent=None) -> None:
+        super().__init__(session, urls=[url] if url else [], parent=parent)
+        self.setWindowTitle("红包口令")
+        self.desc_label.setText("输入口令后回车，自动发送 hongbao <口令>")
+        self.desc_label.show()
+
+    def wait_result_enabled(self) -> bool:
+        return False
+
+    def _send(self) -> None:
+        code = self.input_row.text().strip()
+        if not code:
+            return
+        self.input_row.clear()
+        self.session.send(f"hongbao {code}")
+        self.close()

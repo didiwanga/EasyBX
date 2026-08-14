@@ -637,6 +637,13 @@ class AccountSession(QObject):
         # 宏验证码步骤期间：fullme 链接由宏引擎消费，避免再弹普通 fullme 窗
         if getattr(self, "_macro_captcha_active", False):
             return
+        # 红包口令链接（robot.php?filename=…）：优先识别，弹红包验证码窗（发 hongbao 口令）
+        from xkxclient.core.fullme import extract_hongbao_url
+
+        hb_url = extract_hongbao_url(text)
+        if hb_url:
+            self.app.bus.publish("hongbao.detected", account=self.account_id, url=hb_url)
+            return
         url = extract_fullme_url(text)
         if url:
             if self._fullme_collect > 0:
@@ -888,11 +895,17 @@ class AccountSession(QObject):
         self.connection.close()
 
     def logout(self) -> None:
-        """客户端关闭前的优雅登出：发送 quit 让服务器存档/清理，避免直接断线丢物品。
+        """客户端关闭前的优雅登出：默认发送 quit 让服务器存档/清理，避免直接断线丢物品。
 
-        仅对已登录且有连接时发送；不阻塞、不等服务器应答（等待由 app.shutdown 统一处理）。
+        是否发送 quit 由「关闭行为设置」里的「退出前发送 quit」勾选决定
+        （配置键 close.send_quit，默认 True）。仅对已登录且有连接时发送；
+        不阻塞、不等服务器应答（等待由 app.shutdown 统一处理）。
         """
         if not self.logged_in or not self.connected:
+            return
+        from xkxclient.core.config import ConfigManager
+
+        if not bool(ConfigManager.instance().get("close.send_quit", True)):
             return
         try:
             self.connection.send_line("quit")

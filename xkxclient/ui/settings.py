@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QInputDialog,
@@ -120,6 +121,8 @@ class ShortcutDialog(QDialog):
 
 # 关闭行为配置键的取值：always_tray / always_quit / ask（默认）
 _CLOSE_MODE_KEY = "close.mode"
+# 退出时是否向服务器发送 quit（存档/清理）。默认 True。
+_SEND_QUIT_KEY = "close.send_quit"
 
 
 class CloseBehaviorDialog(QDialog):
@@ -144,6 +147,10 @@ class CloseBehaviorDialog(QDialog):
         group.addButton(self.tray_rb)
         group.addButton(self.quit_rb)
 
+        self.send_quit_cb = QCheckBox("退出前发送 quit（让服务器存档/清理）")
+        self.send_quit_cb.setChecked(
+            bool(ConfigManager.instance().get(_SEND_QUIT_KEY, True)))
+
         save_btn = QPushButton("保存")
         save_btn.clicked.connect(self._save)
         close_btn = QPushButton("取消")
@@ -154,6 +161,7 @@ class CloseBehaviorDialog(QDialog):
         lay.addWidget(self.ask_rb)
         lay.addWidget(self.tray_rb)
         lay.addWidget(self.quit_rb)
+        lay.addWidget(self.send_quit_cb)
         btns = QHBoxLayout()
         btns.addWidget(save_btn)
         btns.addWidget(close_btn)
@@ -167,4 +175,5 @@ class CloseBehaviorDialog(QDialog):
         else:
             mode = "ask"
         ConfigManager.instance().set(_CLOSE_MODE_KEY, mode)
+        ConfigManager.instance().set(_SEND_QUIT_KEY, self.send_quit_cb.isChecked())
         self.accept()
