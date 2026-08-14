@@ -39,9 +39,9 @@ _STEP_WAIT = 0.4      # 轮询间隔（秒）
 # ---------------------------------------------------------------------------
 
 def load_manifest(text: str) -> dict:
-    """解析版本清单文本，返回 dict；不合法返回 {}。"""
+    """解析版本清单文本，返回 dict；不合法返回 {}。容忍 UTF-8 BOM 与前后空白。"""
     try:
-        data = json.loads(text)
+        data = json.loads(text.lstrip("\ufeff \t\r\n"))
     except (ValueError, TypeError):
         return {}
     if not isinstance(data, dict):
@@ -198,6 +198,7 @@ class UpdateManager(QObject):
         self._manifest: dict = {}
         self._update_dir: Path | None = None
         self._new_path: Path | None = None
+        self._manual = False
         # 下载使用独立 NAM：manifest 处理器绑定在本 NAM 的 finished 上，
         # 若共用会把 exe 下载完成信号也当 manifest 处理，readAll 读走数据导致写空文件。
         self._dl_nam = QNetworkAccessManager(self)
@@ -208,9 +209,11 @@ class UpdateManager(QObject):
         self._dl_nam.setProxy(no_proxy)
 
     # ---- 入口 ----
-    def start(self) -> None:
+    def start(self, manual: bool = False) -> None:
+        """检查服务器新版本。manual=True 为菜单手动检查：无新版/失败都给出提示。"""
+        self._manual = manual
         _cleanup_stale_update_dir()
-        _log("start: checking manifest")
+        _log(f"start: checking manifest manual={manual}")
         req = QNetworkRequest(QUrl(UPDATE_MANIFEST_URL))
         req.setTransferTimeout(10_000)
         self.nam.get(req)
@@ -220,15 +223,21 @@ class UpdateManager(QObject):
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 _log(f"manifest error: {reply.error()}")
+                if self._manual:
+                    QMessageBox.warning(None, "检查更新", "无法连接更新服务器，请稍后重试。")
                 return
             raw = bytes(reply.readAll())
             _log(f"manifest received: {len(raw)} bytes")
             data = load_manifest(raw.decode("utf-8", errors="replace"))
             if not data:
                 _log("manifest parse failed")
+                if self._manual:
+                    QMessageBox.warning(None, "检查更新", "更新清单解析失败，请稍后重试。")
                 return
             if not is_newer(data.get("version", ""), VERSION):
                 _log(f"no newer version: server={data.get('version')} local={VERSION}")
+                if self._manual:
+                    QMessageBox.information(None, "检查更新", f"当前已是最新版本 v{VERSION}。")
                 return
             self._manifest = data
             _log(f"new version found: {data.get('version')}")

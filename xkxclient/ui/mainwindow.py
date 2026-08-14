@@ -141,10 +141,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2000, self._updater.start)
 
     def _check_update_now(self) -> None:
-        """菜单「检查更新」：立即（再）检查一次服务器新版本。"""
+        """菜单「检查更新」：立即（再）检查一次服务器新版本，并给出结果提示。"""
         if not hasattr(self, "_updater"):
             self._updater = UpdateManager(self.app, self)
-        self._updater.start()
+        self._updater.start(manual=True)
 
     # ---- 装配工具 ----
     def _make_dock(self, title: str, widget: QWidget) -> QDockWidget:
