@@ -260,6 +260,7 @@ class MainWindow(QMainWindow):
         tb.addAction("▶ 宏控制", self._toggle_dock(self.macro_dock))
         tb.addAction("🔍 查找", self._show_find)
         tb.addAction("📖 命令速查", self._toggle_dock(self.commands_dock))
+        tb.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
         # 最右侧：屏显屏蔽便捷按钮（弹性占位把它推到工具栏右端）
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)

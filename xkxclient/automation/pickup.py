@@ -86,4 +86,6 @@ class AutoPickupEngine(QObject):
         if self._cooldown.get(key, 0.0) > now:
             return
         self._cooldown[key] = now + _PICK_COOLDOWN
-        self.session.send_auto(f"get {name_en}")
+        # 服务器物品英文 id 一律小写（如 get gold / get shi tan）；
+        # look 显示的名字可能大写开头（Gold），直接发会被当作未知物品。
+        self.session.send_auto(f"get {name_en.strip().lower()}")
