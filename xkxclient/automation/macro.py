@@ -7,6 +7,19 @@ from PyQt6.QtCore import QObject, QTimer
 
 from xkxclient.automation.runner import split_commands, substitute
 from xkxclient.core.fullme import extract_fullme_url
+from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
+
+# 移动失败特征行（服务器拦截/防挂机输出）：命中视为该步移动异常
+_MOVE_FAIL_PATTERNS = ("不能移动", "拦住你", "拉住")
+
+# 方向取反（完整方向 + 常用短名）
+_REV_DIRS = dict(_MAP_OPPOSITE)
+_REV_DIRS.update({
+    "n": "s", "s": "n", "e": "w", "w": "e",
+    "ne": "sw", "nw": "se", "se": "nw", "sw": "ne",
+    "nu": "sd", "nd": "su", "su": "nd", "sd": "nu",
+    "eu": "wd", "ed": "wu", "wu": "ed", "wd": "eu",
+})
 
 
 def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
@@ -83,6 +96,8 @@ class MacroEngine(QObject):
         self._captcha_timer: QTimer | None = None           # 3s 检测窗口
         self._captcha_win = None                            # 验证码窗口引用（防 GC）
         self._call_stack: dict[str, list[int]] = {}         # 调用触发返回栈（每宏一个栈）
+        self._move_log: dict[str, list[dict]] = {}          # 移动日志：name -> [(dir, from_room, to_room), ...]
+        self._wait_cleanup: dict[str, Callable] = {}        # 移动并触发等待清理器（停止/终止时解除订阅）
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -185,6 +200,10 @@ class MacroEngine(QObject):
         self._loop_count.clear()
         self._paused.clear()
         self._call_stack.clear()
+        self._move_log.clear()
+        for cleanup in list(self._wait_cleanup.values()):
+            cleanup()
+        self._wait_cleanup.clear()
         self._waiting = None
         if names:
             self.bus.publish("macro.stop", account=self.session.account_id, names=names)
@@ -552,6 +571,11 @@ class MacroEngine(QObject):
         - 命中 → 延时 delay_ms 后发送下一个命令
         - 当前命令超时（timeout_ms，>0）未命中 → 跳过等待，直接发送下一个命令
         - `()` 括起的命令（单个或 `;` 分隔的组）只按延时顺序执行，不走触发/超时
+        - 移动日志：每次方向移动记录 `(方向, 出发房间, 到达房间)` 到 `_move_log[name]`，
+          到达房间由 GMCP.Move 确认回写
+        - 移动异常回退（auto_retry 默认开）：文本命中 `不能移动/拦住你/拉住` 或
+          GMCP.Move result=false 判定该步失败 → 发反向命令回到最近已确认房间 →
+          确认后重发该命令；同一命令连续失败 retry_max（默认 3）次后跳过继续
         - 全部命令发送完 → 继续下一步
         """
         from xkxclient.automation.trigger import Trigger
@@ -563,6 +587,8 @@ class MacroEngine(QObject):
             return
         delay_ms = int(step.get("delay_ms") or 0)
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+        auto_retry = bool(step.get("auto_retry", True))
+        retry_max = max(1, int(step.get("retry_max") or 3))
         conds = step.get("conditions")
         if conds:
             conds = [dict(c) for c in conds]
@@ -578,23 +604,58 @@ class MacroEngine(QObject):
                 return all(self._hit_match(c, line) for c in conds)
             return any(self._hit_match(c, line) for c in conds)
 
+        def current_room() -> str:
+            """当前房间名：优先 map_cache.current，其次 session.room_name。"""
+            mc = getattr(self.session, "map_cache", None)
+            if mc is not None:
+                room = getattr(mc, "current", "") or ""
+                if room:
+                    return room
+            return getattr(self.session, "room_name", "") or ""
+
         done = [False]
+        attempts: dict[int, int] = {}          # 每命令失败重试计数（回退后重发）
+        text_sub = [None]                      # net.text_display 订阅句柄
+        gmcp_sub = [None]                      # GMCP.Move 订阅句柄
+        wait_timer = [None]                    # 触发等待超时计时器
+        bk_timer = [None]                      # 回退确认计时器
+
+        def unsubscribe() -> None:
+            if text_sub[0] is not None:
+                self.bus.unsubscribe("net.text_display", text_sub[0])
+                text_sub[0] = None
+            if gmcp_sub[0] is not None:
+                self.bus.unsubscribe("GMCP.Move", gmcp_sub[0])
+                gmcp_sub[0] = None
+            if wait_timer[0] is not None:
+                wait_timer[0].stop()
+                wait_timer[0] = None
+            if bk_timer[0] is not None:
+                bk_timer[0].stop()
+                bk_timer[0] = None
 
         def cleanup() -> None:
-            if self._trigger_sub is not None:
-                self.bus.unsubscribe("net.text_display", self._trigger_sub)
-                self._trigger_sub = None
-            if self._trigger_timer is not None:
-                self._trigger_timer.stop()
-                self._trigger_timer = None
+            unsubscribe()
+            self._wait_cleanup.pop(name, None)
             tm = self._timers.pop(name, None)
             if tm is not None:
                 tm.stop()
+
+        def record_move(dir_cmd: str) -> None:
+            log = self._move_log.setdefault(name, [])
+            log.append({"dir": dir_cmd, "from": current_room(), "to": ""})
+
+        def confirm_move(to_room: str) -> None:
+            log = self._move_log.get(name)
+            if log and not log[-1].get("to"):
+                log[-1]["to"] = to_room
 
         def send(idx: int) -> None:
             if done[0] or idx >= len(cmds):
                 return
             c, skip = cmds[idx]
+            if not skip:
+                record_move(c)
             self.session.send_auto(c)
             if skip:
                 # 括号命令：只按延时执行，不走触发/超时
@@ -616,6 +677,21 @@ class MacroEngine(QObject):
                              state="waiting_trigger", name=name)
             waited = [False]
 
+            def gmcp_move_data(payload: dict) -> dict:
+                """规范化 GMCP.Move 负载：list → 首元素 dict；result 归一为 bool。"""
+                data = payload.get("data")
+                if isinstance(data, list):
+                    data = data[0] if data and isinstance(data[0], dict) else {}
+                if not isinstance(data, dict):
+                    data = {}
+                return data
+
+            def gmcp_move_ok(data: dict) -> bool:
+                ok = data.get("result")
+                if not isinstance(ok, bool):
+                    ok = str(ok or "").strip().lower() in ("true", "1")
+                return ok
+
             def on_line(payload: dict) -> None:
                 if done[0] or waited[0]:
                     return
@@ -623,14 +699,16 @@ class MacroEngine(QObject):
                     return
                 if (payload.get("account") or "") != self.session.account_id:
                     return
-                if eval_line(payload.get("line") or ""):
+                line = payload.get("line") or ""
+                # 移动异常特征行优先判定（如 泼皮拦截/不能移动）
+                if any(p in line for p in _MOVE_FAIL_PATTERNS):
                     waited[0] = True
-                    if self._trigger_sub is not None:
-                        self.bus.unsubscribe("net.text_display", self._trigger_sub)
-                        self._trigger_sub = None
-                    if self._trigger_timer is not None:
-                        self._trigger_timer.stop()
-                        self._trigger_timer = None
+                    unsubscribe()
+                    move_failed(idx)
+                    return
+                if eval_line(line):
+                    waited[0] = True
+                    unsubscribe()
                     if delay_ms > 0:
                         tm = QTimer(self)
                         tm.setSingleShot(True)
@@ -640,24 +718,105 @@ class MacroEngine(QObject):
                     else:
                         next_or_finish(idx + 1)
 
+            def on_gmcp(payload: dict) -> None:
+                if done[0] or waited[0]:
+                    return
+                if name not in self._active:
+                    return
+                if (payload.get("account") or "") != self.session.account_id:
+                    return
+                data = gmcp_move_data(payload)
+                if gmcp_move_ok(data):
+                    confirm_move(str(data.get("short") or ""))
+                    return
+                # GMCP.Move result=false：撞墙/被拦 → 移动失败
+                waited[0] = True
+                unsubscribe()
+                move_failed(idx)
+
             def on_timeout() -> None:
                 if done[0] or waited[0]:
                     return
                 waited[0] = True
-                if self._trigger_sub is not None:
-                    self.bus.unsubscribe("net.text_display", self._trigger_sub)
-                    self._trigger_sub = None
-                if self._trigger_timer is not None:
-                    self._trigger_timer.stop()
-                    self._trigger_timer = None
+                unsubscribe()
                 next_or_finish(idx + 1)
 
-            self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+            text_sub[0] = self.bus.subscribe("net.text_display", on_line)
+            gmcp_sub[0] = self.bus.subscribe("GMCP.Move", on_gmcp)
             if timeout_ms > 0:
-                self._trigger_timer = QTimer(self)
-                self._trigger_timer.setSingleShot(True)
-                self._trigger_timer.timeout.connect(on_timeout)
-                self._trigger_timer.start(timeout_ms)
+                wait_timer[0] = QTimer(self)
+                wait_timer[0].setSingleShot(True)
+                wait_timer[0].timeout.connect(on_timeout)
+                wait_timer[0].start(timeout_ms)
+
+        def move_failed(idx: int) -> None:
+            """移动失败：回退到最近已确认房间后重发；超过重试上限则跳过当前命令。"""
+            if done[0]:
+                return
+            if not auto_retry:
+                next_or_finish(idx + 1)
+                return
+            n = attempts.get(idx, 0) + 1
+            attempts[idx] = n
+            if n > retry_max:
+                next_or_finish(idx + 1)
+                return
+            c, _skip = cmds[idx]
+            rev = _REV_DIRS.get(c.strip().lower())
+            if not rev:
+                # 非方向命令：无法回退，延时后直接重发
+                tm = QTimer(self)
+                tm.setSingleShot(True)
+                tm.timeout.connect(lambda: send(idx))
+                tm.start(max(300, delay_ms))
+                self._timers[name] = tm
+                return
+            # 发送反向命令回退，等待 GMCP.Move 确认回到房间后重发
+            self.session.send_auto(rev)
+            bk_confirmed = [False]
+
+            def on_gmcp_back(payload: dict) -> None:
+                if done[0] or bk_confirmed[0]:
+                    return
+                if name not in self._active:
+                    return
+                if (payload.get("account") or "") != self.session.account_id:
+                    return
+                data = gmcp_move_data(payload)
+                if gmcp_move_ok(data):
+                    bk_confirmed[0] = True
+                    if bk_timer[0] is not None:
+                        bk_timer[0].stop()
+                        bk_timer[0] = None
+                    if gmcp_sub[0] is not None:
+                        self.bus.unsubscribe("GMCP.Move", gmcp_sub[0])
+                        gmcp_sub[0] = None
+                    tm = QTimer(self)
+                    tm.setSingleShot(True)
+                    tm.timeout.connect(lambda: send(idx))
+                    tm.start(max(200, delay_ms))
+                    self._timers[name] = tm
+
+            def on_bk_timeout() -> None:
+                # 回退确认超时（GMCP 未回推）：直接重发
+                bk_timer[0] = None
+                if done[0] or bk_confirmed[0]:
+                    return
+                bk_confirmed[0] = True
+                if gmcp_sub[0] is not None:
+                    self.bus.unsubscribe("GMCP.Move", gmcp_sub[0])
+                    gmcp_sub[0] = None
+                tm = QTimer(self)
+                tm.setSingleShot(True)
+                tm.timeout.connect(lambda: send(idx))
+                tm.start(max(300, delay_ms))
+                self._timers[name] = tm
+
+            gmcp_sub[0] = self.bus.subscribe("GMCP.Move", on_gmcp_back)
+            bk_timer[0] = QTimer(self)
+            bk_timer[0].setSingleShot(True)
+            bk_timer[0].timeout.connect(on_bk_timeout)
+            bk_timer[0].start(1500)
 
         def finish() -> None:
             if done[0]:
@@ -673,6 +832,7 @@ class MacroEngine(QObject):
             else:
                 send(idx)
 
+        self._wait_cleanup[name] = cleanup
         self.bus.publish("macro.state", account=self.session.account_id,
                          state="waiting_trigger", name=name)
         send(0)
@@ -779,6 +939,9 @@ class MacroEngine(QObject):
         self._paused.discard(name)
         self._call_stack.pop(name, None)
         self._timers.pop(name, None)
+        cleanup = self._wait_cleanup.pop(name, None)
+        if cleanup is not None:
+            cleanup()
         if self._trigger_sub is not None:
             self.bus.unsubscribe("net.text_display", self._trigger_sub)
             self._trigger_sub = None

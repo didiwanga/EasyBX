@@ -998,7 +998,8 @@ class MacroEditor(_EditorBase):
         if t == "move_trigger":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
-            return f"移动并触发: {s.get('command', '')} → {pat}"
+            retry = "" if s.get("auto_retry", True) else "（不回退）"
+            return f"移动并触发: {s.get('command', '')} → {pat} {retry}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -1289,6 +1290,13 @@ class StepDialog(QDialog):
         self.mt_timeout_sb = QSpinBox(); self.mt_timeout_sb.setRange(0, 3600000)
         self.mt_timeout_sb.setSuffix(" ms")
         self.mt_timeout_sb.setToolTip("每个命令等待触发的超时；超时跳过当前命令继续下一个（0 = 永不超时）")
+        self.mt_retry_cb = QCheckBox("移动失败自动回退重试")
+        self.mt_retry_cb.setChecked(True)
+        self.mt_retry_cb.setToolTip("服务器拦截（泼皮/不能移动等）导致移动异常时，回退到最近已确认房间后重发")
+        self.mt_retry_sb = QSpinBox(); self.mt_retry_sb.setRange(1, 20)
+        self.mt_retry_sb.setValue(3)
+        self.mt_retry_sb.setSuffix(" 次")
+        self.mt_retry_sb.setToolTip("同一命令连续失败重试上限；超过后跳过当前命令继续")
         self.mt_note = QLabel("逐个发送移动命令，每个命令等待一次触发命中；命中后延时再发下一个；超时则跳过当前命令继续。")
         self.mt_note.setStyleSheet("color:#c08040;")
 
@@ -1403,6 +1411,9 @@ class StepDialog(QDialog):
         mf.addRow("触发条件", self.mt_cond)
         mf.addRow("命中后延时", self.mt_delay_sb)
         mf.addRow("等待超时", self.mt_timeout_sb)
+        retry_row = QHBoxLayout(); retry_row.addWidget(self.mt_retry_cb)
+        retry_row.addSpacing(8); retry_row.addWidget(self.mt_retry_sb)
+        mf.addRow("异常回退", retry_row)
         self._pages["move_trigger"] = p_mt
 
         self.stack = QStackedWidget()
@@ -1564,6 +1575,8 @@ class StepDialog(QDialog):
             self.mt_cond.set_relation(s.get("relation", "or"))
             self.mt_delay_sb.setValue(int(s.get("delay_ms", 0)))
             self.mt_timeout_sb.setValue(self._timeout_ms(s))
+            self.mt_retry_cb.setChecked(bool(s.get("auto_retry", True)))
+            self.mt_retry_sb.setValue(int(s.get("retry_max", 3)))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
@@ -1809,6 +1822,8 @@ class StepDialog(QDialog):
             s["pattern"] = conds[0].get("pattern", "") if conds else ""
             s["delay_ms"] = self.mt_delay_sb.value()
             s["timeout_ms"] = self.mt_timeout_sb.value()
+            s["auto_retry"] = self.mt_retry_cb.isChecked()
+            s["retry_max"] = self.mt_retry_sb.value()
         self._step = s
         self.accept()
 
