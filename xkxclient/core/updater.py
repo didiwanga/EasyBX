@@ -198,6 +198,9 @@ class UpdateManager(QObject):
         self._manifest: dict = {}
         self._update_dir: Path | None = None
         self._new_path: Path | None = None
+        # 下载使用独立 NAM：manifest 处理器绑定在本 NAM 的 finished 上，
+        # 若共用会把 exe 下载完成信号也当 manifest 处理，readAll 读走数据导致写空文件。
+        self._dl_nam = QNetworkAccessManager(self)
 
     # ---- 入口 ----
     def start(self) -> None:
@@ -257,7 +260,7 @@ class UpdateManager(QObject):
 
         req = QNetworkRequest(QUrl(url))
         req.setTransferTimeout(120_000)
-        reply = self.nam.get(req)
+        reply = self._dl_nam.get(req)
         reply.downloadProgress.connect(self._on_progress)
         self._download_reply = reply
         reply.finished.connect(self._on_download_done)
