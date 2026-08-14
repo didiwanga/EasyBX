@@ -99,9 +99,12 @@ class MapDock(QWidget):
             from xkxclient.core import gmcp
             try:
                 import urllib.request
+                # 地图 API 公网直连，不走系统代理（与 fullme 一致，避免 DNS/代理干扰）
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}))
                 rid_from = self.cache.current or ""
                 url = f"{base}/route?from={rid_from}&to={target}"
-                with urllib.request.urlopen(url, timeout=3) as r:
+                with opener.open(url, timeout=3) as r:
                     data = json.loads(r.read().decode("utf-8", "replace"))
                 route = data.get("route") if isinstance(data, dict) else None
                 if route:

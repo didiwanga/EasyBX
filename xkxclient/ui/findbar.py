@@ -80,7 +80,7 @@ class FindBar(QWidget):
 
     def _on_text_changed(self, text: str) -> None:
         if not text:
-            self._output.clear()
+            self._output.highlight("")   # 仅清高亮与命中分屏，不清主输出
             self.count_label.setText("")
             self.pane.hide()
             return
