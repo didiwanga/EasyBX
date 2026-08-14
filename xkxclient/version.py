@@ -4,7 +4,7 @@
 Lua 绑定、自动更新）都必须从这里读取，禁止在别处硬编码版本号。
 """
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # 更新服务器：阿里云 pytools.cloud（同一文件也通过 http://47.104.0.91 提供）
 UPDATE_BASE = "http://pytools.cloud"
