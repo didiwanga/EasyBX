@@ -49,6 +49,7 @@ class MacroEngine(QObject):
         self._captcha_sub: Callable | None = None           # net.text_display 订阅
         self._captcha_timer: QTimer | None = None           # 3s 检测窗口
         self._captcha_win = None                            # 验证码窗口引用（防 GC）
+        self._call_stack: dict[str, list[int]] = {}         # 调用触发返回栈（每宏一个栈）
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -150,6 +151,7 @@ class MacroEngine(QObject):
         self._pos.clear()
         self._loop_count.clear()
         self._paused.clear()
+        self._call_stack.clear()
         self._waiting = None
         if names:
             self.bus.publish("macro.stop", account=self.session.account_id, names=names)
@@ -206,6 +208,14 @@ class MacroEngine(QObject):
             self._wait_input(name, step, pos)
         elif t == "trigger":
             self._wait_trigger(name, step, pos)
+        elif t == "call_trigger":
+            # 调用触发：仅能被 call 步骤调用进入等待；顺序执行到此直接跳过
+            if self._call_stack.get(name):
+                self._wait_call_trigger(name, step, pos)
+            else:
+                self._goto(name, pos + 1)
+        elif t == "call":
+            self._call(name, step, pos)
         elif t == "captcha":
             self._wait_captcha(name, step, pos)
         elif t == "loop":
@@ -258,6 +268,10 @@ class MacroEngine(QObject):
 
         条件集 = conditions（B3 多条件，与/或）或旧单条件格式。
         """
+        self._wait_trigger_impl(name, step, pos, pos + 1)
+
+    def _wait_trigger_impl(self, name: str, step: dict, pos: int, return_pos: int) -> None:
+        """触发器等待实现：条件命中/超时后跳转 return_pos（触发步骤=pos+1，调用触发=调用点）。"""
         from xkxclient.automation.trigger import Trigger, TEMPLATE_VAR_RE
 
         conds = step.get("conditions")
@@ -344,22 +358,47 @@ class MacroEngine(QObject):
             if not names:
                 for i, cap in enumerate(captures or [], 1):
                     self.session.vars[f"v{i:02d}"] = cap
-            self._goto(name, pos + 1)
+            self._goto(name, return_pos)
 
         self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
         if timeout_ms > 0:
             self._trigger_timer = QTimer(self)
             self._trigger_timer.setSingleShot(True)
-            self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos))
+            self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos, return_pos))
             self._trigger_timer.start(timeout_ms)
 
-    def _timeout_trigger(self, name: str, pos: int) -> None:
+    def _timeout_trigger(self, name: str, pos: int, return_pos: int | None = None) -> None:
         self._trigger_timer = None
         if self._trigger_sub is not None:
             self.bus.unsubscribe("net.text_display", self._trigger_sub)
             self._trigger_sub = None
         if name in self._active:
+            self._goto(name, return_pos if return_pos is not None else pos + 1)
+
+    def _wait_call_trigger(self, name: str, step: dict, pos: int) -> None:
+        """调用触发步骤：与触发步骤相同，但命中/超时后跳转到调用点（栈顶返回位置）。"""
+        stack = self._call_stack.get(name) or []
+        return_pos = stack.pop() if stack else pos + 1
+        self._wait_trigger_impl(name, step, pos, return_pos)
+
+    def _call(self, name: str, step: dict, pos: int) -> None:
+        """调用步骤：压入返回位置（pos+1），跳转到目标 call_trigger 标签。
+        返回时 goto 调用行之后的步骤，避免重复执行调用行造成死循环。
+        """
+        target = step.get("target") or step.get("label") or ""
+        m = self._active.get(name)
+        if not m or not target:
             self._goto(name, pos + 1)
+            return
+        if target.isdigit():
+            idx = max(0, int(target) - 1)
+        else:
+            idx = m.labels.get(target)
+        if idx is None:
+            self._goto(name, pos + 1)
+            return
+        self._call_stack.setdefault(name, []).append(pos + 1)
+        self._goto(name, idx)
 
     # ---- 验证码步骤（新）：发送命令 → 3s 检测链接 → 弹窗输入 → 变量赋值 ----
     def _wait_captcha(self, name: str, step: dict, pos: int) -> None:
@@ -461,6 +500,7 @@ class MacroEngine(QObject):
         self._pos.pop(name, None)
         self._loop_count.pop(name, None)
         self._paused.discard(name)
+        self._call_stack.pop(name, None)
         self._timers.pop(name, None)
         if self._waiting and self._waiting[0] == name:
             self._waiting = None

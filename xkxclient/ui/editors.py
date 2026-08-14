@@ -970,6 +970,12 @@ class MacroEditor(_EditorBase):
             return f"判断分支: 条件{len(conds)} 关键字{len(kws)} 延时{dm} 超时{tm}"
         if t == "loop":
             return f"计数循环: 起点{s.get('start', '')} 次数{s.get('count', 0)}"
+        if t == "call_trigger":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            return f"调用触发[{s.get('label', '')}]: {s.get('match_type', 'contains')} {pat}"
+        if t == "call":
+            return f"调用: {s.get('target', '')}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -1058,7 +1064,8 @@ class StepDialog(QDialog):
     _STEP_LABELS = [("cmd", "命令"), ("delay", "延时"), ("label", "标签"),
                     ("jump", "跳转"), ("if", "判断"), ("status", "状态"),
                     ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码"),
-                    ("branch", "判断分支"), ("loop", "计数循环")]
+                    ("branch", "判断分支"), ("loop", "计数循环"),
+                    ("call_trigger", "调用触发"), ("call", "调用")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -1187,6 +1194,22 @@ class StepDialog(QDialog):
         self.lp_count_sb.setValue(3)
         self.lp_count_sb.setToolTip("循环次数；0 = 无限循环")
 
+        # ---- 调用触发页：同触发页 + 调用标签名（仅能被 call 调用，顺序执行跳过） ----
+        self.ct_label_ed = QLineEdit()
+        self.ct_label_ed.setPlaceholderText("调用标签名（供「调用」步骤引用）")
+        self.ct_note = QLabel("仅能被「调用」步骤触发：顺序执行到此步时直接跳过。")
+        self.ct_note.setStyleSheet("color:#c08040;")
+        self.ct_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.ct_cond.setMinimumHeight(150)
+        self.ct_delay_sb = QSpinBox(); self.ct_delay_sb.setRange(0, 3600000)
+        self.ct_delay_sb.setSuffix(" ms")
+        self.ct_timeout_sb = QSpinBox(); self.ct_timeout_sb.setRange(0, 3600000)
+        self.ct_timeout_sb.setSuffix(" ms")
+
+        # ---- 调用页：目标调用触发标签下拉 ----
+        self.call_target_cb = QComboBox()
+        self.call_target_cb.setToolTip("要调用的「调用触发」步骤的标签")
+
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
 
@@ -1267,6 +1290,19 @@ class StepDialog(QDialog):
         lf.addRow("循环次数", self.lp_count_sb)
         self._pages["loop"] = p_loop
 
+        p_ct = QWidget()
+        ctf = QFormLayout(p_ct)
+        ctf.addRow("调用标签名", self.ct_label_ed)
+        ctf.addRow(self.ct_note)
+        ctf.addRow("条件列表", self.ct_cond)
+        ctf.addRow("延时", self.ct_delay_sb)
+        ctf.addRow("超时", self.ct_timeout_sb)
+        self._pages["call_trigger"] = p_ct
+
+        p_call = QWidget()
+        QFormLayout(p_call).addRow("调用触发标签", self.call_target_cb)
+        self._pages["call"] = p_call
+
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
             self.stack.addWidget(self._pages[code])
@@ -1301,6 +1337,10 @@ class StepDialog(QDialog):
             cb.clear()
             for val, lab in self._target_options():
                 cb.addItem(lab, val)
+        self.call_target_cb.clear()
+        for i, s in enumerate(self._steps, 1):
+            if s.get("type") == "call_trigger" and s.get("label"):
+                self.call_target_cb.addItem(f"调用触发 {s['label']}", s["label"])
 
     # ---- 类型切换：只显示对应页 ----
     def _sync_ui(self) -> None:
@@ -1385,6 +1425,21 @@ class StepDialog(QDialog):
         if t == "loop":
             self.lp_start_cb.setCurrentIndex(max(0, self.lp_start_cb.findData(str(s.get("start", "")))))
             self.lp_count_sb.setValue(int(s.get("count", 0)))
+
+        # 调用触发步骤：标签 + 条件列表（复用触发表单）
+        if t == "call_trigger":
+            self.ct_label_ed.setText(s.get("label", "") or "")
+            ct_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
+                                                 "pattern": s.get("pattern", "")}]
+            self.ct_cond.set_conditions(ct_conds)
+            self.ct_cond.set_relation(s.get("relation", "or"))
+            self.ct_delay_sb.setValue(int(s.get("delay_ms", 0)))
+            self.ct_timeout_sb.setValue(self._timeout_ms(s))
+
+        # 调用步骤：目标调用触发标签
+        if t == "call":
+            self.call_target_cb.setCurrentIndex(
+                max(0, self.call_target_cb.findData(s.get("target") or s.get("label") or "")))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
@@ -1599,6 +1654,17 @@ class StepDialog(QDialog):
         elif t == "loop":
             s["start"] = self.lp_start_cb.currentData() or ""
             s["count"] = self.lp_count_sb.value()
+        elif t == "call_trigger":
+            conds = list(self.ct_cond.conditions)
+            s["label"] = self.ct_label_ed.text().strip()
+            s["relation"] = self.ct_cond.relation()
+            s["conditions"] = conds
+            s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
+            s["pattern"] = conds[0].get("pattern", "") if conds else ""
+            s["delay_ms"] = self.ct_delay_sb.value()
+            s["timeout_ms"] = self.ct_timeout_sb.value()
+        elif t == "call":
+            s["target"] = self.call_target_cb.currentData() or ""
         self._step = s
         self.accept()
 
