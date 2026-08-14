@@ -893,6 +893,8 @@ class MacroEditor(_EditorBase):
         self.step_copy = QPushButton("⧉复制步骤")
         self.step_up = QPushButton("↑上移")
         self.step_dn = QPushButton("↓下移")
+        self.step_batch_delay = QPushButton("批量延时…")
+        self.step_batch_delay.setToolTip("在所有步骤之间插入指定毫秒的延时步骤")
         self.step_save.clicked.connect(self._on_step_save)
         self.step_add.clicked.connect(self._on_step_add)
         self.step_edit.clicked.connect(self._on_step_edit)
@@ -900,12 +902,14 @@ class MacroEditor(_EditorBase):
         self.step_copy.clicked.connect(self._on_step_copy)
         self.step_up.clicked.connect(self._on_step_up)
         self.step_dn.clicked.connect(self._on_step_dn)
+        self.step_batch_delay.clicked.connect(self._on_step_batch_delay)
         self.step_list.itemDoubleClicked.connect(lambda _i: self._on_step_edit())
         self.form.addRow("步骤", self.step_list)
         btn1 = QHBoxLayout(); btn1.addWidget(self.step_add)
         btn1.addWidget(self.step_edit); btn1.addWidget(self.step_del)
         btn1.addWidget(self.step_copy); btn1.addWidget(self.step_save)
         btn2 = QHBoxLayout(); btn2.addWidget(self.step_up); btn2.addWidget(self.step_dn)
+        btn2.addWidget(self.step_batch_delay)
         self.form.addRow(btn1)
         self.form.addRow(btn2)
         self._steps: list[dict] = []
@@ -940,7 +944,7 @@ class MacroEditor(_EditorBase):
             else_t = s.get("else") or {}
             tgt = then_t.get("target") if isinstance(then_t, dict) else then_t
             etg = else_t.get("target") if isinstance(else_t, dict) else else_t
-            return f"判断({n}条件·{rel}) 真→{tgt} 假→{etg}"
+            return f"判断({n}条件·{rel}) 真→{tgt} 假→{etg} 延时{s.get('delay_ms', 0)}/超时{s.get('timeout_ms', 0)}"
         if t == "status":
             attr = s.get("attr", "qi")
             op = s.get("op", "=")
@@ -976,6 +980,14 @@ class MacroEditor(_EditorBase):
             return f"调用触发[{s.get('label', '')}]: {s.get('match_type', 'contains')} {pat}"
         if t == "call":
             return f"调用: {s.get('target', '')}"
+        if t == "hit":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            return f"等待命中: {s.get('command', '')} → {pat} (重发{s.get('delay_ms', 0)}ms/超时{s.get('timeout_ms', 0)}ms)"
+        if t == "move_trigger":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            return f"移动并触发: {s.get('command', '')} → {pat}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -1000,9 +1012,15 @@ class MacroEditor(_EditorBase):
     def _on_step_add(self) -> None:
         dlg = StepDialog(self._steps, None, self)
         if dlg.exec() and dlg.result_step():
-            self._steps.append(dlg.result_step())
-            self._refresh_steps()
-            self.step_list.setCurrentRow(len(self._steps) - 1)
+            row = self.step_list.currentRow()
+            if 0 <= row < len(self._steps):
+                self._steps.insert(row + 1, dlg.result_step())
+                self._refresh_steps()
+                self.step_list.setCurrentRow(row + 1)
+            else:
+                self._steps.append(dlg.result_step())
+                self._refresh_steps()
+                self.step_list.setCurrentRow(len(self._steps) - 1)
 
     def _on_step_edit(self) -> None:
         row = self.step_list.currentRow()
@@ -1045,6 +1063,24 @@ class MacroEditor(_EditorBase):
             self._refresh_steps()
             self.step_list.setCurrentRow(row + 1)
 
+    def _on_step_batch_delay(self) -> None:
+        """批量延时：在所有步骤之间插入用户指定毫秒的延时步骤。"""
+        if len(self._steps) < 2:
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        ms, ok = QInputDialog.getInt(self, "批量延时", "在每两个步骤之间插入延时（毫秒）：",
+                                     value=500, min=0, max=86400000)
+        if not ok or ms <= 0:
+            return
+        out: list[dict] = []
+        for s in self._steps:
+            out.append(s)
+            out.append({"type": "delay", "ms": ms})
+        if out:
+            out.pop()
+        self._steps = out
+        self._refresh_steps()
+
     def _extra(self, d: dict) -> dict:
         return {"steps": [dict(s) for s in self._steps]}
 
@@ -1065,7 +1101,8 @@ class StepDialog(QDialog):
                     ("jump", "跳转"), ("if", "判断"), ("status", "状态"),
                     ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码"),
                     ("branch", "判断分支"), ("loop", "计数循环"),
-                    ("call_trigger", "调用触发"), ("call", "调用")]
+                    ("call_trigger", "调用触发"), ("call", "调用"),
+                    ("hit", "等待命中"), ("move_trigger", "移动并触发")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -1122,6 +1159,12 @@ class StepDialog(QDialog):
         for code, lab in [("none", "无动作"), ("cmd", "发送命令"), ("set", "变量赋值")]:
             self.if_else_action_type.addItem(lab, code)
         self.if_else_action_ed = QLineEdit(); self.if_else_action_ed.setPlaceholderText("命令 或 {变量}=值")
+        self.if_delay_sb = QSpinBox(); self.if_delay_sb.setRange(0, 3600000)
+        self.if_delay_sb.setSuffix(" ms")
+        self.if_delay_sb.setToolTip("条件命中后延时执行真分支")
+        self.if_timeout_sb = QSpinBox(); self.if_timeout_sb.setRange(0, 3600000)
+        self.if_timeout_sb.setSuffix(" ms")
+        self.if_timeout_sb.setToolTip("条件未命中时等待重新判断的时限；超时走假分支（0 = 永不等待）")
 
         # ---- 状态页：GMCP 状态属性比较 + 真/假分支 ----
         self.status_attr = QComboBox()
@@ -1210,6 +1253,34 @@ class StepDialog(QDialog):
         self.call_target_cb = QComboBox()
         self.call_target_cb.setToolTip("要调用的「调用触发」步骤的标签")
 
+        # ---- 等待命中页：命令 + 触发条件 + 等待延时(未命中重发) + 超时(超时终止宏) ----
+        self.hit_cmd_ed = QLineEdit()
+        self.hit_cmd_ed.setPlaceholderText("如 look（先发送的命令）")
+        self.hit_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.hit_cond.setMinimumHeight(150)
+        self.hit_delay_sb = QSpinBox(); self.hit_delay_sb.setRange(0, 3600000)
+        self.hit_delay_sb.setValue(3000); self.hit_delay_sb.setSuffix(" ms")
+        self.hit_delay_sb.setToolTip("等待命中；此期间未命中则再次发送命令并继续等待")
+        self.hit_timeout_sb = QSpinBox(); self.hit_timeout_sb.setRange(0, 3600000)
+        self.hit_timeout_sb.setSuffix(" ms")
+        self.hit_timeout_sb.setToolTip("总超时；超时即终止宏（0 = 永不超时）")
+        self.hit_note = QLabel("先发送命令，等待条件命中；未命中则周期重发命令，直到命中或超时终止宏。")
+        self.hit_note.setStyleSheet("color:#c08040;")
+
+        # ---- 移动并触发页：;分割多命令逐个发送，每个命令等待一次触发 ----
+        self.mt_cmd_ed = QLineEdit()
+        self.mt_cmd_ed.setPlaceholderText("如 north;east;west（; 分割的多个移动命令）")
+        self.mt_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.mt_cond.setMinimumHeight(150)
+        self.mt_delay_sb = QSpinBox(); self.mt_delay_sb.setRange(0, 3600000)
+        self.mt_delay_sb.setSuffix(" ms")
+        self.mt_delay_sb.setToolTip("触发命中后延时，再发送下一个命令")
+        self.mt_timeout_sb = QSpinBox(); self.mt_timeout_sb.setRange(0, 3600000)
+        self.mt_timeout_sb.setSuffix(" ms")
+        self.mt_timeout_sb.setToolTip("每个命令等待触发的超时；超时跳过当前命令继续下一个（0 = 永不超时）")
+        self.mt_note = QLabel("逐个发送移动命令，每个命令等待一次触发命中；命中后延时再发下一个；超时则跳过当前命令继续。")
+        self.mt_note.setStyleSheet("color:#c08040;")
+
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
 
@@ -1240,6 +1311,8 @@ class StepDialog(QDialog):
         ff.addRow("假 → 去向", self.if_else_target)
         else_act = QHBoxLayout(); else_act.addWidget(self.if_else_action_type); else_act.addWidget(self.if_else_action_ed, 1)
         ff.addRow("假 → 动作", else_act)
+        ff.addRow("命中后延时", self.if_delay_sb)
+        ff.addRow("等待超时", self.if_timeout_sb)
         self._pages["if"] = p_if
 
         p_status = QWidget()
@@ -1302,6 +1375,24 @@ class StepDialog(QDialog):
         p_call = QWidget()
         QFormLayout(p_call).addRow("调用触发标签", self.call_target_cb)
         self._pages["call"] = p_call
+
+        p_hit = QWidget()
+        hf = QFormLayout(p_hit)
+        hf.addRow(self.hit_note)
+        hf.addRow("发送命令", self.hit_cmd_ed)
+        hf.addRow("触发条件", self.hit_cond)
+        hf.addRow("等待延时", self.hit_delay_sb)
+        hf.addRow("超时终止", self.hit_timeout_sb)
+        self._pages["hit"] = p_hit
+
+        p_mt = QWidget()
+        mf = QFormLayout(p_mt)
+        mf.addRow(self.mt_note)
+        mf.addRow("移动命令", self.mt_cmd_ed)
+        mf.addRow("触发条件", self.mt_cond)
+        mf.addRow("命中后延时", self.mt_delay_sb)
+        mf.addRow("等待超时", self.mt_timeout_sb)
+        self._pages["move_trigger"] = p_mt
 
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
@@ -1382,6 +1473,8 @@ class StepDialog(QDialog):
         ea = else_.get("action") if isinstance(else_, dict) else {}
         self._load_action(self.if_then_action_type, self.if_then_action_ed, ta)
         self._load_action(self.if_else_action_type, self.if_else_action_ed, ea)
+        self.if_delay_sb.setValue(int(s.get("delay_ms", 0)))
+        self.if_timeout_sb.setValue(self._timeout_ms(s))
 
         # 状态步骤：属性 + 运算符 + 比较值 + 真/假分支
         if t == "status":
@@ -1440,6 +1533,26 @@ class StepDialog(QDialog):
         if t == "call":
             self.call_target_cb.setCurrentIndex(
                 max(0, self.call_target_cb.findData(s.get("target") or s.get("label") or "")))
+
+        # 等待命中步骤
+        if t == "hit":
+            self.hit_cmd_ed.setText(s.get("command", ""))
+            hit_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
+                                                 "pattern": s.get("pattern", "")}]
+            self.hit_cond.set_conditions(hit_conds)
+            self.hit_cond.set_relation(s.get("relation", "or"))
+            self.hit_delay_sb.setValue(int(s.get("delay_ms", 0)))
+            self.hit_timeout_sb.setValue(self._timeout_ms(s))
+
+        # 移动并触发步骤
+        if t == "move_trigger":
+            self.mt_cmd_ed.setText(s.get("command", ""))
+            mt_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
+                                                "pattern": s.get("pattern", "")}]
+            self.mt_cond.set_conditions(mt_conds)
+            self.mt_cond.set_relation(s.get("relation", "or"))
+            self.mt_delay_sb.setValue(int(s.get("delay_ms", 0)))
+            self.mt_timeout_sb.setValue(self._timeout_ms(s))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
@@ -1615,6 +1728,8 @@ class StepDialog(QDialog):
             s["else"] = {"target": else_target}
             if else_act:
                 s["else"]["action"] = else_act
+            s["delay_ms"] = self.if_delay_sb.value()
+            s["timeout_ms"] = self.if_timeout_sb.value()
         elif t == "status":
             s["attr"] = self.status_attr.currentData() or "qi"
             s["op"] = self.status_op.currentData() or "="
@@ -1665,6 +1780,24 @@ class StepDialog(QDialog):
             s["timeout_ms"] = self.ct_timeout_sb.value()
         elif t == "call":
             s["target"] = self.call_target_cb.currentData() or ""
+        elif t == "hit":
+            conds = list(self.hit_cond.conditions)
+            s["command"] = self.hit_cmd_ed.text().strip()
+            s["relation"] = self.hit_cond.relation()
+            s["conditions"] = conds
+            s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
+            s["pattern"] = conds[0].get("pattern", "") if conds else ""
+            s["delay_ms"] = self.hit_delay_sb.value()
+            s["timeout_ms"] = self.hit_timeout_sb.value()
+        elif t == "move_trigger":
+            conds = list(self.mt_cond.conditions)
+            s["command"] = self.mt_cmd_ed.text().strip()
+            s["relation"] = self.mt_cond.relation()
+            s["conditions"] = conds
+            s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
+            s["pattern"] = conds[0].get("pattern", "") if conds else ""
+            s["delay_ms"] = self.mt_delay_sb.value()
+            s["timeout_ms"] = self.mt_timeout_sb.value()
         self._step = s
         self.accept()
 

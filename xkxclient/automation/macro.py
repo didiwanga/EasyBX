@@ -216,6 +216,10 @@ class MacroEngine(QObject):
                 self._goto(name, pos + 1)
         elif t == "call":
             self._call(name, step, pos)
+        elif t == "hit":
+            self._hit(name, step, pos)
+        elif t == "move_trigger":
+            self._move_trigger(name, step, pos)
         elif t == "captcha":
             self._wait_captcha(name, step, pos)
         elif t == "loop":
@@ -400,6 +404,233 @@ class MacroEngine(QObject):
         self._call_stack.setdefault(name, []).append(pos + 1)
         self._goto(name, idx)
 
+    def _hit(self, name: str, step: dict, pos: int) -> None:
+        """等待命中步骤：先发送命令，等待触发条件命中。
+
+        - 等待 delay_ms 内未命中 → 再次发送命令并继续等待（周期重发）
+        - 条件命中 → 继续下一步
+        - timeout_ms 超时（>0）→ 终止当前宏（默认 0 = 永不超时）
+        """
+        from xkxclient.automation.trigger import Trigger
+
+        cmd = step.get("command", "")
+        delay_ms = int(step.get("delay_ms") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+        conds = step.get("conditions")
+        if conds:
+            conds = [dict(c) for c in conds]
+            relation = step.get("relation", "or")
+        else:
+            cond = step.get("condition") or {}
+            conds = [{"match_type": step.get("match_type") or cond.get("type") or "contains",
+                      "pattern": step.get("pattern") or cond.get("pattern") or ""}]
+            relation = "or"
+
+        def eval_line(line: str) -> bool:
+            if relation == "and":
+                for c in conds:
+                    if not self._hit_match(c, line):
+                        return False
+                return True
+            return any(self._hit_match(c, line) for c in conds)
+
+        def send_cmd() -> None:
+            if cmd:
+                for piece in split_commands(substitute(cmd, self.session.vars)):
+                    self.session.send_auto(piece)
+
+        self.bus.publish("macro.state", account=self.session.account_id,
+                         state="waiting_trigger", name=name)
+        send_cmd()
+
+        done = [False]
+
+        def finish(ok: bool) -> None:
+            if done[0]:
+                return
+            done[0] = True
+            if self._trigger_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
+            tm = self._timers.pop(name, None)
+            if tm is not None:
+                tm.stop()
+            if name in self._active:
+                if ok:
+                    self._goto(name, pos + 1)
+                else:
+                    self._halt(name)
+
+        def on_line(payload: dict) -> None:
+            if done[0]:
+                return
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            if eval_line(payload.get("line") or ""):
+                finish(True)
+
+        self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+        if timeout_ms > 0:
+            self._trigger_timer = QTimer(self)
+            self._trigger_timer.setSingleShot(True)
+            self._trigger_timer.timeout.connect(lambda: finish(False))
+            self._trigger_timer.start(timeout_ms)
+
+        # 周期重发：每 delay_ms 未命中则重发命令
+        if delay_ms > 0:
+            from PyQt6.QtCore import QTimer as _QT
+            tm = _QT(self)
+            tm.setSingleShot(False)
+            tm.timeout.connect(lambda: (send_cmd() if not done[0] else None))
+            tm.start(delay_ms)
+            self._timers[name] = tm
+
+    def _hit_match(self, c: dict, line: str) -> bool:
+        from xkxclient.automation.trigger import Trigger
+        mtx = c.get("match_type", "contains")
+        if mtx == "status":
+            return self._match_status_cond(c)
+        trg = Trigger("_c", match_type=mtx, pattern=c.get("pattern", ""))
+        if mtx == "contains":
+            return trg.pattern in line
+        if mtx == "exact":
+            return line == trg.pattern
+        if mtx == "regex":
+            try:
+                return re.search(trg.pattern, line) is not None
+            except re.error:
+                return False
+        if mtx == "template":
+            rx = trg.template_regex
+            if rx is None:
+                return trg.pattern in line
+            return rx.search(line) is not None
+        return False
+
+    def _move_trigger(self, name: str, step: dict, pos: int) -> None:
+        """移动并触发步骤：`;` 分割的多个命令逐个发送，每个命令等待一次触发条件命中。
+
+        - 发送当前命令 → 等待触发条件
+        - 命中 → 延时 delay_ms 后发送下一个命令
+        - 当前命令超时（timeout_ms，>0）未命中 → 跳过等待，直接发送下一个命令
+        - 全部命令发送完 → 继续下一步
+        """
+        from xkxclient.automation.trigger import Trigger
+
+        cmd = step.get("command", "")
+        cmds = split_commands(substitute(cmd, self.session.vars))
+        if not cmds:
+            self._goto(name, pos + 1)
+            return
+        delay_ms = int(step.get("delay_ms") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+        conds = step.get("conditions")
+        if conds:
+            conds = [dict(c) for c in conds]
+            relation = step.get("relation", "or")
+        else:
+            cond = step.get("condition") or {}
+            conds = [{"match_type": step.get("match_type") or cond.get("type") or "contains",
+                      "pattern": step.get("pattern") or cond.get("pattern") or ""}]
+            relation = "or"
+
+        def eval_line(line: str) -> bool:
+            if relation == "and":
+                return all(self._hit_match(c, line) for c in conds)
+            return any(self._hit_match(c, line) for c in conds)
+
+        done = [False]
+
+        def cleanup() -> None:
+            if self._trigger_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
+            tm = self._timers.pop(name, None)
+            if tm is not None:
+                tm.stop()
+
+        def send(idx: int) -> None:
+            if done[0] or idx >= len(cmds):
+                return
+            self.session.send_auto(cmds[idx])
+            wait(idx)
+
+        def wait(idx: int) -> None:
+            if done[0]:
+                return
+            self.bus.publish("macro.state", account=self.session.account_id,
+                             state="waiting_trigger", name=name)
+            waited = [False]
+
+            def on_line(payload: dict) -> None:
+                if done[0] or waited[0]:
+                    return
+                if name not in self._active or name in self._paused:
+                    return
+                if (payload.get("account") or "") != self.session.account_id:
+                    return
+                if eval_line(payload.get("line") or ""):
+                    waited[0] = True
+                    if self._trigger_sub is not None:
+                        self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                        self._trigger_sub = None
+                    if self._trigger_timer is not None:
+                        self._trigger_timer.stop()
+                        self._trigger_timer = None
+                    if delay_ms > 0:
+                        tm = QTimer(self)
+                        tm.setSingleShot(True)
+                        tm.timeout.connect(lambda: next_or_finish(idx + 1))
+                        tm.start(delay_ms)
+                        self._timers[name] = tm
+                    else:
+                        next_or_finish(idx + 1)
+
+            def on_timeout() -> None:
+                if done[0] or waited[0]:
+                    return
+                waited[0] = True
+                if self._trigger_sub is not None:
+                    self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                    self._trigger_sub = None
+                if self._trigger_timer is not None:
+                    self._trigger_timer.stop()
+                    self._trigger_timer = None
+                next_or_finish(idx + 1)
+
+            self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+            if timeout_ms > 0:
+                self._trigger_timer = QTimer(self)
+                self._trigger_timer.setSingleShot(True)
+                self._trigger_timer.timeout.connect(on_timeout)
+                self._trigger_timer.start(timeout_ms)
+
+        def finish() -> None:
+            if done[0]:
+                return
+            done[0] = True
+            cleanup()
+            if name in self._active:
+                self._goto(name, pos + 1)
+
+        def next_or_finish(idx: int) -> None:
+            if idx >= len(cmds):
+                finish()
+            else:
+                send(idx)
+
+        self.bus.publish("macro.state", account=self.session.account_id,
+                         state="waiting_trigger", name=name)
+        send(0)
+
     # ---- 验证码步骤（新）：发送命令 → 3s 检测链接 → 弹窗输入 → 变量赋值 ----
     def _wait_captcha(self, name: str, step: dict, pos: int) -> None:
         """验证码步骤：先发送用户设置的命令，然后在 timeout 毫秒内监听 fullme 链接。
@@ -502,6 +733,12 @@ class MacroEngine(QObject):
         self._paused.discard(name)
         self._call_stack.pop(name, None)
         self._timers.pop(name, None)
+        if self._trigger_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._trigger_sub)
+            self._trigger_sub = None
+        if self._trigger_timer is not None:
+            self._trigger_timer.stop()
+            self._trigger_timer = None
         if self._waiting and self._waiting[0] == name:
             self._waiting = None
         if self._captcha_wait and self._captcha_wait[0] == name:
@@ -607,8 +844,79 @@ class MacroEngine(QObject):
                 ok = any(self._match(c) for c in conds)
         else:
             ok = self._match(step.get("condition", {}))
-        branch = step.get("then") if ok else (step.get("else") if step.get("else") is not None else None)
-        self._goto_branch(name, pos, branch)
+        delay_ms = int(step.get("delay_ms") or 0)
+        timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+        branch_t = step.get("then")
+        branch_f = step.get("else") if step.get("else") is not None else None
+        if ok:
+            if delay_ms > 0:
+                self._branch_later(name, pos, branch_t, delay_ms)
+            else:
+                self._goto_branch(name, pos, branch_t)
+        elif timeout_ms > 0:
+            self._if_wait(name, step, pos, branch_t, branch_f, timeout_ms)
+        else:
+            self._goto_branch(name, pos, branch_f)
+
+    def _if_wait(self, name: str, step: dict, pos: int, branch_t, branch_f, timeout_ms: int) -> None:
+        """判断未命中且配置了超时：订阅新行/新状态，时限内重新评估；命中走真分支，超时走假分支。"""
+        conds = step.get("conditions")
+        if conds:
+            relation = step.get("relation", "or")
+        else:
+            conds = [step.get("condition", {})]
+            relation = "or"
+        done = [False]
+
+        def eval_again() -> bool:
+            if relation == "and":
+                return all(self._match(c) for c in conds)
+            return any(self._match(c) for c in conds)
+
+        def finish(ok: bool) -> None:
+            if done[0]:
+                return
+            done[0] = True
+            if self._trigger_sub is not None:
+                self.bus.unsubscribe("net.text_display", self._trigger_sub)
+                self._trigger_sub = None
+            if self._trigger_timer is not None:
+                self._trigger_timer.stop()
+                self._trigger_timer = None
+            if name not in self._active:
+                return
+            if ok:
+                self._goto_branch(name, pos, branch_t)
+            else:
+                self._goto_branch(name, pos, branch_f)
+
+        def on_line(payload: dict) -> None:
+            if done[0]:
+                return
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            if eval_again():
+                finish(True)
+
+        self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
+        self._trigger_timer = QTimer(self)
+        self._trigger_timer.setSingleShot(True)
+        self._trigger_timer.timeout.connect(lambda: finish(False))
+        self._trigger_timer.start(timeout_ms)
+
+    def _branch_later(self, name: str, pos: int, branch, ms: int) -> None:
+        """延时后执行判断/状态分支（含动作 + 去向）。"""
+        tm = QTimer(self)
+        tm.setSingleShot(True)
+
+        def go():
+            if name in self._active:
+                self._goto_branch(name, pos, branch)
+        tm.timeout.connect(go)
+        tm.start(ms)
+        self._timers[name] = tm
 
     def _goto_branch(self, name: str, pos: int, branch) -> None:
         """执行判断/状态分支：可选动作（cmd/set）+ 去向（标签/序号），缺省继续下一行。"""
