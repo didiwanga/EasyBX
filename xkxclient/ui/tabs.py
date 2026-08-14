@@ -270,6 +270,7 @@ class AccountTab(QWidget):
         self.output.command_send_requested.connect(self._send_command)
         self.output.look_send_requested.connect(self._look_selection)
         self.output.ask_fill_requested.connect(self._ask_fill)
+        self.output.notepad_add_requested.connect(self._notepad_add)
         self.output.autopage_hit.connect(self._on_autopage)
         self.output.clicked_blank.connect(self._refocus_input)
         self._sync_channels()
@@ -351,6 +352,12 @@ class AccountTab(QWidget):
         self.input_line.setCursorPosition(len(f"ask {text} about "))
         self.input_line._tab_cands = []
         self.input_line.setFocus()
+
+    def _notepad_add(self, frag) -> None:
+        """右键「添加到记事本」：把富文本片段发布到总线，记事本面板追加。"""
+        if frag is None:
+            return
+        self.session.app.bus.publish("notepad.add", account=self.account_id, fragment=frag)
 
     def _on_autopage(self, _pages: int) -> None:
         # 自动翻页：发空命令继续分页（B5-3）

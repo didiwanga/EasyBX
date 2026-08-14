@@ -19,6 +19,7 @@ from xkxclient.ui.dslmanual import DslManualPanel
 from xkxclient.ui.lookdock import LookDock
 from xkxclient.ui.mapdock import MapDock
 from xkxclient.ui.navdock import NavDock
+from xkxclient.ui.notepaddock import NotepadDock
 from xkxclient.ui.settings import CloseBehaviorDialog, EnvSettingsDialog, ShortcutDialog
 from xkxclient.ui.skillsdock import SkillsDock
 from xkxclient.ui.statusdock import StateDock
@@ -82,6 +83,7 @@ class MainWindow(QMainWindow):
         self.map_dock = self._make_dock("地图", MapDock(None))
         self.nav_dock = self._make_dock("导航目的地", NavDock(None))
         self.look_dock = self._make_dock("房间详情", LookDock(None))
+        self.notepad_dock = self._make_dock("记事本", NotepadDock(None))
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.skills_dock)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.state_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.commands_dock)
@@ -95,6 +97,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.map_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.nav_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.look_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.notepad_dock)
 
         self._cur_tab: AccountTab | None = None
         self._docks_restored = False
@@ -176,6 +179,7 @@ class MainWindow(QMainWindow):
         vm.addAction("地图", self._toggle_dock(self.map_dock))
         vm.addAction("导航目的地", self._toggle_dock(self.nav_dock))
         vm.addAction("房间详情", self._toggle_dock(self.look_dock))
+        vm.addAction("记事本", self._toggle_dock(self.notepad_dock))
         vm.addSeparator()
         tm_themes = vm.addMenu("🎨 主题")
         self._theme_actions: dict[str, QAction] = {}
@@ -299,6 +303,7 @@ class MainWindow(QMainWindow):
         self.map_dock.widget().bind(session)
         self.nav_dock.widget().bind(session)
         self.look_dock.widget().bind(session)
+        self.notepad_dock.widget().bind(session)
         self.skills_dock_widget().bind(session)
         self._subscribe_nav(session)
         tab._sync_channels()

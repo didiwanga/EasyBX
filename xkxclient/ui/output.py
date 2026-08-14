@@ -4,7 +4,7 @@ import re
 from collections import deque
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QKeyEvent, QTextBlockFormat, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QKeyEvent, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocumentFragment
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -46,6 +46,7 @@ class OutputView(QPlainTextEdit):
     command_send_requested = pyqtSignal(str)   # 右键：发送命令（填入并执行）
     look_send_requested = pyqtSignal(str)      # 右键：直接发送 look + 选中文本
     ask_fill_requested = pyqtSignal(str)       # 右键：填入 ask + 选中文本 + about
+    notepad_add_requested = pyqtSignal(object) # 右键：添加到记事本（QTextDocumentFragment）
     autopage_hit = pyqtSignal(int)
     search_hits_updated = pyqtSignal(list)   # B5：当前命中行列表 [(行号1基, 全文)]，供分屏显示
     clicked_blank = pyqtSignal()             # 点击输出区空白 → 焦点还给命令输入框
@@ -368,6 +369,7 @@ class OutputView(QPlainTextEdit):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         menu.addAction("复制", self.copy)
+        menu.addAction("添加到记事本", self._notepad_add)
         menu.addSeparator()
         raw = self.textCursor().selectedText()
         sel = re.sub(r"[\u2029\u2028\n\r\t]+", " ", raw).strip()
@@ -386,6 +388,13 @@ class OutputView(QPlainTextEdit):
 
     def copy_text_selected(self) -> None:
         self.copy()
+
+    def _notepad_add(self) -> None:
+        """右键「添加到记事本」：把选中文本（保留富文本格式）发出给记事本面板。"""
+        cur = self.textCursor()
+        if cur.hasSelection():
+            frag = QTextDocumentFragment(cur)
+            self.notepad_add_requested.emit(frag)
 
     def _open_font_dialog(self) -> None:
         dlg = FontDialog(self)
