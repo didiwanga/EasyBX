@@ -9,11 +9,11 @@ from xkxclient.automation.runner import split_commands, substitute
 from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
 
-# 移动失败特征行（服务器拦截/防挂机输出）：命中视为该步移动异常
-_MOVE_FAIL_PATTERNS = ("不能移动",)
-# 拦路特征（泼皮等 NPC 瞬时拦截）：移动通常仍会成功（GMCP.Move result=true 会推），
-# 立即判定失败并反向回退反而造成走位错乱。命中后延迟确认，等待 GMCP 结果或超时。
-_MOVE_BLOCK_PATTERNS = ("拦住你", "拉住")
+# 移动异常特征行（服务器拦截/防挂机输出）：命中只作提示，不立即判定失败。
+# 泼皮等 NPC 瞬时拦路 / busy（不能移动）时移动通常仍会成功（GMCP.Move result=true 会推），
+# 立即判定失败并反向回退反而造成走位错乱。命中后延迟确认，等待 GMCP 结果或超时；
+# 只有 GMCP.Move result=false（撞墙/真失败）才触发失败回退。
+_MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动")
 
 # 方向取反（完整方向 + 常用短名）
 _REV_DIRS = dict(_MAP_OPPOSITE)
@@ -576,9 +576,10 @@ class MacroEngine(QObject):
         - `()` 括起的命令（单个或 `;` 分隔的组）只按延时顺序执行，不走触发/超时
         - 移动日志：每次方向移动记录 `(方向, 出发房间, 到达房间)` 到 `_move_log[name]`，
           到达房间由 GMCP.Move 确认回写
-        - 移动异常回退（auto_retry 默认开）：文本命中 `不能移动/拦住你/拉住` 或
-          GMCP.Move result=false 判定该步失败 → 发反向命令回到最近已确认房间 →
-          确认后重发该命令；同一命令连续失败 retry_max（默认 3）次后跳过继续
+        - 移动异常回退（auto_retry 默认开）：文本命中 `拦住你/拉住/不能移动` 时延迟
+          等待 GMCP.Move 确认（true=移动成功继续，false=失败）；只有 GMCP.Move
+          result=false 判定该步失败 → 原地延时重发该命令（不反向回退，避免在当前房间
+          发送不存在的出口触发「什么？」）；同一命令连续失败 retry_max（默认 3）次后跳过继续
         - 全部命令发送完 → 继续下一步
         """
         from xkxclient.automation.trigger import Trigger
@@ -708,14 +709,9 @@ class MacroEngine(QObject):
                 if (payload.get("account") or "") != self.session.account_id:
                     return
                 line = payload.get("line") or ""
-                # 移动异常特征行优先判定（如 泼皮拦截/不能移动）
-                if any(p in line for p in _MOVE_FAIL_PATTERNS):
-                    waited[0] = True
-                    unsubscribe()
-                    move_failed(idx)
-                    return
-                if any(p in line for p in _MOVE_BLOCK_PATTERNS) and not block_pending[0]:
-                    # 泼皮等 NPC 瞬时拦路：移动通常仍会成功，等待 GMCP.Move 确认，
+                # 移动异常特征行只作提示：延迟等待 GMCP.Move 确认（true=成功/false=失败）
+                if any(p in line for p in _MOVE_ABNORMAL_PATTERNS) and not block_pending[0]:
+                    # 泼皮等 NPC 瞬时拦路/busy：移动通常仍会成功，等待 GMCP.Move 确认，
                     # 若一段时间内 GMCP 未推 true/false 则超时后按失败重试。
                     block_pending[0] = True
                     if wait_timer[0] is not None:
@@ -800,7 +796,12 @@ class MacroEngine(QObject):
                 wait_timer[0].start(timeout_ms)
 
         def move_failed(idx: int) -> None:
-            """移动失败：回退到最近已确认房间后重发；超过重试上限则跳过当前命令。"""
+            """移动失败：原地延时重发原命令，等待触发/GMCP 确认；超过重试上限则跳过。
+
+            不做反向回退：泼皮拦路/busy 导致移动失败时角色原地未动，反向命令在当前
+            房间往往不存在（会触发服务器「什么？」造成走位错乱）。失败后重试原命令，
+            待 busy 结束/触发命中即成功；同一命令连续失败 retry_max 次后跳过继续。
+            """
             if done[0]:
                 return
             if not auto_retry:
@@ -811,62 +812,12 @@ class MacroEngine(QObject):
             if n > retry_max:
                 next_or_finish(idx + 1)
                 return
-            c, _skip = cmds[idx]
-            rev = _REV_DIRS.get(c.strip().lower())
-            if not rev:
-                # 非方向命令：无法回退，延时后直接重发
-                tm = QTimer(self)
-                tm.setSingleShot(True)
-                tm.timeout.connect(lambda: send(idx))
-                tm.start(max(300, delay_ms))
-                self._timers[name] = tm
-                return
-            # 发送反向命令回退，等待 GMCP.Move 确认回到房间后重发
-            self.session.send_auto(rev)
-            bk_confirmed = [False]
-
-            def on_gmcp_back(payload: dict) -> None:
-                if done[0] or bk_confirmed[0]:
-                    return
-                if name not in self._active:
-                    return
-                if (payload.get("account") or "") != self.session.account_id:
-                    return
-                data = gmcp_move_data(payload)
-                if gmcp_move_ok(data):
-                    bk_confirmed[0] = True
-                    if bk_timer[0] is not None:
-                        bk_timer[0].stop()
-                        bk_timer[0] = None
-                    if gmcp_sub[0] is not None:
-                        self.bus.unsubscribe("GMCP.Move", gmcp_sub[0])
-                        gmcp_sub[0] = None
-                    tm = QTimer(self)
-                    tm.setSingleShot(True)
-                    tm.timeout.connect(lambda: send(idx))
-                    tm.start(max(200, delay_ms))
-                    self._timers[name] = tm
-
-            def on_bk_timeout() -> None:
-                # 回退确认超时（GMCP 未回推）：直接重发
-                bk_timer[0] = None
-                if done[0] or bk_confirmed[0]:
-                    return
-                bk_confirmed[0] = True
-                if gmcp_sub[0] is not None:
-                    self.bus.unsubscribe("GMCP.Move", gmcp_sub[0])
-                    gmcp_sub[0] = None
-                tm = QTimer(self)
-                tm.setSingleShot(True)
-                tm.timeout.connect(lambda: send(idx))
-                tm.start(max(300, delay_ms))
-                self._timers[name] = tm
-
-            gmcp_sub[0] = self.bus.subscribe("GMCP.Move", on_gmcp_back)
-            bk_timer[0] = QTimer(self)
-            bk_timer[0].setSingleShot(True)
-            bk_timer[0].timeout.connect(on_bk_timeout)
-            bk_timer[0].start(1500)
+            # 原地延时重发原命令（走完整 wait：订阅触发 + GMCP）
+            tm = QTimer(self)
+            tm.setSingleShot(True)
+            tm.timeout.connect(lambda: send(idx))
+            tm.start(max(800, delay_ms))
+            self._timers[name] = tm
 
         def finish() -> None:
             if done[0]:
