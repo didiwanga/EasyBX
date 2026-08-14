@@ -9,6 +9,39 @@ from xkxclient.automation.runner import split_commands, substitute
 from xkxclient.core.fullme import extract_fullme_url
 
 
+def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
+    """解析移动并触发命令串为 [(命令, 括号标记)]。
+
+    `;` 分割多个命令；`(...)` 括起的内容（可含 `;`）整体解析，
+    内部每个命令标记为括号命令（只按延时执行，不走触发/超时）。
+    例：`north;(east;south);west` → [("north",False),("east",True),("south",True),("west",False)]
+    """
+    out: list[tuple[str, bool]] = []
+    buf = ""
+    in_paren = False
+    paren_flag = False
+    for ch in text:
+        if ch == "(":
+            in_paren = True
+            continue
+        if ch == ")":
+            in_paren = False
+            continue
+        if ch == ";":
+            c = buf.strip()
+            if c:
+                out.append((c, paren_flag))
+            buf = ""
+            paren_flag = False
+        else:
+            if not buf:
+                paren_flag = in_paren
+            buf += ch
+    if buf.strip():
+        out.append((buf.strip(), paren_flag))
+    return out
+
+
 class Macro:
     def __init__(self, name: str, enabled: bool = True, shared: bool = False, steps: list | None = None,
                  group: str = "") -> None:
@@ -518,12 +551,13 @@ class MacroEngine(QObject):
         - 发送当前命令 → 等待触发条件
         - 命中 → 延时 delay_ms 后发送下一个命令
         - 当前命令超时（timeout_ms，>0）未命中 → 跳过等待，直接发送下一个命令
+        - `()` 括起的命令（单个或 `;` 分隔的组）只按延时顺序执行，不走触发/超时
         - 全部命令发送完 → 继续下一步
         """
         from xkxclient.automation.trigger import Trigger
 
         cmd = step.get("command", "")
-        cmds = split_commands(substitute(cmd, self.session.vars))
+        cmds = _parse_move_cmds(substitute(cmd, self.session.vars))
         if not cmds:
             self._goto(name, pos + 1)
             return
@@ -560,8 +594,20 @@ class MacroEngine(QObject):
         def send(idx: int) -> None:
             if done[0] or idx >= len(cmds):
                 return
-            self.session.send_auto(cmds[idx])
-            wait(idx)
+            c, skip = cmds[idx]
+            self.session.send_auto(c)
+            if skip:
+                # 括号命令：只按延时执行，不走触发/超时
+                if delay_ms > 0:
+                    tm = QTimer(self)
+                    tm.setSingleShot(True)
+                    tm.timeout.connect(lambda: next_or_finish(idx + 1))
+                    tm.start(delay_ms)
+                    self._timers[name] = tm
+                else:
+                    next_or_finish(idx + 1)
+            else:
+                wait(idx)
 
         def wait(idx: int) -> None:
             if done[0]:
