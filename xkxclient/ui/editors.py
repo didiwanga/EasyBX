@@ -890,19 +890,21 @@ class MacroEditor(_EditorBase):
         self.step_add = QPushButton("＋步骤")
         self.step_edit = QPushButton("编辑")
         self.step_del = QPushButton("－删除")
+        self.step_copy = QPushButton("⧉复制步骤")
         self.step_up = QPushButton("↑上移")
         self.step_dn = QPushButton("↓下移")
         self.step_save.clicked.connect(self._on_step_save)
         self.step_add.clicked.connect(self._on_step_add)
         self.step_edit.clicked.connect(self._on_step_edit)
         self.step_del.clicked.connect(self._on_step_del)
+        self.step_copy.clicked.connect(self._on_step_copy)
         self.step_up.clicked.connect(self._on_step_up)
         self.step_dn.clicked.connect(self._on_step_dn)
         self.step_list.itemDoubleClicked.connect(lambda _i: self._on_step_edit())
         self.form.addRow("步骤", self.step_list)
         btn1 = QHBoxLayout(); btn1.addWidget(self.step_add)
         btn1.addWidget(self.step_edit); btn1.addWidget(self.step_del)
-        btn1.addWidget(self.step_save)
+        btn1.addWidget(self.step_copy); btn1.addWidget(self.step_save)
         btn2 = QHBoxLayout(); btn2.addWidget(self.step_up); btn2.addWidget(self.step_dn)
         self.form.addRow(btn1)
         self.form.addRow(btn2)
@@ -1011,6 +1013,17 @@ class MacroEditor(_EditorBase):
         if row >= 0:
             self._steps.pop(row)
             self._refresh_steps()
+
+    def _on_step_copy(self) -> None:
+        """复制当前选中的步骤到最后一步（深拷贝，避免与原步骤共享 dict）。"""
+        row = self.step_list.currentRow()
+        if row < 0 or row >= len(self._steps):
+            return
+        import copy
+
+        self._steps.append(copy.deepcopy(self._steps[row]))
+        self._refresh_steps()
+        self.step_list.setCurrentRow(len(self._steps) - 1)
 
     def _on_step_up(self) -> None:
         row = self.step_list.currentRow()
