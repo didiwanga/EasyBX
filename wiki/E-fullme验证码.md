@@ -44,7 +44,8 @@ source = 'manual'   # 用户发了 fullme/手动 look 触发
 - 宏验证码窗口（CaptchaWindow）**不启用**该模式：提交即把验证码回传回调（宏赋值变量）并关窗。
 
 ## 五、红包口令窗口（HongbaoWindow）
-- **检测**：服务器消息含 `robot.php?filename=<口令>`（形如「在线发出红包，请到 http://fullme.pkuxkx.net/robot.php?filename=xxx 查询口令。抢红包命令 hongbao <口令>」）。
+- **检测**：服务器消息含 `robot.php?filename=<口令>` **且含红包语义词**（`红包`/`hongbao`/`抢红包`），形如「在线发出红包，请到 http://fullme.pkuxkx.net/robot.php?filename=xxx 查询口令。抢红包命令 hongbao <口令>」。
+- **与 fullme 区分**：fullme 链接也可能走 `robot.php?filename=`，故红包判定须同时命中 URL 与红包语义词；无红包词的链接一律按 fullme 处理。
 - **弹窗**：同一消息内红包链接优先识别，发布 `hongbao.detected`（account, url），弹出红包口令窗口；该链接不再当作 fullme 处理。
 - **交互**：图片加载同 fullme（NoProxy + 10s 超时 + 重试 2 次）；底部输入框只填口令，回车即发送 `hongbao <口令>` 并关窗（不启用等待回话模式）。
 - **入口**：`core/fullme.py::extract_hongbao_url` → `session._maybe_fullme` → `mainwindow._on_hongbao` → `ui/fullme.py::HongbaoWindow`。

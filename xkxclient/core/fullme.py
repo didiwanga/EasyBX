@@ -29,3 +29,13 @@ _HONGBAO_RE = re.compile(
 def extract_hongbao_url(text: str) -> str | None:
     m = _HONGBAO_RE.search(text)
     return m.group(0) if m else None
+
+
+# 红包语义词：消息里出现即视为抢红包提示（fullme 链接同样可能含 robot.php?filename=，
+# 但 fullme 消息不含这些词，可据此区分）。
+_HONGBAO_WORDS = ("红包", "hongbao", "抢红包")
+
+
+def is_hongbao_text(text: str) -> bool:
+    low = text.lower()
+    return any(w in low for w in _HONGBAO_WORDS)

@@ -637,11 +637,12 @@ class AccountSession(QObject):
         # 宏验证码步骤期间：fullme 链接由宏引擎消费，避免再弹普通 fullme 窗
         if getattr(self, "_macro_captcha_active", False):
             return
-        # 红包口令链接（robot.php?filename=…）：优先识别，弹红包验证码窗（发 hongbao 口令）
-        from xkxclient.core.fullme import extract_hongbao_url
+        # 红包口令链接（robot.php?filename=…）：优先识别，弹红包验证码窗（发 hongbao 口令）。
+        # 必须同时含红包语义词（红包/hongbao），避免 fullme 链接（同样走 robot.php?filename=）被误判。
+        from xkxclient.core.fullme import extract_hongbao_url, is_hongbao_text
 
         hb_url = extract_hongbao_url(text)
-        if hb_url:
+        if hb_url and is_hongbao_text(text):
             self.app.bus.publish("hongbao.detected", account=self.account_id, url=hb_url)
             return
         url = extract_fullme_url(text)
