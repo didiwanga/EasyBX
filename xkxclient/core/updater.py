@@ -73,6 +73,35 @@ def _wait_target_free(target: Path, timeout: float = _WAIT_TIMEOUT,
     return False
 
 
+_LOG_PATH = Path(tempfile.gettempdir()) / UPDATE_DIR_NAME / "updater.log"
+
+
+def _log(message: str) -> None:
+    """追加一行更新器日志，便于诊断更新失败。"""
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _terminate_target_owners(target: Path) -> None:
+    """强制结束占用目标 exe 的旧客户端进程（taskkill /F /IM <basename>.exe）。
+
+    更新器进程自身位于临时目录（EasyBXb_new.exe），进程名与目标不同，
+    不会被误杀。多开场景下会一并结束所有旧实例（更新本就要求全部退出）。
+    """
+    exe_name = target.name
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", exe_name],
+                       capture_output=True, timeout=15)
+    except OSError:
+        pass
+    except subprocess.SubprocessError:
+        pass
+
+
 def run_updater(new_exe: str, target: str, wait_timeout: float = _WAIT_TIMEOUT) -> int:
     """更新器核心：等待旧进程退出 → 备份并替换 → 启动新版 → 清理。返回退出码。
 
@@ -84,11 +113,16 @@ def run_updater(new_exe: str, target: str, wait_timeout: float = _WAIT_TIMEOUT) 
     target_path = Path(target)
     bak_path = target_path.with_suffix(target_path.suffix + ".bak")
 
+    _log(f"updater start new={new_path.name} target={target_path}")
     if not new_path.exists():
+        _log("abort: new exe missing")
         return 3
 
+    # 复制前直接强制结束占用目标 exe 的旧客户端进程（复制期间文件必须可写）
+    _log("taskkill old process before copy")
+    _terminate_target_owners(target_path)
     if not _wait_target_free(target_path, timeout=wait_timeout):
-        # 旧进程始终未退出：放弃更新，避免留下损坏/半截文件
+        _log("abort: target still locked after taskkill")
         return 4
 
     # 备份旧 exe 后替换；替换失败则回滚备份
