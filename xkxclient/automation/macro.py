@@ -10,7 +10,10 @@ from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
 
 # 移动失败特征行（服务器拦截/防挂机输出）：命中视为该步移动异常
-_MOVE_FAIL_PATTERNS = ("不能移动", "拦住你", "拉住")
+_MOVE_FAIL_PATTERNS = ("不能移动",)
+# 拦路特征（泼皮等 NPC 瞬时拦截）：移动通常仍会成功（GMCP.Move result=true 会推），
+# 立即判定失败并反向回退反而造成走位错乱。命中后延迟确认，等待 GMCP 结果或超时。
+_MOVE_BLOCK_PATTERNS = ("拦住你", "拉住")
 
 # 方向取反（完整方向 + 常用短名）
 _REV_DIRS = dict(_MAP_OPPOSITE)
@@ -619,6 +622,22 @@ class MacroEngine(QObject):
         gmcp_sub = [None]                      # GMCP.Move 订阅句柄
         wait_timer = [None]                    # 触发等待超时计时器
         bk_timer = [None]                      # 回退确认计时器
+        block_timer: list[QTimer | None] = [None]  # 拦路延迟确认计时器
+
+        def gmcp_move_data(payload: dict) -> dict:
+            """规范化 GMCP.Move 负载：list → 首元素 dict；result 归一为 bool。"""
+            data = payload.get("data")
+            if isinstance(data, list):
+                data = data[0] if data and isinstance(data[0], dict) else {}
+            if not isinstance(data, dict):
+                data = {}
+            return data
+
+        def gmcp_move_ok(data: dict) -> bool:
+            ok = data.get("result")
+            if not isinstance(ok, bool):
+                ok = str(ok or "").strip().lower() in ("true", "1")
+            return ok
 
         def unsubscribe() -> None:
             if text_sub[0] is not None:
@@ -633,6 +652,9 @@ class MacroEngine(QObject):
             if bk_timer[0] is not None:
                 bk_timer[0].stop()
                 bk_timer[0] = None
+            if block_timer[0] is not None:
+                block_timer[0].stop()
+                block_timer[0] = None
 
         def cleanup() -> None:
             unsubscribe()
@@ -676,21 +698,7 @@ class MacroEngine(QObject):
             self.bus.publish("macro.state", account=self.session.account_id,
                              state="waiting_trigger", name=name)
             waited = [False]
-
-            def gmcp_move_data(payload: dict) -> dict:
-                """规范化 GMCP.Move 负载：list → 首元素 dict；result 归一为 bool。"""
-                data = payload.get("data")
-                if isinstance(data, list):
-                    data = data[0] if data and isinstance(data[0], dict) else {}
-                if not isinstance(data, dict):
-                    data = {}
-                return data
-
-            def gmcp_move_ok(data: dict) -> bool:
-                ok = data.get("result")
-                if not isinstance(ok, bool):
-                    ok = str(ok or "").strip().lower() in ("true", "1")
-                return ok
+            block_pending = [False]
 
             def on_line(payload: dict) -> None:
                 if done[0] or waited[0]:
@@ -706,8 +714,25 @@ class MacroEngine(QObject):
                     unsubscribe()
                     move_failed(idx)
                     return
+                if any(p in line for p in _MOVE_BLOCK_PATTERNS) and not block_pending[0]:
+                    # 泼皮等 NPC 瞬时拦路：移动通常仍会成功，等待 GMCP.Move 确认，
+                    # 若一段时间内 GMCP 未推 true/false 则超时后按失败重试。
+                    block_pending[0] = True
+                    if wait_timer[0] is not None:
+                        wait_timer[0].stop()
+                        wait_timer[0] = None
+                    block_timer[0] = QTimer(self)
+                    block_timer[0].setSingleShot(True)
+                    block_timer[0].timeout.connect(lambda: on_block_timeout(idx))
+                    block_timer[0].start(1200)
+                    return
                 if eval_line(line):
                     waited[0] = True
+                    if block_pending[0]:
+                        block_pending[0] = False
+                    if block_timer[0] is not None:
+                        block_timer[0].stop()
+                        block_timer[0] = None
                     unsubscribe()
                     if delay_ms > 0:
                         tm = QTimer(self)
@@ -728,6 +753,22 @@ class MacroEngine(QObject):
                 data = gmcp_move_data(payload)
                 if gmcp_move_ok(data):
                     confirm_move(str(data.get("short") or ""))
+                    if block_pending[0]:
+                        # 拦路后移动实际成功：按成功继续（延迟后进入下一步）
+                        block_pending[0] = False
+                        if block_timer[0] is not None:
+                            block_timer[0].stop()
+                            block_timer[0] = None
+                        waited[0] = True
+                        unsubscribe()
+                        if delay_ms > 0:
+                            tm = QTimer(self)
+                            tm.setSingleShot(True)
+                            tm.timeout.connect(lambda: next_or_finish(idx + 1))
+                            tm.start(delay_ms)
+                            self._timers[name] = tm
+                        else:
+                            next_or_finish(idx + 1)
                     return
                 # GMCP.Move result=false：撞墙/被拦 → 移动失败
                 waited[0] = True
@@ -740,6 +781,15 @@ class MacroEngine(QObject):
                 waited[0] = True
                 unsubscribe()
                 next_or_finish(idx + 1)
+
+            def on_block_timeout(idx: int) -> None:
+                # 拦路后 1200ms 内既无 GMCP 确认也无触发文本：按移动失败处理
+                if done[0] or waited[0]:
+                    return
+                block_timer[0] = None
+                waited[0] = True
+                unsubscribe()
+                move_failed(idx)
 
             text_sub[0] = self.bus.subscribe("net.text_display", on_line)
             gmcp_sub[0] = self.bus.subscribe("GMCP.Move", on_gmcp)
