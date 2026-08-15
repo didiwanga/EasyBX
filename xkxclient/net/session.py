@@ -268,18 +268,21 @@ class AccountSession(QObject):
                 self.app.bus.publish("ui.message", account=self.account_id, message=str(result))
             return
         self._track_pending(text)
+        from xkxclient.core.specialcmd import build_items, is_special
         expanded = self.aliases.expand(text)
         if expanded:
-            for cmd in expanded.split("\n"):
-                for piece in cmd.split(";"):
-                    piece = piece.strip()
-                    if piece:
-                        self.connection.send_line(piece)
+            pieces = [piece for cmd in expanded.split("\n")
+                      for piece in cmd.split(";")]
         else:
-            for cmd in text.split(";"):
-                cmd = cmd.strip()
-                if cmd:
-                    self.connection.send_line(cmd)
+            pieces = text.split(";")
+        pieces = [p.strip() for p in pieces if p.strip()]
+        if any(is_special(p) for p in pieces):
+            # 含 #wa / #N cmd：走节流队列（支持延时/重复，保持顺序），
+            # 保证交互命令与自动化命令一致的时序语义。
+            self.throttle.enqueue_items(build_items(pieces))
+        else:
+            for piece in pieces:
+                self.connection.send_line(piece)
 
     def _track_pending(self, text: str) -> None:
         """MapSync：记录用户发出的方向命令（含多个短名），供 GMCP.Move 确认对边。"""
@@ -294,11 +297,13 @@ class AccountSession(QObject):
             self.map_cache.set_pending_dir(cmd)
 
     def send_auto(self, text: str) -> None:
-        """自动引擎（触发器/宏/战斗轮转）命令：走命令节流队列，避免冲击服务器缓冲。"""
-        for cmd in text.split(";"):
-            cmd = cmd.strip()
-            if cmd:
-                self.throttle.enqueue(cmd)
+        """自动引擎（触发器/宏/战斗轮转）命令：走命令节流队列，避免冲击服务器缓冲。
+
+        `#wa N` 延时 / `#N cmd` 重复发送在此统一解析。
+        """
+        from xkxclient.core.specialcmd import build_items
+        pieces = [c.strip() for c in text.split(";") if c.strip()]
+        self.throttle.enqueue_items(build_items(pieces))
 
     # ---- 上行数据流 ----
     def _on_line(self, spans: list) -> None:

@@ -110,8 +110,6 @@ class ChannelBar(QWidget):
         cursor.insertText(f"【{name}】", prefix)
         for s in spans or []:
             fmt = QTextCharFormat()
-            if getattr(s, "bold", False):
-                fmt.setFontWeight(QFont.Weight.Bold)
             if s.fg:
                 fmt.setForeground(QColor("#" + s.fg))
             if s.bg:

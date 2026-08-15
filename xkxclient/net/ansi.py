@@ -56,6 +56,21 @@ def _sgr_bg(params: list[int]) -> str | None:
     return None
 
 
+def _brighten(fg: str) -> str:
+    """bold(SGR 1) 的终端语义是"增亮"：把 30-37 标准色映射到 90-97 亮色变体。
+
+    客户端不再用粗体字形渲染（该字体粗体字形宽度 8.31px 会破坏表格对齐），
+    因此 bold 只通过颜色增亮保留信息。
+    """
+    try:
+        idx = _BASIC.index(fg)
+    except ValueError:
+        return fg
+    if idx < 8:
+        return _BASIC[idx + 8]
+    return fg
+
+
 @dataclass
 class Span:
     text: str
@@ -138,5 +153,7 @@ def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
     for raw, f, b, bo in byte_runs:
         if not raw:
             continue
+        if bo and f:
+            f = _brighten(f)
         spans.append(Span(raw.decode(encoding, errors="replace"), f, b, bo))
     return spans

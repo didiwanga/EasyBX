@@ -26,7 +26,8 @@ class CommandThrottle(QObject):
         self.account = account
         self.bus = bus
         self.gap = _SAFE_GAP
-        self._queue: list[str] = []
+        self._queue: list = []          # 元素: str=命令 | ("delay", ms)
+        self._delay_until = 0.0         # 当前延时到期时间（monotonic）
         self._panic_until = 0.0
         self._busy = False
         self._sent = 0
@@ -45,8 +46,23 @@ class CommandThrottle(QObject):
             return
         self._queue.append(text)
 
+    def enqueue_delay(self, ms: float) -> None:
+        """排队一段延时：后续命令需等足该时长后才发送。"""
+        ms = max(0.0, float(ms))
+        if ms > 0:
+            self._queue.append(("delay", ms))
+
+    def enqueue_items(self, items: list) -> None:
+        """排队一组动作序列：str=命令，("delay", ms)=延时，按顺序执行。"""
+        for it in items:
+            if isinstance(it, tuple) and len(it) == 2 and it[0] == "delay":
+                self.enqueue_delay(it[1])
+            else:
+                self.enqueue(it)
+
     def cancel_all(self) -> None:
         self._queue.clear()
+        self._delay_until = 0.0
 
     def set_gap(self, seconds: float) -> None:
         self.gap = max(0.0, float(seconds))
@@ -57,6 +73,7 @@ class CommandThrottle(QObject):
         self.gap = _PANIC_GAP
         # 服务端已因限流排队，把本地积压一并丢弃，避免雪上加霜
         self._queue = []
+        self._delay_until = 0.0
         if self.bus:
             self.bus.publish("net.throttle", account=self.account,
                              status="命令进入缓冲，自动限频")
@@ -66,16 +83,27 @@ class CommandThrottle(QObject):
         if not self._queue:
             self._busy = False
             return
-        if self._sent and time.time() - self._sent < self.gap:
+        now = time.time()
+        # 当前在延时等待中 → 时间未到则不发送
+        if self._delay_until and now < self._delay_until:
+            self._busy = True
+            return
+        self._delay_until = 0.0
+        if self._sent and now - self._sent < self.gap:
             return
         # 恢复：缓冲告警结束后逐步回到安全间隔
-        if self._panic_until and time.time() > self._panic_until:
+        if self._panic_until and now > self._panic_until:
             self._panic_until = 0.0
             self.gap = _SAFE_GAP
-        text = self._queue.pop(0)
+        item = self._queue.pop(0)
+        if isinstance(item, tuple) and item[0] == "delay":
+            # 命中延时项：记录到期时间，后续命令等待
+            self._delay_until = now + float(item[1]) / 1000.0
+            self._busy = True
+            return
         self._busy = True
-        self._sent = time.time()
-        self.connection.send_line(text)
+        self._sent = now
+        self.connection.send_line(item)
 
     @property
     def busy(self) -> bool:

@@ -62,6 +62,27 @@ class InputLine(QLineEdit):
         self.hist_btn.clicked.connect(self._show_history_menu)
         self.hist_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
+        # 右侧「保留最后指令」：开启时发送后不清空命令框并全选，便于快速重发/覆盖
+        from xkxclient.core.config import ConfigManager
+
+        self.keep_btn = QPushButton(self)
+        self.keep_btn.setText("⇄")
+        self.keep_btn.setCheckable(True)
+        self.keep_btn.setToolTip("保留最后指令：发送后命令框不清空并全选（关=发送后清空）")
+        self.keep_btn.setFixedSize(28, 28)
+        self.keep_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.keep_btn.setStyleSheet(
+            "QPushButton{background:#f5f5f5;border:1px solid #c8c8c8;border-radius:4px;color:#555;}"
+            "QPushButton:hover{background:#e8e8e8;border-color:#b0b0b0;}"
+            "QPushButton:checked{background:#fff3e0;border:2px solid #ff8c00;color:#e65100;font-weight:bold;}"
+        )
+        self.keep_btn.setChecked(bool(ConfigManager.instance().get("input.keep_last", False)))
+        self.keep_btn.toggled.connect(self._on_keep_toggled)
+
+    def _on_keep_toggled(self, on: bool) -> None:
+        from xkxclient.core.config import ConfigManager
+        ConfigManager.instance().set("input.keep_last", bool(on))
+
     def bind(self, history) -> None:
         self._history = history
 
@@ -80,7 +101,11 @@ class InputLine(QLineEdit):
         self.submit.emit(text)
         if self._history is not None:
             self._history.record(text)
-        self.clear()
+        if self.keep_btn.isChecked():
+            # 保留最后指令：不清空，全选便于下次直接覆盖或回车重发
+            self.selectAll()
+        else:
+            self.clear()
         self._tab_cands = []
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
@@ -241,16 +266,18 @@ class AccountTab(QWidget):
         mlay.addWidget(self.find_bar)
         mlay.addWidget(self.chat)
 
-        # 输入行 + 左侧历史按钮
+        # 输入行 + 左侧历史按钮 + 右侧保留按钮
         self.input_row = QWidget(self)
         row_lay = QHBoxLayout(self.input_row)
         row_lay.setContentsMargins(0, 0, 0, 0)
         row_lay.setSpacing(2)
         row_lay.addWidget(self.input_line.hist_btn)
         row_lay.addWidget(self.input_line, 1)
+        row_lay.addWidget(self.input_line.keep_btn)
         # 输入行高度收紧：只让输出区占据多余空间，避免输入框上下出现空白
         est = max(self.input_line.sizeHint().height(),
-                  self.input_line.hist_btn.sizeHint().height()) + 2
+                  self.input_line.hist_btn.sizeHint().height(),
+                  self.input_line.keep_btn.sizeHint().height()) + 2
         self.input_row.setFixedHeight(est)
 
         self.split = QSplitter(Qt.Orientation.Vertical, self)

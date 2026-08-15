@@ -85,6 +85,10 @@ class OutputView(QPlainTextEdit):
         f = QFont(spec.get("family", "Consolas"), int(spec.get("size", 12)))
         f.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(f)
+        # 制表符停止位 = 空格宽 × 4（对齐 MUD 表格/notepad++ 默认 4 空格一格）。
+        # QPlainTextEdit 默认 tab 距是固定 80px，不随字体宽度取整，导致制表符
+        # 对齐错位（数据本身没丢，复制出去在 notepad++ 里是对齐的）。
+        self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
 
     def mouseReleaseEvent(self, e) -> None:
         """点击输出区（读only）：焦点还给命令输入框，不拦截右键菜单/拖选。"""
@@ -137,8 +141,6 @@ class OutputView(QPlainTextEdit):
                 cursor.setBlockFormat(bg)
             for s in spans:
                 fmt = QTextCharFormat()
-                if s.bold:
-                    fmt.setFontWeight(QFont.Weight.Bold)
                 if s.fg:
                     fmt.setForeground(QColor("#" + s.fg))
                 if s.bg:
