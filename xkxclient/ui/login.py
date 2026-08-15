@@ -340,14 +340,28 @@ class LoginWindow(QDialog):
             self.init_edit.setText(";".join(init_cmds) if isinstance(init_cmds, list) else str(init_cmds))
             self.auto_cb.setChecked(bool(data.get("autologin", True)))
 
+    def _resolve_account_id(self, combo_id: str, username: str) -> str:
+        """账号与用户名本应一致：账号框残留旧值而用户名被改写时，账号跟随用户名。
+
+        场景：回填上次账号后用户改了用户名/密码但没清账号框，若仍用旧账号 key
+        保存会覆盖旧账号的 username，造成账号库错乱。仅当账号库里该账号名确实
+        对应当前用户名时才保留原账号名，否则以新用户名为准。
+        """
+        if not combo_id or combo_id == username:
+            return combo_id or username
+        stored = self.config.accounts().get(combo_id)
+        if stored and str(stored.get("username", "")).strip() == username:
+            return combo_id
+        return username
+
     def _on_connect(self) -> None:
         srv = self._selected_server()
         if srv is None:
             return
-        account_id = self.account_combo.currentText().strip() or self.user_edit.text().strip()
-        if not account_id or not self.user_edit.text().strip():
-            return
         username = self.user_edit.text().strip()
+        if not username:
+            return
+        account_id = self._resolve_account_id(self.account_combo.currentText().strip(), username)
         password = self.pass_edit.text().strip()
         init_cmds = [c for c in self.init_edit.text().split(";") if c.strip()]
         if self.remember_cb.isChecked():
