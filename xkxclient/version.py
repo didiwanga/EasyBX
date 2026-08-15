@@ -4,12 +4,18 @@
 Lua 绑定、自动更新）都必须从这里读取，禁止在别处硬编码版本号。
 """
 
-VERSION = "1.2.13"
+VERSION = "1.2.14"
 
 # 更新服务器：阿里云 pytools.cloud（同一文件也通过 http://47.104.0.91 提供）
 UPDATE_BASE = "http://pytools.cloud"
 UPDATE_MANIFEST_URL = UPDATE_BASE + "/EasyBXb_version.json"
 UPDATE_DOWNLOAD_URL = UPDATE_BASE + "/EasyBXb.exe"
+
+# 宏分享接口（nginx 反代到服务器 map_server 的 /api/macros/*）
+MACRO_SHARE_BASE = UPDATE_BASE + "/api/macros"
+MACRO_SHARE_LIST_URL = MACRO_SHARE_BASE + "/list"
+MACRO_SHARE_GET_URL = MACRO_SHARE_BASE + "/get"
+MACRO_SHARE_UPLOAD_URL = MACRO_SHARE_BASE + "/upload"
 
 
 def parse_version(text: str) -> tuple:

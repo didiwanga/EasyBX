@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
         vm.addAction("别名…", lambda: self._open_editor("alias"))
         vm.addAction("定时器…", lambda: self._open_editor("timer"))
         vm.addAction("宏…", lambda: self._open_editor("macro"))
+        vm.addAction("节点图宏…", self._open_node_editor)
         vm.addAction("脚本…", lambda: self._open_editor("script"))
         vm.addAction("屏显屏蔽…", self._open_screen_block)
         vm.addSeparator()
@@ -217,6 +218,7 @@ class MainWindow(QMainWindow):
         tm.addAction("自动拾取…", self._open_auto_pickup)
         tm.addAction("服务器环境变量…", self._open_env_settings)
         tm.addAction("快捷键设置…", lambda: ShortcutDialog(self).exec())
+        tm.addAction("宏分享…", self._open_macro_share)
 
         am = bar.addMenu("账号")
         am.addAction("新建标签…", self._new_connection)
@@ -242,6 +244,7 @@ class MainWindow(QMainWindow):
         tb.addAction("🔗 别名", lambda: self._open_editor("alias"))
         tb.addAction("⏱ 定时器", lambda: self._open_editor("timer"))
         tb.addAction("🎬 宏", lambda: self._open_editor("macro"))
+        tb.addAction("🧩 节点图", self._open_node_editor)
         tb.addAction("📜 脚本", lambda: self._open_editor("script"))
         tb.addSeparator()
         self._trg_on_act = tb.addAction("🟢 触发器")
@@ -675,6 +678,24 @@ class MainWindow(QMainWindow):
             return
         if cls:
             cls(tab.session, self).show()
+
+    def _open_node_editor(self) -> None:
+        """打开节点图宏编辑器（类 Visio 拖拽连线）。"""
+        tab = self._tab()
+        if not tab:
+            return
+        from xkxclient.ui.nodegraph import NodeGraphEditor
+        self._node_editor = NodeGraphEditor(tab.session, "", None, self)
+        self._node_editor.show()
+
+    def _open_macro_share(self) -> None:
+        """打开宏分享对话框：上传本地宏 / 下载共享宏。"""
+        tab = self._tab()
+        if not tab:
+            return
+        from xkxclient.ui.macroshare import MacroShareDialog
+        self._macro_share = MacroShareDialog(tab.session, self)
+        self._macro_share.show()
 
     # ---- 布局持久化 ----
     # 默认启动布局：以用户当前 dock 布局固化（8 方向各 dock 位置/尺寸）。

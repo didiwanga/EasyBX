@@ -481,6 +481,8 @@ class _EditorBase(QDialog):
             if not bool(d.get("enabled", True)):
                 child.setForeground(0, Qt.GlobalColor.gray)
             child.setData(0, Qt.ItemDataRole.UserRole, idx)
+            if self._key == "macros" and d.get("graph"):
+                child.setText(0, f"{d.get('name', '?')}  [节点图]")
             node.addChild(child)
         self.item_list.expandAll()
         self._refresh_groups()
@@ -524,9 +526,31 @@ class _EditorBase(QDialog):
         else:
             idx = item.data(0, Qt.ItemDataRole.UserRole)
             if idx is not None and 0 <= idx < len(self.items):
+                if self._key == "macros" and self.items[idx].get("graph"):
+                    menu.addAction("打开节点图…",
+                                   lambda i=idx: self._open_graph(i))
                 menu.addAction("启用", lambda i=idx: self._single_toggle(i, True))
                 menu.addAction("停用", lambda i=idx: self._single_toggle(i, False))
         menu.exec(self.item_list.viewport().mapToGlobal(pos))
+
+    def _open_graph(self, idx: int) -> None:
+        """打开选中宏的节点图编辑器（保持当前列表编辑器窗口）。"""
+        if not (0 <= idx < len(self.items)):
+            return
+        d = self.items[idx]
+        from xkxclient.ui.nodegraph import NodeGraphEditor
+
+        def _on_saved(new_name: str, graph: dict) -> None:
+            """节点图保存后同步回列表缓存，避免宏窗口后续保存覆盖磁盘新图。"""
+            for i in range(len(self.items)):
+                if i == idx or self.items[i].get("name") == d.get("name"):
+                    self.items[i] = {**self.items[i], "name": new_name, "graph": graph}
+                    break
+            self._refresh()
+
+        editor = NodeGraphEditor(self.session, d.get("name", ""),
+                                 d.get("graph") or None, self, on_saved=_on_saved)
+        editor.show()
 
     def _group_toggle(self, group: str, on: bool) -> None:
         for d in self.items:
@@ -675,7 +699,7 @@ class _EditorBase(QDialog):
         if name not in ("", default):
             return False
         if self._key == "macros":
-            return not d.get("steps")
+            return not d.get("steps") and not d.get("graph")
         if self._key == "aliases":
             return not (d.get("pattern") or "").strip() and not (d.get("replacement") or "").strip()
         if self._key == "timers":
@@ -926,8 +950,22 @@ class MacroEditor(_EditorBase):
         self._steps: list[dict] = []
 
     def _fill_extra(self, item: dict) -> None:
+        if item.get("graph"):
+            self._steps = []
+            self.step_list.clear()
+            self.step_list.addItem("（节点图宏：请在列表右键「打开节点图…」编辑）")
+            self._set_graph_mode(True)
+            return
         self._steps = [dict(s) for s in item.get("steps", [])]
+        self._set_graph_mode(False)
         self._refresh_steps()
+
+    def _set_graph_mode(self, graph: bool) -> None:
+        """节点图宏禁用步骤区编辑按钮（步骤由节点图管理，避免空 _steps 越界）。"""
+        for btn in (self.step_add, self.step_edit, self.step_del,
+                    self.step_copy, self.step_up, self.step_dn,
+                    self.step_batch_delay):
+            btn.setEnabled(not graph)
 
     def _refresh_steps(self) -> None:
         self.step_list.clear()
@@ -1046,7 +1084,7 @@ class MacroEditor(_EditorBase):
 
     def _on_step_del(self) -> None:
         row = self.step_list.currentRow()
-        if row >= 0:
+        if 0 <= row < len(self._steps):
             self._steps.pop(row)
             self._refresh_steps()
 
@@ -1094,6 +1132,15 @@ class MacroEditor(_EditorBase):
         self._refresh_steps()
 
     def _extra(self, d: dict) -> dict:
+        # 节点图宏：graph 来自原数据，保存时不覆盖、不丢失；步骤留空
+        idx = self._edit_idx
+        cur_graph = None
+        if idx is not None and 0 <= idx < len(self.items):
+            cur_graph = self.items[idx].get("graph")
+        if cur_graph:
+            d["graph"] = cur_graph
+            d["steps"] = []
+            return d
         return {"steps": [dict(s) for s in self._steps]}
 
     def _reload_engine(self) -> None:

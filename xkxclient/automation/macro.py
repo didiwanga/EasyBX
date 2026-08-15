@@ -65,13 +65,136 @@ def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
 
 class Macro:
     def __init__(self, name: str, enabled: bool = True, shared: bool = False, steps: list | None = None,
-                 group: str = "") -> None:
+                 group: str = "", graph: dict | None = None) -> None:
         self.name = name
         self.enabled = enabled
         self.shared = shared
-        self.steps = steps or []
+        self.graph = graph
         self.group = group
+        if graph and not steps:
+            self.steps = compile_graph(graph)
+        else:
+            self.steps = steps or []
         self.labels = {s.get("label"): i for i, s in enumerate(self.steps) if s.get("label")}
+        self.node_labels = {n.get("label"): n.get("id") for n in (graph or {}).get("nodes", []) if n.get("label")} if graph else {}
+
+
+def _graph_start_node(graph: dict) -> dict | None:
+    """返回节点图入口节点：无入边的节点；多个则取最左上；无则取最左上。"""
+    nodes = graph.get("nodes", [])
+    if not nodes:
+        return None
+    edges = graph.get("edges", [])
+    has_in: set[str] = {e.get("to") for e in edges}
+    candidates = [n for n in nodes if n.get("id") not in has_in] or list(nodes)
+    return min(candidates, key=lambda n: (n.get("y", 0), n.get("x", 0)))
+
+
+def _graph_follow(graph: dict, node_id: str, port: str = "out") -> str | None:
+    """沿指定端口取目标节点 id；单出边时端口忽略。"""
+    edges = graph.get("edges", [])
+    outs = [e for e in edges if e.get("from") == node_id]
+    if len(outs) == 1:
+        return outs[0].get("to")
+    for e in outs:
+        if e.get("port", "out") == port:
+            return e.get("to")
+    return outs[0].get("to") if outs else None
+
+
+def _graph_follow_port(graph: dict, node_id: str, port: str) -> str | None:
+    """严格按端口取目标（分支节点专用）：未连该端口返回 None（走默认 next）。"""
+    for e in graph.get("edges", []):
+        if e.get("from") == node_id and e.get("port", "out") == port:
+            return e.get("to")
+    return None
+
+
+def compile_graph(graph: dict) -> list[dict]:
+    """把节点图（nodes+edges）线性化为现有引擎的 steps 列表。
+
+    - 入口 → 沿全部出边 BFS 收集可达节点（保证分支末节点也被编译，标签可寻址）；
+    - 无出边的终点节点：追加显式 jump → 合成终点 `__end__`（label 步骤，越界即结束宏），
+      避免多个终点相邻时顺序延续误入另一分支；
+    - 非分支节点若顺序延续 ≠ 单出边目标，则追加显式 jump 步骤兜底（兼容汇合点）；
+    - 分支节点（if/status）以 `then`/`else` 指向目标节点 id，jump 以 `then` 指向目标。
+    返回的 steps 由现有 MacroEngine 原样执行。
+    """
+    nodes = list(graph.get("nodes", []))
+    if not nodes:
+        return []
+    nodes_by_id = {n.get("id"): n for n in nodes if n.get("id")}
+    start = _graph_start_node(graph)
+    if start is None:
+        return []
+
+    # 1) BFS 沿全部出边收集可达节点
+    order: list[str] = []
+    visited: set[str] = set()
+    queue = [start.get("id")]
+    while queue:
+        nid = queue.pop(0)
+        if nid in visited or nid not in nodes_by_id:
+            continue
+        visited.add(nid)
+        order.append(nid)
+        for e in graph.get("edges", []):
+            if e.get("from") == nid and e.get("to") in nodes_by_id and e.get("to") not in visited:
+                queue.append(e.get("to"))
+
+    def has_out(nid: str) -> bool:
+        return any(e.get("from") == nid for e in graph.get("edges", []))
+
+    # 2) 编译为 steps（含显式 jump 兜底 + 终点标记）
+    steps: list[dict] = []
+    for i, nid in enumerate(order):
+        n = nodes_by_id[nid]
+        t = n.get("type")
+        s = {k: v for k, v in n.items() if k not in ("id", "x", "y", "label")}
+        s.setdefault("type", t or "cmd")
+        s["label"] = nid  # 节点 id 作为步骤 label，使 _goto 可按节点 id 寻址
+        if t in ("if", "status"):
+            s["then"] = _graph_follow_port(graph, nid, "true")
+            s["else"] = _graph_follow_port(graph, nid, "false")
+            steps.append(s)
+        elif t == "jump":
+            s["then"] = _graph_follow(graph, nid, "out")
+            steps.append(s)
+        elif t == "room":
+            # 房间节点：出口移动 →（可选）到达命令。出口移动用 move_trigger 承载，
+            # 到达触发文本留空则移动后直接继续；超时/重试语义复用 move_trigger。
+            s = {"type": "move_trigger",
+                 "command": n.get("exit") or "",
+                 "delay_ms": int(n.get("delay_ms") or 500),
+                 "timeout_ms": int(n.get("timeout_ms") or 5000)}
+            cond = n.get("trigger") or ""
+            if cond:
+                s["conditions"] = [{"match_type": "contains", "pattern": cond}]
+            else:
+                s["conditions"] = [{"match_type": "contains", "pattern": ""}]
+            s["label"] = nid
+            steps.append(s)
+            if n.get("command"):
+                steps.append({"type": "cmd", "command": n.get("command"),
+                              "label": f"__room_cmd_{nid}"})
+            target = _graph_follow(graph, nid, "out")
+            if not target:  # 终点节点：显式跳到合成终点，防止误入相邻分支
+                steps.append({"type": "jump", "then": "__end__", "label": f"__j_end_{nid}"})
+            else:
+                nxt = order[i + 1] if i + 1 < len(order) else None
+                if target != nxt:
+                    steps.append({"type": "jump", "then": target, "label": f"__j_{nid}"})
+        else:
+            steps.append(s)
+            target = _graph_follow(graph, nid, "out")
+            if not target:  # 终点节点：显式跳到合成终点，防止误入相邻分支
+                steps.append({"type": "jump", "then": "__end__", "label": f"__j_end_{nid}"})
+            else:
+                nxt = order[i + 1] if i + 1 < len(order) else None
+                if target != nxt:
+                    steps.append({"type": "jump", "then": target, "label": f"__j_{nid}"})
+    steps.append({"type": "label", "label": "__end__"})
+    return steps
 
 
 class MacroEngine(QObject):
@@ -113,7 +236,7 @@ class MacroEngine(QObject):
             d = dict(d)
             name = d.pop("name")
             m = Macro(name, d.pop("enabled", True), d.pop("shared", False), d.pop("steps", []),
-                      d.pop("group", ""))
+                      d.pop("group", ""), graph=d.pop("graph", None) or None)
             self.macros[m.name] = m
             # 运行中的宏：实时应用修改后的内容（不打断运行，保留当前步骤位置）
             if m.name in self._active:
