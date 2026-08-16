@@ -11,7 +11,7 @@ from xkxclient.core.config import ConfigManager
 # （同屏列表/重复房间描述会连续命中同一名字）。
 _REPEAT_COOLDOWN = 10.0
 
-# 玩家条目：中文名(英文名)，如 乐师(Ccbv)
+# 玩家条目：中文名(英文名)
 _PLAYER_RE = re.compile(r"([\u4e00-\u9fff·]{1,6})\s*\(([A-Za-z][A-Za-z ]*)\)")
 
 
@@ -29,8 +29,9 @@ class PlayerWatchEngine(QObject):
     - 玩家以 `中文名(英文名)` 配置，每条可带触发指令；
     - 文本行包含中文名或英文名（英文大小写不敏感）即触发，发送用户指令；
     - 指令中的 `<cn>` 替换为中文名，`<en>` 替换为英文名（全小写）；
-    - 同一玩家冷却期内不重复触发。
-    配置存 config.json `player_watch` = {"enabled": bool, "players": [...]}。
+    - 同一玩家冷却期内不重复触发；
+    - 命中时播放「叮」提示音（beep）。
+    配置存 config.json `player_watch` = {"enabled": bool, "beep": bool, "players": [...]}。
     """
 
     def __init__(self, bus, session, parent=None) -> None:
@@ -38,6 +39,7 @@ class PlayerWatchEngine(QObject):
         self.bus = bus
         self.session = session
         self.enabled = False
+        self.beep = True
         self.players: list[dict] = []
         self._cooldown: dict[str, float] = {}
         self._load_config()
@@ -48,6 +50,7 @@ class PlayerWatchEngine(QObject):
     def _load_config(self) -> None:
         cfg = ConfigManager.instance().get("player_watch") or {}
         self.enabled = bool(cfg.get("enabled", False))
+        self.beep = bool(cfg.get("beep", True))
         self.players = []
         for p in (cfg.get("players") or []):
             if isinstance(p, dict) and p.get("cn"):
@@ -57,8 +60,9 @@ class PlayerWatchEngine(QObject):
                     "cmd": str(p.get("cmd", "")),
                 })
 
-    def set_config(self, enabled: bool, players: list[dict]) -> None:
+    def set_config(self, enabled: bool, players: list[dict], beep: bool = True) -> None:
         self.enabled = bool(enabled)
+        self.beep = bool(beep)
         self.players = []
         for p in players:
             cn = str(p.get("cn", "")).strip()
@@ -69,7 +73,20 @@ class PlayerWatchEngine(QObject):
                     "cmd": str(p.get("cmd", "")).strip(),
                 })
         ConfigManager.instance().set("player_watch", {
-            "enabled": self.enabled, "players": self.players})
+            "enabled": self.enabled, "beep": self.beep, "players": self.players})
+
+    # ---- 匹配 ----
+    def peek_hit(self, line: str) -> bool:
+        """同步判断本行是否命中任一玩家（供主输出整行高亮）。不发送、不耗冷却。"""
+        if not self.enabled:
+            return False
+        low = line.lower()
+        for p in self.players:
+            cn = p.get("cn", "")
+            en = p.get("en", "")
+            if bool(cn and cn in line) or bool(en and en.lower() in low):
+                return True
+        return False
 
     # ---- 触发 ----
     def _on_line(self, payload: dict) -> None:
@@ -94,5 +111,11 @@ class PlayerWatchEngine(QObject):
             if self._cooldown.get(key, 0.0) > now:
                 continue
             self._cooldown[key] = now + _REPEAT_COOLDOWN
+            if self.beep:
+                self._play_ding()
             out = cmd.replace("<cn>", cn).replace("<en>", en.lower())
             self.session.send_auto(out)
+
+    def _play_ding(self) -> None:
+        from xkxclient.automation.trigger import play_ding
+        play_ding()

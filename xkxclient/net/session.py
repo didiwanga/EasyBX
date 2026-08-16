@@ -327,8 +327,9 @@ class AccountSession(QObject):
             self._login.on_line(text)
         if self.logged_in:
             fired = self.triggers.handle_line(text)
+            hit_player = self.player_watch.peek_hit(text)
             if not self._consume_line(text):
-                self._route_line(text, spans, bool(fired))
+                self._route_line(text, spans, bool(fired) or hit_player)
         else:
             self.line_displayed.emit(spans, False)
         # 旁路解析（不阻塞主输出）：缓冲区告警 / look 捕获 / fullme 链接

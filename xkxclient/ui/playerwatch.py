@@ -41,7 +41,11 @@ class PlayerWatchDialog(QDialog):
         self.enabled_cb = QCheckBox("启用发现玩家（常驻，监控所有服务器信息）")
         self.enabled_cb.setChecked(bool(cfg.get("enabled", False)))
 
-        hint = QLabel("添加「中文名(英文名)」如 乐师(Ccbv)。服务器信息包含中文名或英文名"
+        self.beep_cb = QCheckBox("命中提示音")
+        self.beep_cb.setToolTip("命中玩家时播放一声「叮」提醒")
+        self.beep_cb.setChecked(bool(cfg.get("beep", True)))
+
+        hint = QLabel("添加「中文名(英文名)」。服务器信息包含中文名或英文名"
                       "（英文不区分大小写）时发送你设定的指令。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#808080;")
@@ -50,11 +54,11 @@ class PlayerWatchDialog(QDialog):
         self.list.currentRowChanged.connect(self._on_select)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("中文名(英文名)，如 乐师(Ccbv)")
+        self.input.setPlaceholderText("中文名(英文名)")
         self.input.returnPressed.connect(self._add)
 
         self.cmd_ed = QLineEdit()
-        self.cmd_ed.setPlaceholderText("触发指令，如 wenhao <cn> / kill <en>（<en> 发送时全小写）")
+        self.cmd_ed.setPlaceholderText("触发指令，如 wenhao <cn> / kill <en>（支持 ; 分隔多条，<en> 发送时全小写）")
         self.cmd_ed.returnPressed.connect(self._add)
 
         add_btn = QPushButton("添加")
@@ -71,6 +75,7 @@ class PlayerWatchDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.enabled_cb)
+        lay.addWidget(self.beep_cb)
         lay.addWidget(hint)
         lay.addWidget(self.list, 1)
         lay.addWidget(self.cmd_ed)
@@ -137,9 +142,11 @@ class PlayerWatchDialog(QDialog):
     def accept(self) -> None:
         players = [p for p in self.players if str(p.get("cn", "")).strip()]
         self.config.set("player_watch", {
-            "enabled": self.enabled_cb.isChecked(), "players": players})
+            "enabled": self.enabled_cb.isChecked(),
+            "beep": self.beep_cb.isChecked(), "players": players})
         if self.session is not None:
             eng = getattr(self.session, "player_watch", None)
             if eng is not None:
-                eng.set_config(self.enabled_cb.isChecked(), players)
+                eng.set_config(self.enabled_cb.isChecked(), players,
+                               self.beep_cb.isChecked())
         super().accept()

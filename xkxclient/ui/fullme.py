@@ -108,6 +108,7 @@ class FullmeGridWindow(QDialog):
         self._attempts = 0
         self._result_timer: QTimer | None = None
         self._sub = None
+        self._sent = False  # 等待结果期间禁止重复提交（防二次回车/误点按钮触发「请先输入验证码」）
         if self.wait_result_enabled():
             self._sub = self.session.app.bus.subscribe("net.text_display", self._on_text)
 
@@ -137,6 +138,7 @@ class FullmeGridWindow(QDialog):
                                     "输入的验证码可能有误，请仔细辨别")
             self.input_row.clear()
             self.input_row.setFocus()
+            self._sent = False  # 允许重输再提交
             return
         if _SUCCESS_MSG in text:
             self._clear_result_timer()
@@ -220,17 +222,34 @@ class FullmeGridWindow(QDialog):
         self.input_row.setFocus()
         return True
 
+    def _current_code(self) -> str:
+        """读取输入框当前文本（先强制提交输入法预编辑内容）。
+
+        中文输入法输入验证码时，未上屏的拼音/候选词可能仍在预编辑区，
+        此时 QLineEdit.text() 返回空——若直接校验会被 _block_empty 误判为
+        「未输入验证码」。先 commit() 强制上屏，再取输入框文本。"""
+        from PyQt6.QtGui import QGuiApplication
+        im = QGuiApplication.inputMethod()
+        if im is not None:
+            im.commit()
+        return self.input_row.text()
+
     def _send(self) -> None:
-        code = self.input_row.text()
+        # 等待结果期间已发送：忽略重复触发（用户二次回车/误点按钮会带着空输入框进来）
+        if self.wait_result_enabled() and self._sent:
+            return
+        code = self._current_code()
         if self._block_empty(code):
             return
         code = code.strip()
         self.session.send(f"fullme {code}")
         self.input_row.clear()
+        self.input_row.clearFocus()  # 失焦：防止等待结果期间再次回车误触「请先输入验证码」
         if not self.wait_result_enabled():
             self.close()
             return
         # 等待结果模式：不关闭，等到成功/失败/超时回话
+        self._sent = True
         self._attempts += 1
         if self._attempts >= _MAX_ATTEMPTS:
             self._do_close()
@@ -251,6 +270,7 @@ class FullmeGridWindow(QDialog):
                                 "输入的验证码可能有误，请仔细辨别")
         self.input_row.clear()
         self.input_row.setFocus()
+        self._sent = False  # 允许重输再提交
 
     def closeEvent(self, event) -> None:
         if self._sub is not None:
@@ -298,7 +318,7 @@ class CaptchaWindow(FullmeGridWindow):
         return False
 
     def _send(self) -> None:
-        code = self.input_row.text()
+        code = self._current_code()
         if self._block_empty(code):
             return
         code = code.strip()
@@ -325,7 +345,7 @@ class HongbaoWindow(FullmeGridWindow):
         return False
 
     def _send(self) -> None:
-        code = self.input_row.text()
+        code = self._current_code()
         if self._block_empty(code):
             return
         code = code.strip()
