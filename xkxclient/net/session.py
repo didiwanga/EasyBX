@@ -908,9 +908,15 @@ class AccountSession(QObject):
                 self.state.busy = busy
             if fighting is not None:
                 self.state.fighting = fighting
+            ident = data.get("id")
+            enemy_pkt = isinstance(ident, str) and "#" in ident
             if self.state.update_from_gmcp_status(data):
                 self.app.bus.publish("state.changed", account=self.account_id, state=self.state)
-                self._backfill_account()
+                if not enemy_pkt:
+                    self._backfill_account()
+            elif enemy_pkt:
+                # 敌人 Status：自身属性不变，但 busy/fighting 可能已更新，仍要刷新 UI
+                self.app.bus.publish("state.changed", account=self.account_id, state=self.state)
         elif module == "GMCP.Move":
             handled = True
             if isinstance(data, list):

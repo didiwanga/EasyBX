@@ -65,7 +65,7 @@ class OutputView(QPlainTextEdit):
         self._last_block_was_fold = False
         self._search_matches: list[tuple[int, int]] = []
         self._search_index = -1
-        self._history: deque[str] = deque(maxlen=_HISTORY_MAX)   # 已移出显示窗口的更早行（B5）
+        self._history: deque[QTextDocumentFragment] = deque(maxlen=_HISTORY_MAX)   # 已移出显示窗口的更早行（B5，保留富文本格式）
         self._view_all = False           # True：正处于回看历史（doc 可超 5000 行）
 
         self._apply_font(cfg.ConfigManager.instance().get("font", {"family": "SimHei", "size": 12}))
@@ -175,7 +175,10 @@ class OutputView(QPlainTextEdit):
             blk = doc.firstBlock()
             if not blk.isValid() or not blk.length():
                 break
-            self._history.append(blk.text())
+            sel = QTextCursor(blk)
+            sel.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            sel.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            self._history.append(QTextDocumentFragment(sel))
             cur.setPosition(blk.position())
             cur.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
@@ -203,8 +206,9 @@ class OutputView(QPlainTextEdit):
         cursor = QTextCursor(self.document())
         cursor.beginEditBlock()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
-        text = "".join(ln + "\n" for ln in lines)
-        cursor.insertText(text)   # 整段一次性插入，避免逐行 insertText 的重排开销
+        for frag in lines:
+            cursor.insertFragment(frag)
+            cursor.insertText("\n")
         cursor.endEditBlock()
         new_h = self.document().size().height()
         # 顶部插入 N 行后，文档变高；把滚动值同步下移插入高度，让原本可见的内容保持原位

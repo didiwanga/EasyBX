@@ -99,19 +99,19 @@ class ChannelBar(QWidget):
             return
         cursor = QTextCursor(self.output.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        if highlight:
-            bg = QTextBlockFormat()
-            bg.setBackground(QColor("#3d3410"))
-            cursor.setBlockFormat(bg)
-        # 频道前缀淡色标识
+        # 频道前缀淡色标识（命中时也带高亮底色）
         prefix = QTextCharFormat()
         prefix.setForeground(QColor("#808080"))
+        if highlight:
+            prefix.setBackground(QColor("#3d3410"))
         cursor.insertText(f"【{name}】", prefix)
         for s in spans or []:
             fmt = QTextCharFormat()
             if s.fg:
                 fmt.setForeground(QColor("#" + s.fg))
-            if s.bg:
+            if highlight:
+                fmt.setBackground(QColor("#3d3410"))
+            elif s.bg:
                 fmt.setBackground(QColor("#" + s.bg))
             cursor.insertText(getattr(s, "text", ""), fmt)
         cursor.insertText("\n")
