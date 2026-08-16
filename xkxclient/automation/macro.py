@@ -266,7 +266,7 @@ class MacroEngine(QObject):
         self._active: dict[str, Macro] = {}
         self._pos: dict[str, int] = {}
         self._timers: dict[str, QTimer] = {}
-        self._loop_count: dict[str, int] = {}   # 计数循环：当前循环次数
+        self._loop_count: dict[tuple[str, int], int] = {}   # 计数循环：(宏名, 步骤位置) -> 当前循环次数
         self._waiting: tuple[str, int] | None = None
         self._paused: set[str] = set()       # 被暂停的宏名
         self._wait_input_timer: QTimer | None = None
@@ -330,7 +330,7 @@ class MacroEngine(QObject):
             return False
         self._active[name] = m
         self._pos[name] = 0
-        self._loop_count[name] = 0
+        self._loop_count = {k: v for k, v in self._loop_count.items() if k[0] != name}
         self._paused.discard(name)
         self.bus.publish("macro.start", account=self.session.account_id, name=name)
         self._step(name)
@@ -1389,7 +1389,7 @@ class MacroEngine(QObject):
     def _halt(self, name: str) -> None:
         self._active.pop(name, None)
         self._pos.pop(name, None)
-        self._loop_count.pop(name, None)
+        self._loop_count = {k: v for k, v in self._loop_count.items() if k[0] != name}
         self._paused.discard(name)
         self._call_stack.pop(name, None)
         self._recursion_depth.pop(name, None)
@@ -1448,6 +1448,13 @@ class MacroEngine(QObject):
             ok = self._last_line_has(cond.get("pattern", ""), line)
         elif ctype == "contains":
             ok = cond.get("pattern", "") in line
+        elif ctype == "exact":
+            ok = line == cond.get("pattern", "")
+        elif ctype == "template":
+            from xkxclient.automation.trigger import Trigger
+            trg = Trigger("_c", match_type="template", pattern=cond.get("pattern", ""))
+            rx = trg.template_regex
+            ok = (trg.pattern in line) if rx is None else (rx.search(line) is not None)
         elif ctype == "regex":
             ok = self._last_line_has(cond.get("pattern", ""), line)
         elif ctype == "cmp":
@@ -1477,6 +1484,10 @@ class MacroEngine(QObject):
                 return fa > fb
             if op == "<":
                 return fa < fb
+            if op == ">=":
+                return fa >= fb
+            if op == "<=":
+                return fa <= fb
             if op == "!=":
                 return fa != fb
             return fa == fb
@@ -1484,6 +1495,10 @@ class MacroEngine(QObject):
             return a > b
         if op == "<":
             return a < b
+        if op == ">=":
+            return a >= b
+        if op == "<=":
+            return a <= b
         if op == "!=":
             return a != b
         return a == b
@@ -1605,12 +1620,14 @@ class MacroEngine(QObject):
         """计数循环步骤：以 `start`（步骤序号/标签）为循环起点，`count` 为次数。
 
         执行到本步时计数 +1：若尚未达到 count（count=0 视为无限），跳回起点继续；
-        达到 count 后向下继续执行。
+        达到 count 后计数归零再向下继续执行（再次进入本步时重新计数）。
+        计数按 (宏名, 步骤位置) 隔离，同一宏的多个循环互不影响。
         """
         count = int(step.get("count") or 0)
         start = step.get("start") or ""
-        cur = self._loop_count.get(name, 0) + 1
-        self._loop_count[name] = cur
+        key = (name, pos)
+        cur = self._loop_count.get(key, 0) + 1
+        self._loop_count[key] = cur
         if count <= 0 or cur < count:
             if start in (None, ""):
                 self._goto(name, pos + 1)
@@ -1618,6 +1635,7 @@ class MacroEngine(QObject):
                 # 异步跳回起点：避免无限/高频循环同步递归爆栈
                 self._goto_later(name, start)
         else:
+            self._loop_count.pop(key, None)  # 完成 count 次后计数归零，防止再次进入直接跳过
             self._goto(name, pos + 1)
 
     def _branch(self, name: str, step: dict, pos: int) -> None:
