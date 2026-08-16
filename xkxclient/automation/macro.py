@@ -1113,15 +1113,16 @@ class MacroEngine(QObject):
         idx = int(target)
         self._chain(name, ms, idx)
 
-    def _match(self, cond: dict) -> bool:
+    def _match(self, cond: dict, line: str | None = None) -> bool:
         ctype = cond.get("type") or cond.get("match_type")  # 兼容跳转(type) 与 判断条件列表(match_type)
         var = cond.get("var", "")
+        line = line if line is not None else getattr(self.session, "last_line", "")
         if ctype in ("jump", "wait", "loop"):
-            ok = self._last_line_has(cond.get("pattern", ""))
+            ok = self._last_line_has(cond.get("pattern", ""), line)
         elif ctype == "contains":
-            ok = cond.get("pattern", "") in getattr(self.session, "last_line", "")
+            ok = cond.get("pattern", "") in line
         elif ctype == "regex":
-            ok = self._last_line_has(cond.get("pattern", ""))
+            ok = self._last_line_has(cond.get("pattern", ""), line)
         elif ctype == "cmp":
             key = self._varname(var)
             ok = self._cmp(str(self.session.vars.get(key, "")),
@@ -1207,10 +1208,10 @@ class MacroEngine(QObject):
             relation = "or"
         done = [False]
 
-        def eval_again() -> bool:
+        def eval_again(line: str | None = None) -> bool:
             if relation == "and":
-                return all(self._match(c) for c in conds)
-            return any(self._match(c) for c in conds)
+                return all(self._match(c, line) for c in conds)
+            return any(self._match(c, line) for c in conds)
 
         def finish(ok: bool) -> None:
             if done[0]:
@@ -1236,7 +1237,7 @@ class MacroEngine(QObject):
                 return
             if (payload.get("account") or "") != self.session.account_id:
                 return
-            if eval_again():
+            if eval_again(payload.get("line") or ""):
                 finish(True)
 
         self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
@@ -1310,8 +1311,8 @@ class MacroEngine(QObject):
             if not conds:
                 return True
             if relation == "and":
-                return all(self._match(c) for c in conds)
-            return any(self._match(c) for c in conds)
+                return all(self._match(c, line) for c in conds)
+            return any(self._match(c, line) for c in conds)
 
         def find_keyword(line: str) -> dict | None:
             for kw in keywords:
@@ -1370,7 +1371,11 @@ class MacroEngine(QObject):
             var = self._varname(action.get("var", ""))
             if var:
                 self.session.vars[var] = substitute(str(action.get("value", "")), self.session.vars)
-            self._goto(name, pos + 1)
+            target = action.get("target")
+            if target not in (None, ""):
+                self._goto_later(name, target)
+            else:
+                self._goto(name, pos + 1)
         else:
             self._goto(name, pos + 1)
 
@@ -1431,8 +1436,8 @@ class MacroEngine(QObject):
             if var:
                 self.session.vars[var] = substitute(val, self.session.vars)
 
-    def _last_line_has(self, pattern: str) -> bool:
-        line = getattr(self.session, "last_line", "")
+    def _last_line_has(self, pattern: str, line: str | None = None) -> bool:
+        line = line if line is not None else getattr(self.session, "last_line", "")
         try:
             return re.search(pattern, line) is not None
         except re.error:

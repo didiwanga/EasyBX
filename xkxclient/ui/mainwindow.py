@@ -4,7 +4,7 @@ from PyQt6.QtCore import QEvent, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QResizeEvent
 from PyQt6.QtWidgets import (QCheckBox, QDialog, QDockWidget, QLabel, QMainWindow,
                              QMessageBox, QProgressBar, QSizePolicy, QTabWidget, QToolBar,
-                             QVBoxLayout, QWidget)
+                             QToolButton, QVBoxLayout, QWidget)
 
 from xkxclient.core import config as cfg
 from xkxclient.core import resources
@@ -271,6 +271,17 @@ class MainWindow(QMainWindow):
         tb.addWidget(spacer)
         tb.addAction("🛡 屏显屏蔽", self._open_screen_block)
         tb.addAction("🪣 自动拾取", self._open_auto_pickup)
+        # 客户端用户快捷按钮（亮绿色边框，同账号菜单项）
+        cu_btn = QToolButton()
+        cu_btn.setText("👤 客户端用户")
+        cu_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        cu_btn.setStyleSheet(
+            "QToolButton { border: 2px solid #00ff00; border-radius: 4px; padding: 2px 8px; }"
+            "QToolButton:hover { background-color: rgba(0,255,0,0.15); }"
+            "QToolButton:pressed { background-color: rgba(0,255,0,0.25); }"
+        )
+        cu_btn.clicked.connect(self._open_client_user)
+        tb.addWidget(cu_btn)
         self.addToolBar(tb)
 
     def _build_shortcuts(self) -> None:

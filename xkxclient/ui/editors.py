@@ -1686,7 +1686,10 @@ class StepDialog(QDialog):
         if t == "jump":
             return f"含「{k}」→ 跳转: {a.get('target', '')}"
         if t == "set":
-            return f"含「{k}」→ 赋值: {a.get('var', '')}={a.get('value', '')}"
+            desc = f"含「{k}」→ 赋值: {a.get('var', '')}={a.get('value', '')}"
+            if a.get("target"):
+                desc += f" → 跳转: {a.get('target')}"
+            return desc
         return f"含「{k}」→ (无动作)"
 
     def _br_kw_dlg(self, kw: dict | None = None) -> dict | None:
@@ -1701,12 +1704,13 @@ class StepDialog(QDialog):
         tgt_cb = QComboBox()
         for val, lab in self._target_options():
             tgt_cb.addItem(lab, val)
-        set_ed = QLineEdit(); set_ed.setPlaceholderText("{变量}=值")
+        set_ed = QLineEdit(); set_ed.setPlaceholderText("{变量}=值（可含 {变量}）")
         form = QFormLayout()
         form.addRow("关键字", kw_ed)
         form.addRow("动作类型", act_type)
         form.addRow("命令", cmd_ed)
-        form.addRow("跳转到", tgt_cb)
+        tgt_label = QLabel("跳转到")
+        form.addRow(tgt_label, tgt_cb)
         form.addRow("赋值", set_ed)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
         box.accepted.connect(dlg.accept)
@@ -1716,8 +1720,9 @@ class StepDialog(QDialog):
         def sync(idx: int) -> None:
             t = act_type.itemData(idx)
             cmd_ed.setVisible(t == "cmd")
-            tgt_cb.setVisible(t == "jump")
+            tgt_cb.setVisible(t == "jump" or t == "set")
             set_ed.setVisible(t == "set")
+            tgt_label.setVisible(t == "jump" or t == "set")
 
         act_type.currentIndexChanged.connect(sync)
         if kw:
@@ -1746,6 +1751,8 @@ class StepDialog(QDialog):
             else:
                 var, val = txt, ""
             action = {"type": "set", "var": var.strip(), "value": val.strip()}
+            if tgt_cb.currentData():
+                action["target"] = tgt_cb.currentData()
         else:
             action = {}
         return {"keyword": k, "action": action}
