@@ -262,12 +262,18 @@ class UpdateManager(QObject):
             reply.deleteLater()
 
     def _prompt_update(self, data: dict) -> None:
+        """非阻塞更新提示：避免在 QNetworkReply 信号槽栈内 exec() 嵌套事件循环
+        （Qt6 下用户点击按钮时可能触发 0xc0000409 崩溃）。改为 show() + finished 信号。
+        """
         new_ver = str(data.get("version", ""))
         from PyQt6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
                                      QScrollArea, QVBoxLayout, QWidget)
         dlg = QDialog()
         dlg.setWindowTitle("发现新版本")
         dlg.setMinimumSize(480, 360)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # 非阻塞 show() 后必须持有引用，否则 Python GC 会销毁对话框
+        self._update_dlg = dlg
         lay = QVBoxLayout(dlg)
         top = QLabel(f"<b>EasyBXb 有新版本可用：v{VERSION} → v{new_ver}</b>")
         top.setWordWrap(True)
@@ -291,17 +297,22 @@ class UpdateManager(QObject):
             lay.addWidget(scroll, 1)
 
         box = QDialogButtonBox()
-        upd = box.addButton("立即更新", QDialogButtonBox.ButtonRole.AcceptRole)
+        box.addButton("立即更新", QDialogButtonBox.ButtonRole.AcceptRole)
         box.addButton("稍后", QDialogButtonBox.ButtonRole.RejectRole)
         box.accepted.connect(dlg.accept)
         box.rejected.connect(dlg.reject)
         lay.addWidget(box)
-        dlg.exec()
-        if box.clickedButton() is upd:
-            _log("user chose: update now")
-            self._start_download(data)
-        else:
-            _log("user chose: later")
+
+        def on_finished(result: int) -> None:
+            from PyQt6.QtWidgets import QDialog as _D
+            if result == _D.DialogCode.Accepted:
+                _log("user chose: update now")
+                self._start_download(data)
+            else:
+                _log("user chose: later")
+
+        dlg.finished.connect(on_finished)
+        dlg.show()
 
     # ---- 下载 ----
     def _start_download(self, data: dict) -> None:
@@ -394,6 +405,9 @@ class UpdateManager(QObject):
 
     # ---- 应用更新 ----
     def _prompt_apply(self) -> None:
+        """非阻塞「准备更新」确认：同样避免在 QNetworkReply 信号槽栈内 exec()。"""
+        from PyQt6.QtWidgets import QMessageBox
+
         box = QMessageBox()
         box.setIcon(QMessageBox.Icon.Information)
         box.setWindowTitle("准备更新")
@@ -402,11 +416,20 @@ class UpdateManager(QObject):
         ok = box.addButton("开始更新", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(ok)
-        box.exec()
-        if box.clickedButton() is not ok:
-            _log("user cancelled apply")
-            return
-        self._launch_and_quit()
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # 非阻塞 show() 后必须持有引用，否则 Python GC 会销毁对话框
+        self._apply_box = box
+
+        def on_finished(result: int) -> None:
+            from PyQt6.QtWidgets import QDialog as _D
+            if result == _D.DialogCode.Accepted:
+                _log("user chose: apply")
+                self._launch_and_quit()
+            else:
+                _log("user cancelled apply")
+
+        box.finished.connect(on_finished)
+        box.show()
 
     def _launch_and_quit(self) -> None:
         if not self._new_path:
