@@ -420,9 +420,10 @@ class UpdateManager(QObject):
         # 非阻塞 show() 后必须持有引用，否则 Python GC 会销毁对话框
         self._apply_box = box
 
-        def on_finished(result: int) -> None:
-            from PyQt6.QtWidgets import QDialog as _D
-            if result == _D.DialogCode.Accepted:
+        def on_finished(_result: int) -> None:
+            # 注意：QMessageBox 自定义按钮的 finished 返回值不是标准 DialogCode
+            # （AcceptRole 按钮返回 2），不能用 DialogCode.Accepted 判断，须比较按钮对象。
+            if box.clickedButton() is ok:
                 _log("user chose: apply")
                 self._launch_and_quit()
             else:
