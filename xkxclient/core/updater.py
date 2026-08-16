@@ -23,7 +23,13 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QObject, QUrl
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
-from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+from PyQt6.QtWidgets import (
+    QDialog,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QVBoxLayout,
+)
 
 from xkxclient.version import VERSION, UPDATE_DOWNLOAD_URL, UPDATE_MANIFEST_URL, is_newer
 
@@ -209,12 +215,11 @@ class UpdateManager(QObject):
         self.nam = QNetworkAccessManager(self)
         self.nam.finished.connect(self._on_reply)
         self._download_reply: QNetworkReply | None = None
-        self._progress: QProgressDialog | None = None
+        self._progress_bar: QProgressBar | None = None
         self._manifest: dict = {}
         self._update_dir: Path | None = None
         self._new_path: Path | None = None
         self._manual = False
-        self._cancelled = False
         # 下载使用独立 NAM：manifest 处理器绑定在本 NAM 的 finished 上，
         # 若共用会把 exe 下载完成信号也当 manifest 处理，readAll 读走数据导致写空文件。
         self._dl_nam = QNetworkAccessManager(self)
@@ -327,16 +332,21 @@ class UpdateManager(QObject):
         except OSError:
             pass
 
-        # 不用取消按钮（cancelButtonText=""）：QProgressDialog 的取消按钮在
-        # 进度到 100% 时可能触发 canceled 信号，被误判为用户取消而跳过更新。
-        # 下载完成后由 _on_download_done 手动关闭进度条。
-        self._progress = QProgressDialog("正在下载新版本…", "", 0, 100)
-        self._progress.setWindowTitle("更新 EasyBXb")
-        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._progress.setMinimumDuration(300)
-        self._progress.setAutoClose(False)
-        self._progress.setAutoReset(False)
-        self._progress.canceled.connect(self._cancel_download)
+        # 自建进度对话框（不用 QProgressDialog）：其在真实 Windows 桌面上
+        # setValue 到 100% 时仍会触发 canceled 信号（与文档不符），被误判为
+        # 用户取消而跳过更新。自建 QDialog+QProgressBar 无任何 canceled 信号，
+        # 从根上消除该问题。
+        dlg = QDialog()
+        dlg.setWindowTitle("更新 EasyBXb")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumWidth(320)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("正在下载新版本…"))
+        self._progress_bar = QProgressBar(dlg)
+        self._progress_bar.setRange(0, 100)
+        lay.addWidget(self._progress_bar)
+        self._progress = dlg
+        dlg.show()
 
         req = QNetworkRequest(QUrl(url))
         req.setTransferTimeout(120_000)
@@ -345,21 +355,10 @@ class UpdateManager(QObject):
         self._download_reply = reply
         reply.finished.connect(self._on_download_done)
 
-    def _cancel_download(self) -> None:
-        # 若下载已完成（finished 已发出），canceled 信号通常是进度条到 100%
-        # 的副作用，不应视为用户取消。
-        if self._download_reply is not None and self._download_reply.isFinished():
-            _log("cancel ignored: download already finished")
-            return
-        _log("download cancelled by user")
-        self._cancelled = True
-        if self._download_reply is not None:
-            self._download_reply.abort()
-
     def _on_progress(self, done: int, total: int) -> None:
-        if total > 0 and self._progress is not None:
-            self._progress.setMaximum(total)
-            self._progress.setValue(done)
+        if total > 0 and self._progress_bar is not None:
+            self._progress_bar.setMaximum(total)
+            self._progress_bar.setValue(done)
         _log(f"progress: {done}/{total}")
 
     def _on_download_done(self) -> None:
@@ -368,13 +367,11 @@ class UpdateManager(QObject):
         if self._progress is not None:
             self._progress.close()
             self._progress = None
+        self._progress_bar = None
         if reply is None:
             _log("download done: reply is None")
             return
         try:
-            if self._cancelled:
-                _log("download was cancelled, skip")
-                return
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 _log(f"download error: {reply.error()}")
                 QMessageBox.warning(None, "更新失败", "下载新版本失败，请稍后重试。")
