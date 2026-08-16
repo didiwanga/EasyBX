@@ -21,7 +21,7 @@ from xkxclient.ui.lookdock import LookDock
 from xkxclient.ui.mapdock import MapDock
 from xkxclient.ui.navdock import NavDock
 from xkxclient.ui.notepaddock import NotepadDock
-from xkxclient.ui.settings import CloseBehaviorDialog, EnvSettingsDialog, ShortcutDialog
+from xkxclient.ui.settings import EnvSettingsDialog, SettingsDialog
 from xkxclient.ui.skillsdock import SkillsDock
 from xkxclient.ui.statusdock import StateDock
 from xkxclient.ui.statusbar import StatusBar
@@ -85,20 +85,31 @@ class MainWindow(QMainWindow):
         self.nav_dock = self._make_dock("导航目的地", NavDock(None))
         self.look_dock = self._make_dock("房间详情", LookDock(None))
         self.notepad_dock = self._make_dock("记事本", NotepadDock(None))
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.skills_dock)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.state_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.commands_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dsl_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.quick_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.move_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.macro_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.recorder_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.combat_dock)
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.xiuxian_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.map_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.nav_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.look_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.notepad_dock)
+# dock 布局（默认）：左=房间详情(上1/3)+[导航/战斗/修炼](下2/3)，
+        # 右=上[快捷/宏控制/宏录制] 中[状态/技能/记事本] 下[移动控制]；
+        # 命令速查/DSL手册/地图 默认隐藏（菜单打开时悬浮）。
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.look_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.nav_dock)
+        self.splitDockWidget(self.look_dock, self.nav_dock, Qt.Orientation.Vertical)
+        self.tabifyDockWidget(self.nav_dock, self.combat_dock)
+        self.tabifyDockWidget(self.combat_dock, self.xiuxian_dock)
+        self.nav_dock.raise_()
+
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.quick_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.state_dock)
+        self.splitDockWidget(self.quick_dock, self.state_dock, Qt.Orientation.Vertical)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.move_dock)
+        self.splitDockWidget(self.state_dock, self.move_dock, Qt.Orientation.Vertical)
+        self.tabifyDockWidget(self.quick_dock, self.macro_dock)
+        self.tabifyDockWidget(self.macro_dock, self.recorder_dock)
+        self.tabifyDockWidget(self.state_dock, self.skills_dock)
+        self.tabifyDockWidget(self.skills_dock, self.notepad_dock)
+        self.quick_dock.raise_()
+        self.state_dock.raise_()
+
+        self.commands_dock.hide()
+        self.dsl_dock.hide()
+        self.map_dock.hide()
 
         self._cur_tab: AccountTab | None = None
         self._docks_restored = False
@@ -155,85 +166,78 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self) -> None:
         bar = self.menuBar()
-        fm = bar.addMenu("文件")
-        fm.addAction("新建连接…", self._new_connection)
-        fm.addAction("断开当前标签", self._disconnect_current)
-        fm.addAction("重新连接", self._reconnect_current)
+        fm = bar.addMenu("📡 服务器")
+        fm.addAction("🆕 新建标签", self._new_connection)
+        fm.addAction("⏻ 断开并关闭当前标签", self._disconnect_current)
         fm.addSeparator()
-        fm.addAction("关闭行为…", lambda: CloseBehaviorDialog(self).exec())
+        fm.addAction("⚙️ 设置", lambda: SettingsDialog(self).exec())
+        fm.addAction("🎮 游戏账号管理", self._manage_accounts)
         fm.addSeparator()
-        fm.addAction("退出", self.close)
+        fm.addAction("🚪 退出", self.close)
 
-        em = bar.addMenu("编辑")
-        em.addAction("查找…", self._show_find)
-        em.addAction("字体设置…", self._open_font)
-        em.addAction("清屏", self._clean_screen)
-        em.addAction("清空历史", self._clear_output)
+        em = bar.addMenu("📝 编辑")
+        em.addAction("🔍 查找", self._show_find)
+        em.addAction("🛡 屏显屏蔽", self._open_screen_block)
+        em.addSeparator()
+        em.addAction("🧹 清屏", self._clean_screen)
+        em.addAction("🗑 清空历史", self._clear_output)
+        em.addSeparator()
+        em.addAction("⛶ 全屏", self._toggle_fullscreen)
 
-        vm = bar.addMenu("查看")
-        vm.addAction("触发器…", lambda: self._open_editor("trigger"))
-        vm.addAction("别名…", lambda: self._open_editor("alias"))
-        vm.addAction("定时器…", lambda: self._open_editor("timer"))
-        vm.addAction("宏…", lambda: self._open_editor("macro"))
-        vm.addAction("节点图宏…", self._open_node_editor)
-        vm.addAction("脚本…", lambda: self._open_editor("script"))
-        vm.addAction("屏显屏蔽…", self._open_screen_block)
-        vm.addSeparator()
-        vm.addAction("命令速查", self._toggle_dock(self.commands_dock))
-        vm.addAction("DSL 手册", self._toggle_dock(self.dsl_dock))
-        vm.addAction("技能面板", self._toggle_dock(self.skills_dock))
-        vm.addAction("状态", self._toggle_dock(self.state_dock))
-        vm.addAction("快捷动作", self._toggle_dock(self.quick_dock))
-        vm.addAction("移动控制", self._toggle_dock(self.move_dock))
-        vm.addAction("宏控制", self._toggle_dock(self.macro_dock))
-        vm.addAction("宏录制", self._toggle_dock(self.recorder_dock))
-        vm.addAction("自动战斗", self._toggle_dock(self.combat_dock))
-        vm.addAction("辅助修炼", self._toggle_dock(self.xiuxian_dock))
-        vm.addAction("地图", self._toggle_dock(self.map_dock))
-        vm.addAction("导航目的地", self._toggle_dock(self.nav_dock))
-        vm.addAction("房间详情", self._toggle_dock(self.look_dock))
-        vm.addAction("记事本", self._toggle_dock(self.notepad_dock))
-        vm.addSeparator()
-        tm_themes = vm.addMenu("🎨 主题")
+        vm = bar.addMenu("⚙️ 自动化")
+        vm.addAction("🎬 宏", lambda: self._open_editor("macro"))
+        vm.addAction("📋 触发器", lambda: self._open_editor("trigger"))
+        vm.addAction("🔗 别名", lambda: self._open_editor("alias"))
+        vm.addAction("⏱ 定时器", lambda: self._open_editor("timer"))
+        vm.addAction("🧩 节点图宏", self._open_node_editor)
+        vm.addAction("📜 Lua 脚本", lambda: self._open_editor("script"))
+        vm.addAction("🪣 自动拾取", self._open_auto_pickup)
+
+        pm = bar.addMenu("🧩 功能面板")
+        pm.addAction("📊 状态", self._toggle_dock(self.state_dock))
+        pm.addAction("⚔️ 技能面板", self._toggle_dock(self.skills_dock))
+        pm.addAction("⚡ 快捷动作", self._toggle_dock(self.quick_dock))
+        pm.addAction("🕹 移动控制", self._toggle_dock(self.move_dock))
+        pm.addAction("▶️ 宏控制", self._toggle_dock(self.macro_dock))
+        pm.addAction("🧭 导航目的地", self._toggle_dock(self.nav_dock))
+        pm.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
+        pm.addAction("⏺ 宏录制", self._toggle_dock(self.recorder_dock))
+        pm.addAction("🥊 自动战斗", self._toggle_dock(self.combat_dock))
+        pm.addAction("🧘 辅助修炼", self._toggle_dock(self.xiuxian_dock))
+        pm.addAction("🏠 房间详情", self._toggle_dock(self.look_dock))
+        pm.addAction("📖 命令速查", self._toggle_float_dock(self.commands_dock))
+        pm.addAction("📚 DSL 手册", self._toggle_float_dock(self.dsl_dock))
+        pm.addAction("🗺 世界地图", self._open_world_map)
+        pm.addSeparator()
+        pm.addAction("🔄 重置面板布局", self._reset_layout)
+
+        tm = bar.addMenu("🛠️ 便捷工具")
+        tm.addAction("🔲 fullme 2×2（开 4 次）", self._full_me_4)
+        tm.addAction("🌐 服务器环境变量", self._open_env_settings)
+
+        um = bar.addMenu("👤 客户端功能")
+        um.addAction("👤 客户端用户", self._open_client_user)
+        um.addAction("📤 宏分享", self._open_macro_share)
+        um.addSeparator()
+        tm_themes = um.addMenu("🎨 风格设置")
         self._theme_actions: dict[str, QAction] = {}
         theme_group = QActionGroup(self)
         theme_group.setExclusive(True)
         current = cfg.ConfigManager.instance().get("theme", "night")
         for key, pal in PALETTES.items():
-            act = QAction(f"{pal.get('name', key)}", self)
+            act = QAction(f"🎨 {pal.get('name', key)}", self)
             act.setCheckable(True)
             act.setChecked(key == current)
             act.triggered.connect(lambda _=False, k=key: self._set_theme(k))
             theme_group.addAction(act)
             self._theme_actions[key] = act
             tm_themes.addAction(act)
-        vm.addSeparator()
-        vm.addAction("重置窗口布局", self._reset_layout)
-        vm.addAction("世界地图", self._open_world_map)
-        vm.addAction("全屏", self._toggle_fullscreen)
 
-        tm = bar.addMenu("工具")
-        tm.addAction("编码…", self._open_encoding)
-        tm.addAction("fullme 2×2（开 4 次）", self._full_me_4)
-        tm.addAction("自动拾取…", self._open_auto_pickup)
-        tm.addAction("服务器环境变量…", self._open_env_settings)
-        tm.addAction("快捷键设置…", lambda: ShortcutDialog(self).exec())
-        tm.addAction("宏分享…", self._open_macro_share)
-
-        am = bar.addMenu("账号")
-        am.addAction("新建标签…", self._new_connection)
-        am.addAction("关闭当前标签", self._close_current)
-        am.addSeparator()
-        am.addAction("客户端用户…", self._open_client_user)
-        am.addAction("编辑账户信息…", self._manage_accounts)
-
-        sm = bar.addMenu("脚本")
-        sm.addAction("Lua 脚本…", lambda: self._open_editor("script"))
-
-        hm = bar.addMenu("帮助")
-        hm.addAction("检查更新…", self._check_update_now)
-        hm.addAction("关于", self._about)
-        hm.addAction("Lua 脚本手册", self._open_manual)
+        hm = bar.addMenu("❓ 帮助")
+        hm.addAction("🔄 检查更新", self._check_update_now)
+        hm.addAction("📜 Lua 脚本手册", self._open_manual)
+        hm.addSeparator()
+        hm.addAction("ℹ️ 关于", self._about)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("自动化", self)
@@ -304,7 +308,6 @@ class MainWindow(QMainWindow):
             "next_tab": self._next_tab,
             "prev_tab": self._prev_tab,
             "find_next": self._find_next,
-            "local_map": self._toggle_dock(self.map_dock),
         }
         for key, cb in actions.items():
             sc.register(key, cb)
@@ -657,6 +660,20 @@ class MainWindow(QMainWindow):
 
         return toggle
 
+    def _toggle_float_dock(self, dock: QDockWidget):
+        """命令速查 / DSL 手册：默认隐藏，菜单打开时以悬浮 Dock 弹出。"""
+
+        def toggle():
+            if dock.isVisible():
+                dock.close()
+            else:
+                dock.setFloating(True)
+                dock.show()
+                dock.raise_()
+                self._flash_dock(dock, 2)
+
+        return toggle
+
     def _raise_dock(self, dock: QDockWidget) -> None:
         """把 dock 提到所在组合（tab 化）的前台，并闪烁 2-3 次提示位置。"""
         dock.raise_()
@@ -718,7 +735,7 @@ class MainWindow(QMainWindow):
     # ---- 布局持久化 ----
     # 默认启动布局：以用户当前 dock 布局固化（8 方向各 dock 位置/尺寸）。
     _DEFAULT_LAYOUT = (
-        "000000ff00000000fd0000000200000000000001440000038dfc0200000001fc000000420000038d000002b201000019fa000000000100000005fb000000140064006f0063006b005f5bfc822a76ee768457300100000000ffffffff0000014400fffffffb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff000000f000fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff000000e600fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff0000014400fffffffb0000000e0064006f0063006b005f573056fe0100000000ffffffff000000f000ffffff00000001000001220000038dfc0200000003fc0000004200000138000000c301000019fa000000010100000004fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000007800fffffffb000000100064006f0063006b005f5b8f63a7523601000000ffffffff0000010600fffffffb000000120064006f0063006b005f547d4ee4901f67e501000003fc000001040000004f00fffffffb000000160064006f0063006b005f00440053004c0020624b518c0100000000ffffffff0000004f00fffffffc0000017e00000164000000d801000019fa000000000100000003fb0000000e0064006f0063006b005f72b6600101000005a500000106000000dc00fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff000000c800fffffffb000000120064006f0063006b005f623f95f48be660c50100000000ffffffff000000dc00fffffffb000000120064006f0063006b005f79fb52a863a7523601000002e6000000e9000000c100ffffff0000043d0000038d00000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
+        "000000ff00000000fd0000000200000000000001b200000330fc0200000002fb000000120064006f0063006b005f623f95f48be660c50100000030000000b0000000b000fffffffc000000e60000027a0000027a01000017fa000000000200000003fb000000140064006f0063006b005f5bfc822a76ee768457300100000000ffffffff0000019400fffffffb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff0000026200fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff0000005600ffffff000000010000017200000330fc0200000003fc0000003000000136000000d801000017fa000000000200000003fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000008800fffffffb000000100064006f0063006b005f5b8f63a752360100000000ffffffff0000009c00fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff000000c000fffffffc0000016c00000139000000a201000017fa000000000200000003fb0000000e0064006f0063006b005f72b660010100000000ffffffff0000005600fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff0000008a00fffffffb000000100064006f0063006b005f8bb04e8b672c0100000000ffffffff0000007800fffffffb000000120064006f0063006b005f79fb52a863a7523601000002ab000000b5000000b000ffffff000001d00000033000000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
     )
 
     def _restore_layout(self) -> None:
@@ -829,12 +846,17 @@ class MainWindow(QMainWindow):
         cfg.ConfigManager.instance().set("layout_state", bytes(state).hex())
 
     def _reset_layout(self) -> None:
-        """重置所有窗口布局为客户端默认布局：清除已存布局并恢复默认。"""
+        """重置所有窗口布局为客户端默认布局：清除已存布局并恢复默认，立即刷新显示。"""
         cfg.ConfigManager.instance().set("layout_state", "")
         try:
             self.restoreState(bytes.fromhex(self._DEFAULT_LAYOUT))
         except (ValueError, TypeError):
             pass
+        # 默认布局中隐藏的 dock 强制保持隐藏，避免重置后残留可见
+        for d in (self.commands_dock, self.dsl_dock, self.map_dock):
+            d.hide()
+        self._layout_healed = False
+        QTimer.singleShot(0, self._relayout)
         self.status.showMessage("窗口布局已重置为默认", 3000)
 
     def closeEvent(self, event) -> None:

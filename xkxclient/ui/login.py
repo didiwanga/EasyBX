@@ -30,7 +30,7 @@ class ServerDialog(QDialog):
         self.host_ed = QLineEdit()
         self.port_ed = QLineEdit()
         self.enc_cb = QComboBox()
-        self.enc_cb.addItems(["gbk", "utf-8", "big5"])
+        self.enc_cb.addItems(["gbk", "utf-8"])
         if server:
             self.name_ed.setText(server.get("name", ""))
             self.host_ed.setText(server.get("host", ""))
@@ -213,7 +213,7 @@ class LoginWindow(QDialog):
         srv_row.addWidget(self.del_srv)
 
         self.enc_cb = QComboBox()
-        self.enc_cb.addItems(["gbk", "utf-8", "big5"])
+        self.enc_cb.addItems(["gbk", "utf-8"])
         self.server_combo.currentIndexChanged.connect(self._on_server_changed)
         self._on_server_changed()
 

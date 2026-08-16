@@ -123,10 +123,13 @@ class NavDock(QWidget):
         self.desc_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._capturing = False
         self._seen_header = False
+        self._after_node = None
+        self._walk_capturing = False
+        self._walk_seen_header = False
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
-        self._idle_timer.setInterval(3000)
-        self._idle_timer.timeout.connect(lambda: self._fetch_node_list(auto=True))
+        self._idle_timer.setInterval(2000)
+        self._idle_timer.timeout.connect(self._idle_refresh)
         self._cap_timer = QTimer(self)
         self._cap_timer.setSingleShot(True)
         self._cap_timer.setInterval(20000)
@@ -187,6 +190,36 @@ class NavDock(QWidget):
         dlay.addWidget(self.dest_list, 1)
         dlay.addLayout(dest_btns)
 
+        # ---- walk 内建路径表（服务器 walk 命令返回，双击=walk <拼音>）----
+        self.walk_ed = QLineEdit()
+        self.walk_ed.setPlaceholderText("walk 拼音名，回车=walk <拼音名>")
+        self.walk_go_btn = QPushButton("刷新")
+        self.walk_go_btn.clicked.connect(self._fetch_walk_list)
+        self.walk_ed.returnPressed.connect(self._send_walk_cmd)
+
+        self.walk_list = QTreeWidget()
+        self.walk_list.setColumnCount(3)
+        self.walk_list.setHeaderLabels(["目的地", "拼音", "步数"])
+        self.walk_list.setRootIsDecorated(False)
+        self.walk_list.setAlternatingRowColors(True)
+        walk_header = self.walk_list.header()
+        if isinstance(walk_header, QHeaderView):
+            walk_header.setStretchLastSection(True)
+        self.walk_list.itemDoubleClicked.connect(lambda item, _c: self._send_walk_cmd(item))
+
+        walk_top = QHBoxLayout()
+        walk_top.addWidget(self.walk_ed, 1)
+        walk_top.addWidget(self.walk_go_btn)
+
+        walk_frame = QFrame()
+        walk_frame.setObjectName("navDestFrame")
+        walk_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        wlay = QVBoxLayout(walk_frame)
+        wlay.setContentsMargins(6, 4, 6, 4)
+        wlay.addWidget(QLabel("内建路径（walk 命令返回，点击=walk 过去）"))
+        wlay.addLayout(walk_top)
+        wlay.addWidget(self.walk_list, 1)
+
         # ---- walk 状态 ----
         self.status = QLabel("待命中")
 
@@ -195,6 +228,7 @@ class NavDock(QWidget):
         lay.setSpacing(6)
         lay.addWidget(self.node_frame)
         lay.addWidget(dest_frame, 1)
+        lay.addWidget(walk_frame, 1)
         lay.addWidget(self.status)
         lay.addStretch(0)
 
@@ -362,19 +396,21 @@ class NavDock(QWidget):
     _NODE_NAME_RE = re.compile(r"^\s*[★☆]?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*$")
     _NODE_ROW_RE = re.compile(r"^\s*[│|]?\s*[★☆]?\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[│|]")
 
-    def _fetch_node_list(self, auto: bool = False) -> None:
+    def _fetch_node_list(self, auto: bool = False, follow: str | None = None) -> None:
         """发送 `node` 开始捕获玩家路径表格（session 拦截表格行不上主输出）。
 
         auto=True（移动静止定时器触发）时：若用户正在交互（命令输入框聚焦、
         行走中、宏运行）则跳过本次刷新，避免静默命令打断用户操作；手动点
-        刷新按钮不受限。
+        刷新按钮不受限。follow="walk" 表示 node 捕获结束后自动接 walk 刷新
+        （空闲联动两表一起更新）。
         """
         if self.session is None or not getattr(self.session, "logged_in", False):
             return
         if auto and self._user_busy():
             return
-        if self._capturing:
+        if self._capturing or self._walk_capturing:
             return
+        self._after_node = "walk" if follow == "walk" else None
         self._capturing = True
         self._seen_header = False
         self._node_rows: list[tuple[str, str]] = []
@@ -402,22 +438,46 @@ class NavDock(QWidget):
 
     def _capture_timeout(self) -> None:
         """捕获超时兜底：结束捕获，避免卡在捕获态；同时通知会话停止吞行。"""
+        s = self.session
         if self._capturing:
             self._capturing = False
             self._seen_header = False
             self._cap_timer.stop()
-            s = self.session
             if s is not None:
                 s.abort_node_capture()
             self.status.setText(f"node 读取超时（已获 {len(self._node_rows)} 条）")
+            self._run_node_follow()
+        elif self._walk_capturing:
+            self._walk_capturing = False
+            self._walk_seen_header = False
+            self._cap_timer.stop()
+            if s is not None:
+                s.abort_walk_capture()
+            self.status.setText(f"walk 读取超时（已获 {len(self._walk_rows)} 条）")
+
+    def _idle_refresh(self) -> None:
+        """移动静止定时刷新：先 node，捕获结束后自动接 walk，两表一起更新。"""
+        self._fetch_node_list(auto=True, follow="walk")
+
+    def _run_node_follow(self) -> None:
+        """node 捕获结束后的联动刷新（空闲时自动接 walk）。"""
+        if self._after_node != "walk":
+            self._after_node = None
+            return
+        self._after_node = None
+        if not self._walk_capturing and self.session is not None \
+                and getattr(self.session, "logged_in", False):
+            self._fetch_walk_list()
 
     def _on_text(self, payload: dict) -> None:
-        if not self._capturing:
-            return
         acc = payload.get("account")
         if acc is not None and self._account is not None and acc != self._account:
             return
-        self._feed_node_line(str(payload.get("line") or ""))
+        line = str(payload.get("line") or "")
+        if self._capturing:
+            self._feed_node_line(line)
+        if self._walk_capturing:
+            self._feed_walk_line(line)
 
     def _feed_node_line(self, line: str) -> None:
         """解析 node 表格行（如 `│★ cj_yz  │扬州的中央广场  │...│`）。
@@ -440,6 +500,7 @@ class NavDock(QWidget):
             self._seen_header = False
             self._cap_timer.stop()
             self.status.setText("当前房间没有玩家定义的路径")
+            self._run_node_follow()
             return
         if self._seen_header is False:
             # 表头行或数据行兜底：表头页丢失（分页交互吞掉）时，首列
@@ -456,6 +517,7 @@ class NavDock(QWidget):
             self._seen_header = False
             self._cap_timer.stop()
             self.status.setText(f"node 路径 {len(self._node_rows)} 条")
+            self._run_node_follow()
             return
         if not has_box:
             return
@@ -498,3 +560,90 @@ class NavDock(QWidget):
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.stop()
         self.stop_btn.setEnabled(False)
+
+    # ---- 内建路径：服务器 walk 命令列表 ----
+    _WALK_ROW_RE = re.compile(r"^\s*[│|]\s*[^│]+\s*[│|]")
+
+    def _fetch_walk_list(self) -> None:
+        """发送 `walk` 开始捕获内建路径表（session 拦截表格行不上主输出）。"""
+        if self.session is None or not getattr(self.session, "logged_in", False):
+            return
+        if self._walk_capturing or self._capturing:
+            return
+        self._walk_capturing = True
+        self._walk_seen_header = False
+        self._walk_rows: list[tuple[str, str, str]] = []
+        self.walk_list.clear()
+        self.status.setText("正在读取 walk 列表…")
+        self._cap_timer.start()
+        self.session.request_walk()
+
+    def _feed_walk_line(self, line: str) -> None:
+        """解析 walk 表格行（`│目的地  │拼音  │步数  │`）。
+
+        捕获起点：表头含「目的地/拼音/步数」或顶框线；表尾 `└─…─┘` 结束。
+        说明行（walk 命令用法）不含竖线，忽略不上表。
+        """
+        if not line.strip():
+            return
+        has_vbar = "│" in line
+        if "未完继续" in line and "%" in line:
+            self._cap_timer.start()
+            return
+        if "没有内建路径" in line or "没有内建" in line:
+            self._walk_capturing = False
+            self._walk_seen_header = False
+            self._cap_timer.stop()
+            self.status.setText("当前房间没有内建路径")
+            return
+        if self._walk_seen_header is False:
+            if has_vbar and "目的地" in line and "拼音" in line:
+                self._walk_seen_header = True
+                return
+            elif line.startswith("┌") and "─" in line:
+                self._walk_seen_header = True
+                return
+            else:
+                return
+        if "└" in line and "─" in line:
+            self._walk_capturing = False
+            self._walk_seen_header = False
+            self._cap_timer.stop()
+            self.status.setText(f"walk 路径 {len(self._walk_rows)} 条")
+            return
+        if not has_vbar:
+            return
+        # 表头行（含「目的地/拼音/步数」列名）跳过，不当作数据
+        if "目的地" in line and "拼音" in line and "步数" in line:
+            return
+        parts = [p for p in line.split("│") if p.strip()]
+        if len(parts) < 3:
+            return
+        dest = parts[0].strip()
+        pinyin = parts[1].strip()
+        steps = parts[2].strip()
+        if not dest or not pinyin:
+            return
+        self._walk_rows.append((dest, pinyin, steps))
+        item = QTreeWidgetItem([dest, pinyin, steps])
+        self.walk_list.addTopLevelItem(item)
+        self._cap_timer.start()  # 分页活动期续命
+
+    def _send_walk_cmd(self, item=None) -> None:
+        """发送 `walk <拼音名>`：优先双击 item 列1（拼音），否则输入框文本。"""
+        if self.session is None:
+            return
+        target = ""
+        if item is not None:
+            target = item.text(1)
+        if not target:
+            items = self.walk_list.selectedItems()
+            if items:
+                target = items[0].text(1)
+        if not target:
+            target = self.walk_ed.text().strip()
+        if not target:
+            return
+        self.session.send(f"walk {target}")
+        self.status.setText(f"→ walk {target}")
+        self.stop_btn.setEnabled(True)

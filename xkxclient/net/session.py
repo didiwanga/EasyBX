@@ -132,6 +132,10 @@ class AccountSession(QObject):
         self._node_capture = False
         self._node_capture_start = 0.0
         self._node_in_table = False
+        # walk 命令捕获：目的地/拼音/步数表格，拦截方式同 node
+        self._walk_capture = False
+        self._walk_capture_start = 0.0
+        self._walk_in_table = False
         # 分页自动继续（持续看门狗，见 _NODE_PAGE_GAP）
         self._node_page_lines = 0      # 表内累计行数（数据行+分隔线）
         self._node_page_sent = False   # 当前页是否已发过自动翻页
@@ -215,6 +219,8 @@ class AccountSession(QObject):
         self.logged_in = False
         self._node_capture = False
         self._node_in_table = False
+        self._walk_capture = False
+        self._walk_in_table = False
         self._node_page_stop()
         self._pager_close()
         self._macro_captcha_active = False
@@ -269,13 +275,16 @@ class AccountSession(QObject):
             return
         self._track_pending(text)
         from xkxclient.core.specialcmd import build_items, is_special
-        expanded = self.aliases.expand(text)
-        if expanded:
-            pieces = [piece for cmd in expanded.split("\n")
-                      for piece in cmd.split(";")]
-        else:
-            pieces = text.split(";")
-        pieces = [p.strip() for p in pieces if p.strip()]
+        # 逐段（; 分隔）展开别名：支持 `a1;a2` 一次执行多个别名
+        raw = [p.strip() for p in text.split(";") if p.strip()]
+        pieces: list[str] = []
+        for p in raw:
+            expanded = self.aliases.expand(p)
+            if expanded:
+                pieces.extend(c for cmd in expanded.split("\n")
+                              for c in cmd.split(";") if c.strip())
+            else:
+                pieces.append(p)
         if any(is_special(p) for p in pieces):
             # 含 #wa / #N cmd：走节流队列（支持延时/重复，保持顺序），
             # 保证交互命令与自动化命令一致的时序语义。
@@ -342,6 +351,8 @@ class AccountSession(QObject):
             return True
         if self._consume_node_line(text):
             return True
+        if self._consume_walk_line(text):
+            return True
         if self._consume_skills_line(text):
             return True
         if self._pager_pending:
@@ -359,7 +370,8 @@ class AccountSession(QObject):
         空指令跳页；但保留看门狗继续运行——补发万一被服务器吞掉、下一页内容
         始终不来时，看门狗会再次补发。
         """
-        if self._node_capture and self._node_in_table:
+        if (self._node_capture and self._node_in_table) or \
+           (self._walk_capture and self._walk_in_table):
             self._node_page_touch()
             if self._node_page_sent:
                 # 看门狗/提示行已补发过本章节，迟到的提示行只吞不发
@@ -478,7 +490,9 @@ class AccountSession(QObject):
         吞），静默补发空指令翻页。补发后仍无进展则按 _NODE_PAGE_RETRY_MAX
         重试，超过上限静默放弃，交给 navdock 捕获超时收尾。
         """
-        if not (self._node_capture and self._node_in_table):
+        if not (self._node_capture or self._walk_capture):
+            return
+        if not (self._node_in_table or self._walk_in_table):
             return
         now = time.monotonic()
         if now - self._node_page_last_active < _NODE_PAGE_GAP:
@@ -501,6 +515,78 @@ class AccountSession(QObject):
             return
         self._node_capture = False
         self._node_in_table = False
+        self._node_page_stop()
+
+# ---- walk 命令捕获（内建路径表：目的地/拼音/步数，dock 调用）----
+    def request_walk(self) -> None:
+        """发送 `walk -c` 并开启捕获（dock 调用）。
+
+        服务器 `walk` 无参只回显当前房间内建路径的文字说明（无表格），
+        完整表格（目的地/拼音/步数）需用 `walk -c`。
+        """
+        if not self.logged_in:
+            return
+        self._walk_capture = True
+        self._walk_in_table = False
+        self._walk_capture_start = time.time()
+        self._node_page_stop()
+        self.connection.send_line("walk -c")
+
+    def _consume_walk_line(self, text: str) -> bool:
+        """捕获期间抑制 walk 表格行，返回 True 表示本行不上主输出。
+
+        状态机同 node 捕获：表头含「目的地/拼音/步数」或顶框线进表；
+        表尾框线结束；空列表提示「这里没有内建路径」也结束。
+        复用 node 的分页看门狗（一次仅一个捕获激活，互不冲突）。
+        """
+        if not self._walk_capture:
+            return False
+        has_vbar = "│" in text or "|" in text
+        if not self._walk_in_table and time.time() - self._walk_capture_start > 5.0:
+            self._walk_capture = False
+            self._walk_in_table = False
+            return False
+        if "这里没有内建路径" in text or "没有内建" in text:
+            self._node_page_stop()
+            self._walk_capture = False
+            self._walk_in_table = False
+            return True
+        if not self._walk_in_table:
+            if (has_vbar and "目的地" in text and "拼音" in text) or \
+               (text.startswith("┌") and "─" in text):
+                self._walk_in_table = True
+                self._node_page_lines = 1
+                self._node_page_touch()
+                return True
+            return False
+        if "└" in text and "─" in text:
+            self._node_page_stop()
+            self._walk_capture = False
+            self._walk_in_table = False
+            return True
+        if has_vbar or any(ch in text for ch in "├┤┼┬┴"):
+            self._node_page_lines += 1
+            self._node_stray = 0
+            if self._node_page_sent:
+                self._node_page_lines = 1
+                self._node_page_sent = False
+                self._node_page_retries = 0
+            self._node_page_touch()
+            return True
+        if self._node_page_sent:
+            self._node_stray += 1
+            if self._node_stray >= _NODE_STRAY_MAX:
+                self._node_page_stop()
+                self._walk_capture = False
+                self._walk_in_table = False
+        return False
+
+    def abort_walk_capture(self) -> None:
+        """外部强制中止 walk 捕获。"""
+        if not self._walk_capture:
+            return
+        self._walk_capture = False
+        self._walk_in_table = False
         self._node_page_stop()
 
     def _route_line(self, text: str, spans: list, highlight: bool = False) -> None:
@@ -596,9 +682,11 @@ class AccountSession(QObject):
             return
         self._PAGER_LAST_SEND = now
         self.connection.send_line("")
-        # 分页间隙不打断进行中的 node/look 捕获（换页未到表尾，续命等待后续表格行）
-        if self._node_capture and self._node_in_table:
+        # 分页间隙不打断进行中的 node/walk/look 捕获（换页未到表尾，续命等待后续表格行）
+        if (self._node_capture and self._node_in_table) or \
+           (self._walk_capture and self._walk_in_table):
             self._node_capture_start = now
+            self._walk_capture_start = now
 
     def _pager_arm(self) -> None:
         """识别到页尾提示行：进入（或续命）通用分页会话并启动看门狗。"""

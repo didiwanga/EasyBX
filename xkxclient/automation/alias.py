@@ -19,8 +19,9 @@ class Alias:
 
     @property
     def regex(self) -> re.Pattern | None:
+        # 别名匹配大小写不敏感：纯小写/纯大写/混合大小写输入均可命中
         try:
-            return re.compile(self.pattern)
+            return re.compile(self.pattern, re.IGNORECASE)
         except re.error:
             return None
 
