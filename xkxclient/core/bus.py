@@ -48,6 +48,13 @@ class EventBus(QObject):
         if not self._subs[event]:
             del self._subs[event]
 
+    def unsubscribe_pattern(self, event_glob: str, cb: Callable) -> None:
+        if event_glob not in self._patterns:
+            return
+        self._patterns[event_glob] = [(p, c) for p, c in self._patterns[event_glob] if c is not cb]
+        if not self._patterns[event_glob]:
+            del self._patterns[event_glob]
+
     def clear(self) -> None:
         self._subs.clear()
         self._patterns.clear()

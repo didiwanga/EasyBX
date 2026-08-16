@@ -4,7 +4,6 @@ import json
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -96,7 +95,6 @@ class MapDock(QWidget):
         from xkxclient.core.config import ConfigManager
         base = ConfigManager.instance().get("map.api", "")
         if base and self.cache is not None:
-            from xkxclient.core import gmcp
             try:
                 import urllib.request
                 # 地图 API 公网直连，不走系统代理（与 fullme 一致，避免 DNS/代理干扰）

@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
 )
 
 from xkxclient.core import config as cfg
-from xkxclient.net.ansi import Span
 
 
 class ChannelBar(QWidget):

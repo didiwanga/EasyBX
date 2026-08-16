@@ -15,8 +15,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from xkxclient.core.fullme import extract_fullme_url  # noqa: F401 (re-export for UI)
-
 _IMG_RE = re.compile(rb"<img[^>]+src\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 # 描述行：`本次fullme请输入<描述>的字`（显示在输入框上方）
@@ -83,15 +81,15 @@ class FullmeGridWindow(QDialog):
         self.input_row = QLineEdit()
         self.input_row.setPlaceholderText("输入验证码后回车")
         self.input_row.returnPressed.connect(self._send)
-        send_btn = QPushButton("发送")
-        send_btn.clicked.connect(self._send)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.clicked.connect(self._send)
 
         lay = QVBoxLayout(self)
         lay.addStretch(0)
         lay.addLayout(grid)
         lay.addWidget(self.desc_label)
         lay.addWidget(self.input_row)
-        lay.addWidget(send_btn)
+        lay.addWidget(self.send_btn)
 
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._nam = QNetworkAccessManager(self)
@@ -213,10 +211,20 @@ class FullmeGridWindow(QDialog):
         else:
             label.setText(f"无法解析图片\n{url}")
 
+    def _block_empty(self, code: str) -> bool:
+        """留空拦截：返回 True 表示拦截（提示并聚焦，不发送）。
+        回车在留空时同样走此分支，保证空输入一律无法确认。"""
+        if code.strip():
+            return False
+        QMessageBox.information(self, "验证码", "请输入验证码后再发送")
+        self.input_row.setFocus()
+        return True
+
     def _send(self) -> None:
-        code = self.input_row.text().strip()
-        if not code:
+        code = self.input_row.text()
+        if self._block_empty(code):
             return
+        code = code.strip()
         self.session.send(f"fullme {code}")
         self.input_row.clear()
         if not self.wait_result_enabled():
@@ -252,6 +260,13 @@ class FullmeGridWindow(QDialog):
                 pass
             self._sub = None
         self._clear_result_timer()
+        # 中止未完成请求，防止 finished 闭包在窗口销毁后回调访问已删 label
+        for reply in self._replies:
+            try:
+                reply.abort()
+            except Exception:
+                pass
+        self._replies.clear()
         super().closeEvent(event)
 
 
@@ -283,9 +298,10 @@ class CaptchaWindow(FullmeGridWindow):
         return False
 
     def _send(self) -> None:
-        code = self.input_row.text().strip()
-        if not code:
+        code = self.input_row.text()
+        if self._block_empty(code):
             return
+        code = code.strip()
         self.input_row.clear()
         if self._on_submit is not None:
             self._on_submit(code)
@@ -309,9 +325,10 @@ class HongbaoWindow(FullmeGridWindow):
         return False
 
     def _send(self) -> None:
-        code = self.input_row.text().strip()
-        if not code:
+        code = self.input_row.text()
+        if self._block_empty(code):
             return
+        code = code.strip()
         self.input_row.clear()
         self.session.send(f"hongbao {code}")
         self.close()

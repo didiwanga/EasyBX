@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import re
 
-from xkxclient.automation.runner import substitute, split_commands
-
 
 class Alias:
     def __init__(self, name: str, pattern: str, replacement: str = "",
@@ -65,7 +63,8 @@ class AliasEngine:
                 return None
             out = a.replacement
             out = out.replace("%0", text)   # %0 = 整行输入
-            for i, g in enumerate(m.groups(), start=1):
+            # 按 %N 从大到小替换，避免 %1 抢先吃掉 %10 的前缀
+            for i, g in reversed(list(enumerate(m.groups(), start=1))):
                 out = out.replace(f"%{i}", g or "")
             return out
         return None

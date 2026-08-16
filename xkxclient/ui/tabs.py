@@ -327,13 +327,8 @@ class AccountTab(QWidget):
 
         dlg = TriggerEditor(self.session, self)
         if sel:
-            try:
-                from xkxclient.automation.trigger import Trigger
-
-                tr = Trigger(name="from_select", pattern=sel)
-                dlg.pattern_ed.setText(sel)
-            except Exception:
-                pass
+            # 预填为第一条包含条件（条件列表是唯一条件输入入口）
+            dlg.cond_edit.set_conditions([{"match_type": "contains", "pattern": sel}])
         dlg.show()
 
     def _add_screen_block(self, sel: str) -> None:

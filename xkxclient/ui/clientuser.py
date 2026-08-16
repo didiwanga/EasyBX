@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPushButton,
-    QLabel, QMessageBox, QGroupBox, QWidget, QGridLayout,
+    QLabel, QMessageBox, QGroupBox, QGridLayout,
 )
 
 from xkxclient.core import client_user

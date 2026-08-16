@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QPoint, QSize, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QIcon, QPixmap, QTransform
+from PyQt6.QtCore import QEvent, QSize, QTimer, Qt
+from PyQt6.QtGui import QIcon, QKeySequence, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -488,6 +485,13 @@ class MoveControlDock(QWidget):
                     btn.clicked.connect(lambda _=False, d=name: self._move(d))
                 btn.setProperty("dirBtn", True)
                 btn.setFixedSize(42, 32)
+                # 小键盘快捷键：3×3 位置（左上 nw=7，中 look=5，右下 se=3）：
+                #     nw n ne → 7 8 9
+                #     w look e → 4 5 6
+                #     sw s se → 1 2 3
+                kp_num = (2 - r) * 3 + (c + 1)
+                btn.setShortcut(QKeySequence(
+                    Qt.KeyboardModifier.KeypadModifier.value | (Qt.Key.Key_0.value + kp_num)))
                 grid.addWidget(btn, r, c)
                 if name != "look":
                     self._btns[name] = btn
@@ -938,6 +942,24 @@ class MacroRecorderDock(QWidget):
             if conds:
                 return f"触发: {conds[0].get('pattern', '')}"
             return f"触发: {s.get('pattern', '')}"
+        if t == "cruise":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            mode = "顺序" if s.get("mode", "ordered") == "ordered" else "随机"
+            hm = {"home_exec": "返回起点执行", "exec_home": "执行后返回",
+                  "exec": "仅执行", "home": "仅返回"}.get(s.get("hit_mode"), "")
+            rh = f"·{hm}" if hm else ""
+            return f"巡航[{mode}]: {s.get('range', '')} → {pat}{rh}"
+        if t == "move_trigger":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            return f"移动并触发: {s.get('command', '')} → {pat}"
+        if t == "captcha":
+            return f"验证码: {s.get('command', '')} → ${s.get('var', 'captcha')}"
+        if t == "hit":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            return f"等待命中: {s.get('command', '')} → {pat}"
         return t
 
     def _refresh(self) -> None:

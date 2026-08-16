@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         self.map_dock.hide()
 
         self._cur_tab: AccountTab | None = None
+        self._nav_subscribed = False
         self._docks_restored = False
         self._layout_healed = False
         self._layout_diag = False
@@ -192,6 +193,7 @@ class MainWindow(QMainWindow):
         vm.addAction("🧩 节点图宏", self._open_node_editor)
         vm.addAction("📜 Lua 脚本", lambda: self._open_editor("script"))
         vm.addAction("🪣 自动拾取", self._open_auto_pickup)
+        vm.addAction("👁 发现玩家", self._open_player_watch)
 
         pm = bar.addMenu("🧩 功能面板")
         pm.addAction("📊 状态", self._toggle_dock(self.state_dock))
@@ -269,6 +271,7 @@ class MainWindow(QMainWindow):
         tb.addAction("🔍 查找", self._show_find)
         tb.addAction("📖 命令速查", self._toggle_dock(self.commands_dock))
         tb.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
+        tb.addAction("👁 发现玩家", self._open_player_watch)
         # 最右侧：屏显屏蔽便捷按钮（弹性占位把它推到工具栏右端）
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -347,7 +350,10 @@ class MainWindow(QMainWindow):
         return self.skills_dock.widget()
 
     def _subscribe_nav(self, session) -> None:
-        """地图导航状态事件转发给地图面板更新 UI。"""
+        """地图导航状态事件转发给地图面板更新 UI（只订阅一次，切换账号只重绑定 session）。"""
+        if self._nav_subscribed:
+            return
+        self._nav_subscribed = True
         self.app.bus.subscribe_pattern("nav.*", self.map_dock.widget().on_nav_state)
         self.app.bus.subscribe_pattern("nav.*", self.nav_dock.widget()._nav_state)
 
@@ -471,6 +477,8 @@ class MainWindow(QMainWindow):
         if isinstance(tab, AccountTab):
             tab.session.close()
         self.tabs.removeTab(index)
+        if tab is not None:
+            tab.deleteLater()  # 释放 tab 及其子控件，避免孤儿对象
 
     def _next_tab(self) -> None:
         n = self.tabs.count()
@@ -541,8 +549,6 @@ class MainWindow(QMainWindow):
 
     def _set_theme(self, key: str) -> None:
         """切换全局主题并持久化。"""
-        from PyQt6.QtWidgets import QApplication
-
         apply_theme(key)
         cfg.ConfigManager.instance().set("theme", key)
         for k, act in self._theme_actions.items():
@@ -588,6 +594,14 @@ class MainWindow(QMainWindow):
         tab = self._tab()
         session = tab.session if tab else None
         AutoPickupDialog(session, self).exec()
+
+    def _open_player_watch(self) -> None:
+        """工具栏→发现玩家：监控服务器信息，发现指定玩家时触发设定指令。"""
+        from xkxclient.ui.playerwatch import PlayerWatchDialog
+
+        tab = self._tab()
+        session = tab.session if tab else None
+        PlayerWatchDialog(session, self).exec()
 
     def _toggle_chat(self) -> None:
         pass  # B5e：聊天栏恒开，无总开关
@@ -693,11 +707,12 @@ class MainWindow(QMainWindow):
             title.setStyleSheet(flash if count[0] % 2 == 1 else base)
             if count[0] >= times * 2:
                 title.setStyleSheet(base)
+                timer.stop()  # 闪烁结束即停，避免定时器空转
 
-        t = QTimer(self)
-        t.setInterval(160)
-        t.timeout.connect(step)
-        t.start()
+        timer = QTimer(self)
+        timer.setInterval(160)
+        timer.timeout.connect(step)
+        timer.start()
 
     def _open_editor(self, kind: str) -> None:
         tab = self._tab()
@@ -742,8 +757,6 @@ class MainWindow(QMainWindow):
         raw = cfg.ConfigManager.instance().get("layout_state")
         if not (isinstance(raw, str) and raw):
             raw = self._DEFAULT_LAYOUT  # 无已存布局：用默认启动布局
-        import base64
-
         try:
             self.restoreState(bytes.fromhex(raw))
         except (ValueError, TypeError):
@@ -807,7 +820,7 @@ class MainWindow(QMainWindow):
                             pass
                         f.write("  dock[%s] float=%s vis=%s pos=%s geo=%s tab=%s\n" % (
                             d.objectName(), d.isFloating(), d.isVisible(),
-                            d.pos().x(), d.pos().y(), d.geometry().getRect(), tabs))
+                            (d.pos().x(), d.pos().y()), d.geometry().getRect(), tabs))
             except Exception:
                 pass
 

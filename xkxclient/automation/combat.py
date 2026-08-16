@@ -84,13 +84,29 @@ class CombatEngine(QObject):
         """旧版冷却为秒（0-300），现统一为毫秒：把看起来像秒的旧值 ×1000 迁移。"""
         changed = False
         for item in self.rotation:
-            if isinstance(item, dict) and item.get("cd") and item["cd"] <= 300:
-                item["cd"] = int(item["cd"]) * 1000
-                changed = True
+            if not isinstance(item, dict):
+                continue
+            cd = item.get("cd")
+            if cd in (None, ""):
+                continue
+            try:
+                if float(cd) <= 300:
+                    item["cd"] = int(float(cd)) * 1000
+                    changed = True
+            except (TypeError, ValueError):
+                pass
         for w in self.buff_watch:
-            if isinstance(w, dict) and w.get("cooldown") and w["cooldown"] <= 300:
-                w["cooldown"] = int(w["cooldown"]) * 1000
-                changed = True
+            if not isinstance(w, dict):
+                continue
+            cd = w.get("cooldown")
+            if cd in (None, ""):
+                continue
+            try:
+                if float(cd) <= 300:
+                    w["cooldown"] = int(float(cd)) * 1000
+                    changed = True
+            except (TypeError, ValueError):
+                pass
         if changed:
             self.save_cfg()
 
@@ -308,7 +324,8 @@ class CombatEngine(QObject):
     def _do_rotation(self, now: float) -> None:
         st = self.session.state
         # 敌人已空/低残：可能下一击结束战斗，避免在黑区浪费 busy 节拍
-        if self.enemy_eff_qi_pct and self.enemy_eff_qi_pct <= 0.0:
+        # 注意 0.0 也可能表示"真 0%"（空血），同样应跳过，故直接用 <= 判断
+        if self.enemy_eff_qi_pct <= 0.0:
             return
         for act in self.actions:
             if now - self._last_cd_time.get(act["cmd"], 0.0) < act["cd"]:
@@ -363,3 +380,7 @@ class CombatEngine(QObject):
 
     def close(self) -> None:
         self._tick.stop()
+        subs = {"state.changed": self._on_state, "GMCP.Combat": self._on_combat,
+                "state.combat": self._on_enemy, "state.buffs": self._on_buffs}
+        for ev, cb in subs.items():
+            self.bus.unsubscribe(ev, cb)

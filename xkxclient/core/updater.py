@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -215,6 +214,7 @@ class UpdateManager(QObject):
         self._update_dir: Path | None = None
         self._new_path: Path | None = None
         self._manual = False
+        self._cancelled = False
         # 下载使用独立 NAM：manifest 处理器绑定在本 NAM 的 finished 上，
         # 若共用会把 exe 下载完成信号也当 manifest 处理，readAll 读走数据导致写空文件。
         self._dl_nam = QNetworkAccessManager(self)
@@ -264,7 +264,7 @@ class UpdateManager(QObject):
     def _prompt_update(self, data: dict) -> None:
         new_ver = str(data.get("version", ""))
         from PyQt6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
-                                     QScrollArea, QVBoxLayout)
+                                     QScrollArea, QVBoxLayout, QWidget)
         dlg = QDialog()
         dlg.setWindowTitle("发现新版本")
         dlg.setMinimumSize(480, 360)
@@ -292,7 +292,7 @@ class UpdateManager(QObject):
 
         box = QDialogButtonBox()
         upd = box.addButton("立即更新", QDialogButtonBox.ButtonRole.AcceptRole)
-        later = box.addButton("稍后", QDialogButtonBox.ButtonRole.RejectRole)
+        box.addButton("稍后", QDialogButtonBox.ButtonRole.RejectRole)
         box.accepted.connect(dlg.accept)
         box.rejected.connect(dlg.reject)
         lay.addWidget(box)
@@ -333,6 +333,7 @@ class UpdateManager(QObject):
 
     def _cancel_download(self) -> None:
         _log("download cancelled by user")
+        self._cancelled = True
         if self._download_reply is not None:
             self._download_reply.abort()
 
@@ -352,6 +353,9 @@ class UpdateManager(QObject):
             _log("download done: reply is None")
             return
         try:
+            if self._cancelled:
+                _log("download was cancelled, skip")
+                return
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 _log(f"download error: {reply.error()}")
                 QMessageBox.warning(None, "更新失败", "下载新版本失败，请稍后重试。")

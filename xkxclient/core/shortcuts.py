@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QObject
 from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtWidgets import QWidget
 
 from xkxclient.core.config import ConfigManager
 

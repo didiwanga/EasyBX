@@ -3,7 +3,7 @@
 import time
 from dataclasses import dataclass, field
 
-from PyQt6.QtCore import QObject, Qt, QTimer
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from xkxclient.automation.runner import ActionRunner
 
@@ -22,6 +22,10 @@ class TimerDef:
 class TimerEngine(QObject):
     """E6 定时器（毫秒模型）：interval / daily/weekly / macron 依赖一次计时。"""
 
+    # start/stop 可能来自脚本工作线程：经信号切回主线程再操作 QTimer
+    _start_req = pyqtSignal(str)
+    _stop_req = pyqtSignal(str, bool)
+
     def __init__(self, bus, session) -> None:
         super().__init__(session)
         self.bus = bus
@@ -34,17 +38,23 @@ class TimerEngine(QObject):
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
         self._tick.start()
+        self._start_req.connect(self._do_start)
+        self._stop_req.connect(self._do_stop)
 
     def load(self, definitions: list[dict]) -> None:
         for t in self._interval.values():
             t.stop()
         self._interval.clear()
-        clean = [dict(d) for d in definitions]
-        for d in clean:
-            d.pop("shared", None)
-        self.timers = {
-            TimerDef(**d).name: TimerDef(**d) for d in clean
-        }
+        fields = {"name", "enabled", "schedule", "actions", "last_at", "next_at", "group"}
+        timers: dict[str, TimerDef] = {}
+        for d in definitions:
+            dd = {k: v for k, v in dict(d).items() if k in fields}
+            try:
+                td = TimerDef(**dd)
+            except (TypeError, ValueError):
+                continue  # 字段类型异常的历史脏数据：跳过，不崩溃
+            timers[td.name] = td
+        self.timers = timers
         self._schedule_all()
         self._ensure_tick()
 
@@ -58,6 +68,10 @@ class TimerEngine(QObject):
             self._tick.start()
 
     def start(self, name: str) -> None:
+        # 可能从脚本工作线程调用：信号切回主线程执行，避免在错误线程建 QTimer
+        self._start_req.emit(str(name))
+
+    def _do_start(self, name: str) -> None:
         if name not in self.timers:
             return
         td = self.timers[name]
@@ -69,6 +83,9 @@ class TimerEngine(QObject):
         self.bus.publish("timer.start", account=self.session.account_id, name=name)
 
     def stop(self, name: str, pause: bool = False) -> None:
+        self._stop_req.emit(str(name), bool(pause))
+
+    def _do_stop(self, name: str, pause: bool) -> None:
         if name not in self.timers:
             return
         td = self.timers[name]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Callable
 
 from PyQt6.QtCore import QObject, QTimer
@@ -8,7 +9,6 @@ from PyQt6.QtCore import QObject, QTimer
 from xkxclient.automation.runner import split_commands, substitute
 from xkxclient.automation.trigger import play_ding
 from xkxclient.core.fullme import extract_fullme_url
-from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
 
 # 移动异常特征行（服务器拦截/防挂机输出）：命中只作提示，不立即判定失败。
 # 泼皮等 NPC 瞬时拦路 / busy（不能移动）时移动通常仍会成功（GMCP.Move result=true 会推），
@@ -20,15 +20,6 @@ _MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动")
 # 太短会在 busy 未结束时重发而反复失败；3-5 秒停顿后 busy 结束即可正常推进下一步。
 _BLOCK_WAIT_MS = 5000   # 移动异常后等待 GMCP.Move 确认（true=成功）的窗口
 _RETRY_WAIT_MS = 5000   # 确认失败后原地重发前的停顿（覆盖 busy 周期）
-
-# 方向取反（完整方向 + 常用短名）
-_REV_DIRS = dict(_MAP_OPPOSITE)
-_REV_DIRS.update({
-    "n": "s", "s": "n", "e": "w", "w": "e",
-    "ne": "sw", "nw": "se", "se": "nw", "sw": "ne",
-    "nu": "sd", "nd": "su", "su": "nd", "sd": "nu",
-    "eu": "wd", "ed": "wu", "wu": "ed", "wd": "eu",
-})
 
 
 def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
@@ -62,6 +53,64 @@ def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
     if buf.strip():
         out.append((buf.strip(), paren_flag))
     return out
+
+
+# 八方向（巡航范围用）。用户输入短名或完整名都接受，统一为短名。
+_CRUISE_DIRS = {
+    "n": "n", "north": "n", "s": "s", "south": "s",
+    "e": "e", "east": "e", "w": "w", "west": "w",
+    "ne": "ne", "northeast": "ne", "nw": "nw", "northwest": "nw",
+    "se": "se", "southeast": "se", "sw": "sw", "southwest": "sw",
+}
+_CRUISE_OPPOSITE = {"n": "s", "s": "n", "e": "w", "w": "e",
+                    "ne": "sw", "nw": "se", "se": "nw", "sw": "ne"}
+
+
+def parse_cruise_range(text: str) -> list[list[str]]:
+    """解析巡航范围串 `s;s;s&s;w;w;w&s;e;e` → 去重后的位置点方向序列列表。
+
+    每个 `&` 分隔一个范围（从起点出发的路径），`;` 分隔方向步；
+    每个范围的每个前缀（含整条）都算一个位置点，整体去重保持首次出现顺序。
+    例：`s;s;s&s;w;w;w&s;e;e` →
+    [['s'],['s','s'],['s','s','s'],['s','w'],['s','w','w'],['s','w','w','w'],['s','e'],['s','e','e']]
+    """
+    points: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for part in text.split("&"):
+        dirs: list[str] = []
+        for step in part.split(";"):
+            d = _CRUISE_DIRS.get((step or "").strip().lower())
+            if not d:
+                continue
+            dirs.append(d)
+            key = tuple(dirs)
+            if key not in seen:
+                seen.add(key)
+                points.append(list(dirs))
+    return points
+
+
+def cruise_move_steps(cur: list[str], tgt: list[str]) -> list[str]:
+    """从当前位置点方向序列 cur 移动到目标位置点 tgt 需执行的方向命令列表。
+
+    取公共前缀：先反向走 cur 的独有部分回到公共祖先，再正向走 tgt 的独有部分。
+    """
+    if cur == tgt:
+        return []
+    lcp = 0
+    for a, b in zip(cur, tgt):
+        if a == b:
+            lcp += 1
+        else:
+            break
+    back = [_CRUISE_OPPOSITE[d] for d in reversed(cur[lcp:])]
+    fwd = tgt[lcp:]
+    return back + fwd
+
+
+def cruise_back_steps(cur: list[str]) -> list[str]:
+    """从当前位置点方向序列 cur 返回起点需执行的方向命令列表（反向取反）。"""
+    return [_CRUISE_OPPOSITE[d] for d in reversed(cur)]
 
 
 class Macro:
@@ -230,6 +279,7 @@ class MacroEngine(QObject):
         self._call_stack: dict[str, list[int]] = {}         # 调用触发返回栈（每宏一个栈）
         self._move_log: dict[str, list[dict]] = {}          # 移动日志：name -> [(dir, from_room, to_room), ...]
         self._wait_cleanup: dict[str, Callable] = {}        # 移动并触发等待清理器（停止/终止时解除订阅）
+        self._recursion_depth: dict[str, int] = {}          # _step 递归深度保护（jump 成环兜底）
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -295,7 +345,8 @@ class MacroEngine(QObject):
         self._notify_state("paused")
 
     def resume(self, name: str | None = None) -> None:
-        """恢复暂停的宏。"""
+        """恢复暂停的宏。若宏正停在同一等待步（触发/输入/验证码等），只清除暂停标记，
+        保持原等待订阅/定时器，不重跑该步，避免重复订阅与命令重发。"""
         targets = [name] if name else [t for t in self._active if t in self._paused]
         if not targets:
             return
@@ -303,7 +354,13 @@ class MacroEngine(QObject):
         self._notify_state("running")
         for t in targets:
             if t in self._active:
-                self._step(t)
+                step = self._active[t].steps[self._pos.get(t, 0)] if self._active[t].steps else None
+                stype = step.get("type") if isinstance(step, dict) else None
+                waiting = (stype in ("trigger", "call_trigger", "hit", "move_trigger") and self._trigger_sub is not None) \
+                    or (stype in ("input", "wait_input") and self._waiting is not None) \
+                    or (stype == "captcha" and self._captcha_wait is not None)
+                if not waiting:
+                    self._step(t)
 
     def is_running(self, name: str | None = None) -> bool:
         if name:
@@ -333,6 +390,7 @@ class MacroEngine(QObject):
         self._paused.clear()
         self._call_stack.clear()
         self._move_log.clear()
+        self._recursion_depth.clear()
         for cleanup in list(self._wait_cleanup.values()):
             cleanup()
         self._wait_cleanup.clear()
@@ -366,6 +424,23 @@ class MacroEngine(QObject):
         if pos >= len(m.steps):
             self._halt(name)
             return
+        # 递归深度保护：jump/if/status 等分支是同步递归，成环时避免 RecursionError，
+        # 超过阈值后转异步跳转，让事件循环接管。
+        depth = self._recursion_depth.get(name, 0)
+        if depth >= 256:
+            self._goto_later(name, pos)
+            return
+        self._recursion_depth[name] = depth + 1
+        try:
+            self._step_impl(name, pos)
+        finally:
+            if self._recursion_depth.get(name, 0) <= 1:
+                self._recursion_depth.pop(name, None)
+            else:
+                self._recursion_depth[name] = self._recursion_depth[name] - 1
+
+    def _step_impl(self, name: str, pos: int) -> None:
+        m = self._active.get(name)
         step = m.steps[pos]
         t = step.get("type")
 
@@ -404,6 +479,8 @@ class MacroEngine(QObject):
             self._hit(name, step, pos)
         elif t == "move_trigger":
             self._move_trigger(name, step, pos)
+        elif t == "cruise":
+            self._cruise(name, step, pos)
         elif t == "captcha":
             self._wait_captcha(name, step, pos)
         elif t == "loop":
@@ -462,13 +539,11 @@ class MacroEngine(QObject):
 
     def _wait_trigger_impl(self, name: str, step: dict, pos: int, return_pos: int) -> None:
         """触发器等待实现：条件命中/超时后跳转 return_pos（触发步骤=pos+1，调用触发=调用点）。"""
-        from xkxclient.automation.trigger import Trigger, TEMPLATE_VAR_RE
+        from xkxclient.automation.trigger import Trigger
 
         conds = step.get("conditions")
         if conds:
             conds = [dict(c) for c in conds]
-            mt = conds[0].get("match_type", "contains")
-            pat = conds[0].get("pattern", "")
             relation = step.get("relation", "or")
         else:
             cond = step.get("condition") or {}
@@ -479,8 +554,10 @@ class MacroEngine(QObject):
         self.bus.publish("macro.state", account=self.session.account_id,
                          state="waiting_trigger", name=name)
 
-        def eval_line(line: str) -> list | None:
-            """按与/或评估条件集，返回捕获列表（None = 未命中）。"""
+        def eval_line(line: str) -> tuple[list, int | None] | None:
+            """按与/或评估条件集，返回 (捕获列表, 命中条件下标)；None = 未命中。
+            返回命中条件下标，供 on_line 用对应条件的模板变量名对齐捕获（or 关系多条件时不会错位）。
+            """
             if relation == "and":
                 all_caps: list = []
                 for c in conds:
@@ -488,11 +565,11 @@ class MacroEngine(QObject):
                     if caps is None:
                         return None
                     all_caps.extend(caps or [])
-                return all_caps
-            for c in conds:
+                return all_caps, 0   # and：全条件命中，names 收集全部模板条件
+            for idx, c in enumerate(conds):
                 caps = _match_trigger_cond(c, line)
                 if caps is not None:
-                    return caps or []
+                    return (caps or []), idx
             return None
 
         def _match_trigger_cond(c: dict, line: str) -> list | None:
@@ -524,9 +601,10 @@ class MacroEngine(QObject):
             if (payload.get("account") or "") != self.session.account_id:
                 return
             line = payload.get("line") or ""
-            captures = eval_line(line)
-            if captures is None:
+            res = eval_line(line)
+            if res is None:
                 return
+            captures, hit_idx = res
             # 命中：先真正取消订阅（否则后续行仍会回调，重复 goto/赋值）
             if self._trigger_sub is not None:
                 self.bus.unsubscribe("net.text_display", self._trigger_sub)
@@ -534,11 +612,20 @@ class MacroEngine(QObject):
             if self._trigger_timer is not None:
                 self._trigger_timer.stop()
                 self._trigger_timer = None
-            # 模板变量捕获（B3：命名/编号都支持）
+            # 模板变量捕获（B3：命名/编号都支持）；只取命中条件的模板名，
+            # 保证 or 关系下 names 与 captures 一一对应不错位。
             names: list = []
-            for c in conds:
+            if relation == "and":
+                for c in conds:
+                    if c.get("match_type") == "template":
+                        tmp = Trigger("_t", match_type="template", pattern=c.get("pattern", ""))
+                        tmp.template_regex  # 访问 property 才会填充 _names
+                        names.extend(getattr(tmp, "_names", []) or [])
+            else:
+                c = conds[hit_idx]
                 if c.get("match_type") == "template":
                     tmp = Trigger("_t", match_type="template", pattern=c.get("pattern", ""))
+                    tmp.template_regex  # 访问 property 才会填充 _names
                     names.extend(getattr(tmp, "_names", []) or [])
             for i, (var, _color) in enumerate(names):
                 g = captures[i] if i < len(captures) else ""
@@ -597,8 +684,6 @@ class MacroEngine(QObject):
         - 条件命中 → 继续下一步
         - timeout_ms 超时（>0）→ 终止当前宏（默认 0 = 永不超时）
         """
-        from xkxclient.automation.trigger import Trigger
-
         cmd = step.get("command", "")
         delay_ms = int(step.get("delay_ms") or 0)
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
@@ -713,7 +798,6 @@ class MacroEngine(QObject):
           发送不存在的出口触发「什么？」）；同一命令连续失败 retry_max（默认 3）次后跳过继续
         - 全部命令发送完 → 继续下一步
         """
-        from xkxclient.automation.trigger import Trigger
 
         cmd = step.get("command", "")
         cmds = _parse_move_cmds(substitute(cmd, self.session.vars))
@@ -970,6 +1054,241 @@ class MacroEngine(QObject):
                          state="waiting_trigger", name=name)
         send(0)
 
+    # ---- 巡航步骤：范围 + 顺序/随机遍历 + 每房间条件触发 + 返回起点 ----
+    def _cruise(self, name: str, step: dict, pos: int) -> None:
+        """巡航：以当前房间为起点，按范围（`&` 连接的多条八方向路径）生成位置点集，
+        顺序或随机（不重复）遍历；每个位置点等待触发条件（条件超时=单房间停留上限），
+        命中后延时执行指令并按 hit_mode 处理；全部位置点遍历完未命中且未超时则重新巡航
+        一轮；巡航超时（总时长）到达立即返回起点结束。
+
+        hit_mode（命中后）：
+        - home_exec  返回起始点执行：先走回起点，再执行命令，结束巡航
+        - exec_home  执行后返回起始点：先执行命令，再走回起点，结束巡航
+        - exec       仅执行：执行命令后结束巡航（留在当前位置，不返回）
+        - home       仅返回：直接走回起点结束巡航（不执行命令）
+        """
+        import random
+
+        points = parse_cruise_range(step.get("range", ""))
+        if not points:
+            self._goto(name, pos + 1)
+            return
+        mode = step.get("mode", "ordered")
+        hit_mode = step.get("hit_mode", "home_exec")
+        if hit_mode not in ("home_exec", "exec_home", "exec", "home"):
+            hit_mode = "home_exec"
+        conds = step.get("conditions")
+        if conds:
+            conds = [dict(c) for c in conds]
+            relation = step.get("relation", "or")
+        else:
+            cond = step.get("condition") or {}
+            conds = [{"match_type": step.get("match_type") or cond.get("type") or "contains",
+                      "pattern": step.get("pattern") or cond.get("pattern") or ""}]
+            relation = "or"
+        cmd = step.get("command", "")
+        delay_ms = int(step.get("delay_ms") or 0)
+        cond_timeout = int(step.get("cond_timeout_ms") or (step.get("cond_timeout") or 0) * 1000)
+        cruise_timeout = int(step.get("cruise_timeout_ms") or (step.get("cruise_timeout") or 0) * 1000)
+
+        def eval_line(line: str) -> bool:
+            if relation == "and":
+                return all(self._hit_match(c, line) for c in conds)
+            return any(self._hit_match(c, line) for c in conds)
+
+        state = {
+            "cur": [],            # 当前位置点方向序列（[] = 起点）
+            "idx": 0,             # 本轮遍历到的位置点下标
+            "round": 0,           # 已完成轮数
+            "start": time.monotonic(),
+            "done": False,
+        }
+        text_sub = [None]
+        cond_timer = [None]
+        cruise_timer = [None]
+        walk_timer = [None]
+
+        def unsub() -> None:
+            if text_sub[0] is not None:
+                self.bus.unsubscribe("net.text_display", text_sub[0])
+                text_sub[0] = None
+            for tl in (cond_timer, cruise_timer, walk_timer):
+                if tl[0] is not None:
+                    tl[0].stop()
+                    tl[0] = None
+
+        def cleanup() -> None:
+            unsub()
+            self._wait_cleanup.pop(name, None)
+            tm = self._timers.pop(name, None)
+            if tm is not None:
+                tm.stop()
+
+        def _walk_dir(steps: list[str], on_done) -> None:
+            """依次发送方向命令（每步固定间隔），走完后回调 on_done。
+            不做 state["done"] 拦截：命中/超时后走回起点也走此路径（此时已 unsub，
+            done 置 True 是为了阻止 on_line/on_cond_timeout 重复触发，不阻止本行走位）。
+            """
+            if not steps:
+                on_done()
+                return
+
+            def step_walk(i: int) -> None:
+                if name not in self._active:
+                    return
+                if i >= len(steps):
+                    on_done()
+                    return
+                self.session.send_auto(steps[i])
+                walk_timer[0] = QTimer(self)
+                walk_timer[0].setSingleShot(True)
+                walk_timer[0].timeout.connect(lambda: step_walk(i + 1))
+                walk_timer[0].start(400)
+
+            step_walk(0)
+
+        def finish_step() -> None:
+            """结束巡航步骤：继续宏下一步。"""
+            if name in self._active:
+                self._goto(name, pos + 1)
+
+        def go_home(on_arrived) -> None:
+            """走回起点，到达后回调 on_arrived。"""
+            back = cruise_back_steps(state["cur"])
+            _walk_dir(back, on_arrived)
+
+        def handle_hit() -> None:
+            """命中处理：按 hit_mode 决定「返回」与「执行命令」的顺序。"""
+            if hit_mode == "home":
+                # 仅返回：走回起点结束，不执行命令
+                go_home(finish_step)
+                return
+
+            def do_exec() -> None:
+                if cmd:
+                    for c in split_commands(substitute(cmd, self.session.vars)):
+                        self.session.send_auto(c)
+
+            if hit_mode == "home_exec":
+                # 先走回起点，再执行命令，结束
+                go_home(lambda: (do_exec(), finish_step()))
+            elif hit_mode == "exec_home":
+                # 先执行命令，再走回起点，结束
+                do_exec()
+                go_home(finish_step)
+            else:  # exec
+                # 仅执行：执行命令后结束（留在当前位置）
+                do_exec()
+                finish_step()
+
+        def on_cond_timeout() -> None:
+            if state["done"]:
+                return
+            cond_timer[0] = None
+            if text_sub[0] is not None:
+                self.bus.unsubscribe("net.text_display", text_sub[0])
+                text_sub[0] = None
+            _next_point()
+
+        def on_line(payload: dict) -> None:
+            if state["done"]:
+                return
+            if name not in self._active or name in self._paused:
+                return
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            line = payload.get("line") or ""
+            if eval_line(line):
+                state["done"] = True
+                unsub()
+                # 命中：先延时，再按 hit_mode 处理
+                def fire():
+                    if name in self._active:
+                        handle_hit()
+                if delay_ms > 0:
+                    tm = QTimer(self)
+                    tm.setSingleShot(True)
+                    tm.timeout.connect(fire)
+                    tm.start(delay_ms)
+                    self._timers[name] = tm
+                else:
+                    fire()
+
+        def wait_cond() -> None:
+            if state["done"]:
+                return
+            self.bus.publish("macro.state", account=self.session.account_id,
+                             state="waiting_trigger", name=name)
+            text_sub[0] = self.bus.subscribe("net.text_display", on_line)
+            if cond_timeout > 0:
+                cond_timer[0] = QTimer(self)
+                cond_timer[0].setSingleShot(True)
+                cond_timer[0].timeout.connect(on_cond_timeout)
+                cond_timer[0].start(cond_timeout)
+
+        def move_to(tgt: list[str]) -> None:
+            """从当前位置走到目标位置点（走方向命令，每步间隔固定延时）。"""
+            steps = cruise_move_steps(state["cur"], tgt)
+            if state["done"]:
+                return
+            if not steps:
+                state["cur"] = list(tgt)
+                wait_cond()
+                return
+            _walk_dir(steps, lambda: (state.__setitem__("cur", list(tgt)), wait_cond()))
+
+        def _next_point() -> None:
+            """完成一个位置点：前进到下一个；本轮遍历完则检查超时/开新一轮。"""
+            if state["done"]:
+                return
+            if cruise_timeout > 0 and time.monotonic() - state["start"] > cruise_timeout / 1000.0:
+                state["done"] = True
+                unsub()
+                self._wait_cleanup.pop(name, None)
+                tm = self._timers.pop(name, None)
+                if tm is not None:
+                    tm.stop()
+                go_home(finish_step)
+                return
+            order = state.get("order")
+            if order is None:
+                order = _build_order()
+                state["order"] = order
+            state["idx"] += 1
+            if state["idx"] >= len(order):
+                # 一轮遍历完：未命中且未超时 → 重新巡航一轮
+                state["round"] += 1
+                state["idx"] = 0
+                order = _build_order()
+                state["order"] = order
+            move_to(order[state["idx"]])
+
+        def _build_order() -> list[list[str]]:
+            if mode == "random":
+                o = [list(p) for p in points]
+                random.shuffle(o)
+                return o
+            return [list(p) for p in points]
+
+        self._wait_cleanup[name] = cleanup
+        # 巡航总超时定时器
+        if cruise_timeout > 0:
+            cruise_timer[0] = QTimer(self)
+            cruise_timer[0].setSingleShot(True)
+            cruise_timer[0].timeout.connect(lambda: (
+                state.__setitem__("done", True),
+                unsub(),
+                self._wait_cleanup.pop(name, None),
+                (self._timers.pop(name, None) and None),
+                go_home(finish_step),
+            ))
+            cruise_timer[0].start(cruise_timeout)
+        self.bus.publish("macro.state", account=self.session.account_id,
+                         state="waiting_trigger", name=name)
+        order = _build_order()
+        state["order"] = order
+        move_to(order[0])
+
     # ---- 验证码步骤（新）：发送命令 → 3s 检测链接 → 弹窗输入 → 变量赋值 ----
     def _wait_captcha(self, name: str, step: dict, pos: int) -> None:
         """验证码步骤：先发送用户设置的命令，然后在 timeout 毫秒内监听 fullme 链接。
@@ -1073,7 +1392,10 @@ class MacroEngine(QObject):
         self._loop_count.pop(name, None)
         self._paused.discard(name)
         self._call_stack.pop(name, None)
-        self._timers.pop(name, None)
+        self._recursion_depth.pop(name, None)
+        tm = self._timers.pop(name, None)
+        if tm is not None:
+            tm.stop()  # 停掉挂起的跳转定时器，避免停止后仍触发 _goto
         cleanup = self._wait_cleanup.pop(name, None)
         if cleanup is not None:
             cleanup()

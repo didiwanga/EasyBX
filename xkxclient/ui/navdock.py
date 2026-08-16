@@ -502,6 +502,14 @@ class NavDock(QWidget):
             self.status.setText("当前房间没有玩家定义的路径")
             self._run_node_follow()
             return
+        if "└" in line and "─" in line:
+            # 表尾框线，本次捕获结束（在表头门之前判断：表头页丢失时也能正常收尾）
+            self._capturing = False
+            self._seen_header = False
+            self._cap_timer.stop()
+            self.status.setText(f"node 路径 {len(self._node_rows)} 条")
+            self._run_node_follow()
+            return
         if self._seen_header is False:
             # 表头行或数据行兜底：表头页丢失（分页交互吞掉）时，首列
             # `[★☆]?ASCII名称│` 的数据行本身也能确认表格并开始解析。
@@ -511,14 +519,6 @@ class NavDock(QWidget):
                 self._seen_header = True
             else:
                 return  # 未见表头：框线/表头/闲杂行一律忽略，继续等待表头
-        if "└" in line and "─" in line:
-            # 表尾框线，本次捕获结束
-            self._capturing = False
-            self._seen_header = False
-            self._cap_timer.stop()
-            self.status.setText(f"node 路径 {len(self._node_rows)} 条")
-            self._run_node_follow()
-            return
         if not has_box:
             return
         parts = [p for p in line.split("│") if p.strip()]
@@ -605,6 +605,13 @@ class NavDock(QWidget):
                 self.session.abort_walk_capture()
             self.status.setText("当前区域的内建路径出发点暂时不明确")
             return
+        if "└" in line and "─" in line:
+            # 表尾框线，本次捕获结束（在表头门之前判断：表头页丢失时也能正常收尾）
+            self._walk_capturing = False
+            self._walk_seen_header = False
+            self._cap_timer.stop()
+            self.status.setText(f"walk 路径 {len(self._walk_rows)} 条")
+            return
         if self._walk_seen_header is False:
             if has_vbar and "目的地" in line and "拼音" in line:
                 self._walk_seen_header = True
@@ -614,12 +621,6 @@ class NavDock(QWidget):
                 return
             else:
                 return
-        if "└" in line and "─" in line:
-            self._walk_capturing = False
-            self._walk_seen_header = False
-            self._cap_timer.stop()
-            self.status.setText(f"walk 路径 {len(self._walk_rows)} 条")
-            return
         if not has_vbar:
             return
         # 表头行（含「目的地/拼音/步数」列名）跳过，不当作数据

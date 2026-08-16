@@ -12,8 +12,6 @@ from xkxclient.core.dsl import DslEngine
 from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.history import HistoryStore
 from xkxclient.core.map import MapCache
-from xkxclient.core.skills import _GROUP_RE as _SKILL_GROUP_RE
-from xkxclient.core.skills import _SKILL_ROW_RE as _SKILL_ROW_RE
 from xkxclient.core.state import CharacterState
 from xkxclient.net.connection import Connection
 from xkxclient.parse.look import LookParser
@@ -94,6 +92,7 @@ class AccountSession(QObject):
         from xkxclient.automation.combat import CombatEngine
         from xkxclient.automation.macro import MacroEngine
         from xkxclient.automation.pickup import AutoPickupEngine
+        from xkxclient.automation.playerwatch import PlayerWatchEngine
         from xkxclient.automation.throttle import CommandThrottle
         from xkxclient.automation.timer import TimerEngine
         from xkxclient.automation.trigger import TriggerEngine
@@ -104,6 +103,7 @@ class AccountSession(QObject):
         self.macros = MacroEngine(app.bus, self)
         self.combat = CombatEngine(self)
         self.pickup = AutoPickupEngine(app.bus, self)
+        self.player_watch = PlayerWatchEngine(app.bus, self)
         self.throttle = CommandThrottle(self.connection, self.account_id, app.bus)
         # B9 全局开关：读配置初值
         self.triggers.master_on = bool(ConfigManager.instance().get("automation.trigger_on", True))
@@ -221,6 +221,10 @@ class AccountSession(QObject):
         self._node_in_table = False
         self._walk_capture = False
         self._walk_in_table = False
+        self._capture_skills = False
+        self._skills_buf = ""
+        self._capture_look = False
+        self._look_buf = ""
         self._node_page_stop()
         self._pager_close()
         self._macro_captcha_active = False
@@ -422,8 +426,6 @@ class AccountSession(QObject):
             self._node_capture = False
             self._node_in_table = False
             return True
-        has_vbar = "│" in text or "|" in text
-        frame = any(ch in text for ch in "├┤┼┬┴")
         if not self._node_in_table:
             # 确认进入表格：含竖线的表头（名称/目的地）或顶框线 `┌…─` 行。
             # 兜底：表头页丢失（分页交互/首段被吞）时，数据行本身也能进表
@@ -749,8 +751,6 @@ class AccountSession(QObject):
                 src = "manual" if (self._last_sent or "").strip().startswith("fullme") else "task"
                 self.app.bus.publish("fullme.detected", account=self.account_id,
                                      source=src, url=url)
-        elif "fullme" in text and "验证码" not in text:
-            return
 
     def request_full_4(self) -> None:
         """手动开 2×2 fullme 网格：服务器只给 1 个 fullme 链接（可开 4 次），
@@ -874,8 +874,6 @@ class AccountSession(QObject):
         data = accs.get(self.account_id)
         if not isinstance(data, dict):
             return
-        from xkxclient.core.crypto import encrypt_password
-
         changed = False
         info = {
             "cn_name": st.name,
@@ -897,10 +895,12 @@ class AccountSession(QObject):
         module = module.split(".", 1)[0]
         if not module.startswith("GMCP."):
             module = "GMCP." + module
-        self.app.bus.publish(module, account=self.account_id, data=data)
         if ConfigManager.instance().get("debug.gmcp_log", False):
             self._gmcp_log(module, data)
+        handled = False
         if module == "GMCP.Status" and isinstance(data, dict):
+            handled = True
+            self.app.bus.publish("GMCP.Status", account=self.account_id, data=data)
             busy = data.get("is_busy", getattr(self.state, "busy", None))
             fighting = data.get("is_fighting", getattr(self.state, "fighting", None))
             if busy is not None:
@@ -911,6 +911,7 @@ class AccountSession(QObject):
                 self.app.bus.publish("state.changed", account=self.account_id, state=self.state)
                 self._backfill_account()
         elif module == "GMCP.Move":
+            handled = True
             if isinstance(data, list):
                 d = data[0] if data and isinstance(data[0], dict) else {}
             elif isinstance(data, dict):
@@ -930,6 +931,7 @@ class AccountSession(QObject):
                 if self.auto_look:
                     self._send_look()
         elif module == "GMCP.Combat":
+            handled = True
             if isinstance(data, list):
                 d = None
                 for it in data:
@@ -948,15 +950,20 @@ class AccountSession(QObject):
             if data.get("enemy_out"):
                 self.app.bus.publish("state.changed", account=self.account_id, state=self.state)
         elif module == "GMCP.Buff":
+            handled = True
             if isinstance(data, (dict, list)):
                 if self.state.update_buffs(data):
                     self.app.bus.publish("state.buffs", account=self.account_id, buffs=self.state.buffs)
             self.app.bus.publish("GMCP.Buff", account=self.account_id, data=data)
         elif module == "GMCP.Message" and isinstance(data, list):
+            handled = True
             for item in data if isinstance(data, list) else [data]:
                 if isinstance(item, dict):
                     self.app.bus.publish("GMCP.Message", account=self.account_id, data=item,
                                          name=str(item.get("name", "")), url=str(item.get("url", "")))
+        if not handled:
+            # 其余未特化处理的 GMCP 模块：仍按原样开放发布（供脚本/扩展订阅）
+            self.app.bus.publish(module, account=self.account_id, data=data)
     def _gmcp_log(self, module: str, data) -> None:
         try:
             cfg = ConfigManager.instance()
@@ -1085,11 +1092,11 @@ class LoginMachine:
             if not self.sent_name and not self._enc_sent and any(k in text for k in DEFAULT_PROMPTS["encoding"]):
                 self.session.connection.send_line(self._encoding_line())
             if not self.sent_name and self.register and "要注册新人物" in text:
-                # 注册模式：被提示输入 new 时，发 new 并停掉登录机，交给用户
+                # 注册模式：被提示输入 new 时，发 new 后保持监听（不置 finished），
+                # 等待服务器继续引导，最终回到 MXP 回退消息触发 _finish() 完成登录
                 self.sent_name = True
                 self.stage = "name_sent"
                 self.session.connection.send_line("new")
-                self.finished = True
                 return
             if _REAL_NAME_RE.search(text) and not self.sent_name:
                 if self.username:
@@ -1102,7 +1109,7 @@ class LoginMachine:
                         self.sent_name = True
                         self.stage = "name_sent"
                         self.session.connection.send_line("new")
-                        self.finished = True
+                        # 注册模式无预设用户名：保持监听，等待服务器引导
                     else:
                         self.finished = True
                 return
@@ -1183,7 +1190,8 @@ class LoginMachine:
             self._schedule_send(self.password, 500)
             self._arm_mxp_push()
         else:
-            self.finished = True
+            # 无密码服务器：名字阶段即视为登录进入，直接完成
+            self._finish()
 
     def _finish(self) -> None:
         self.finished = True

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 
 _KEY = hashlib.sha256(b"EasyBXb::account::v1").digest()
 

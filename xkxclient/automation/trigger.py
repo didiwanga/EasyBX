@@ -279,6 +279,9 @@ class TriggerEngine(QObject):
 
     def _schedule(self, t: Trigger) -> None:
         if t.delay_ms > 0:
+            old = self.pending.pop(t.name, None)
+            if old is not None:
+                old.stop()  # 旧定时器未触发：先停掉，避免与新的重复执行动作
             timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(lambda tt=t: self._fire_now(tt))

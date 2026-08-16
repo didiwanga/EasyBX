@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-from PyQt6.QtCore import QRegularExpression, Qt
 from PyQt6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat
 from PyQt6.QtWidgets import (
     QCheckBox,

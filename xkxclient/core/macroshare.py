@@ -26,10 +26,6 @@ def _opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def share_url() -> str:
-    return MACRO_SHARE_URL
-
-
 class ShareError(RuntimeError):
     """宏分享网络/服务器错误（HTTP 非 2xx 或响应异常）。"""
 

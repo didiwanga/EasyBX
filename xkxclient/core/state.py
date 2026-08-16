@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from xkxclient.core.gmcp import clean_ansi, fix_double
+from xkxclient.core.gmcp import clean_ansi
 
 _HP_RE = re.compile(r"[（(【?【](\S+)[】]?\s*[:：]?\s*[^\d]*(\d+)\s*/\s*(\d+)")
 
@@ -72,6 +72,8 @@ class CharacterState:
         for key, attr in mapping.items():
             if key in data:
                 val = data[key]
+                if val is None:
+                    continue  # GMCP 字段为 JSON null：跳过，避免把属性置 None
                 if isinstance(val, str):
                     val = clean_ansi(val)
                 current = getattr(self, attr)

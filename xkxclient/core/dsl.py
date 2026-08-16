@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import re
 
 from xkxclient.automation.runner import substitute

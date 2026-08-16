@@ -10,7 +10,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QListWidget, QListWidgetItem,
-    QLineEdit, QTextEdit, QPushButton, QLabel, QMessageBox, QWidget, QFormLayout,
+    QLineEdit, QTextEdit, QPushButton, QLabel, QMessageBox, QWidget,
 )
 
 from xkxclient.core import macroshare

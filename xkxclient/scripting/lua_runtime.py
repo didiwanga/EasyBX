@@ -37,6 +37,7 @@ class LuaWorker(QObject):
         self._sub_handlers: list[tuple[str, object]] = []
         self._bus = None
         self._thread: threading.Thread | None = None
+        self._wd_stop = threading.Event()  # 脚本正常结束时置位，通知看门线程退出
 
     def attach_bus(self, bus) -> None:
         """绑定事件总线（一次运行内用于批量退订）。"""
@@ -187,10 +188,12 @@ class LuaWorker(QObject):
             self.log.emit("脚本错误")
             self.done_err.emit(str(exc) + "\n" + traceback.format_exc(limit=8))
         finally:
+            self._wd_stop.set()  # 通知看门线程：脚本已结束，无需再等超时
             self._unsubscribe_all()
 
     def _watchdog(self) -> None:
-        time.sleep(self.timeout)
+        if self._wd_stop.wait(self.timeout):
+            return  # 脚本已正常结束，看门线程退出
         if not self._stop:
             self._abort = True
             self.log.emit("[超时] 脚本超过 %ss 未结束，已中止" % self.timeout)

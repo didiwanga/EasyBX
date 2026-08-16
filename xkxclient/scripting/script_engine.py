@@ -9,7 +9,6 @@ from PyQt6.QtCore import QObject
 from PyQt6.QtWidgets import QApplication
 
 from xkxclient.core.config import ConfigManager
-from xkxclient.core.resources import PROJECT_ROOT
 from xkxclient.scripting.lua_runtime import ScriptRunner
 
 DEFAULT_TIMEOUT = 3600.0
@@ -107,7 +106,8 @@ class ScriptManager(QObject):
         if not src.exists():
             raise FileNotFoundError(path)
         code = src.read_text(encoding="utf-8", errors="replace")
-        lua_dir = PROJECT_ROOT / "lua"
+        # lua/ 放用户数据目录（冻结打包后应用目录只读不可写）
+        lua_dir = ConfigManager.instance().root / "lua"
         lua_dir.mkdir(parents=True, exist_ok=True)
         dst = lua_dir / src.name
         dst.write_text(code, encoding="utf-8")

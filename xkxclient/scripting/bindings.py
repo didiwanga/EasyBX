@@ -55,14 +55,25 @@ def _coerce_list(value, split: bool = True) -> list:
 
 
 def _to_actions(action) -> list[dict]:
-    """把脚本层 action（字符串 / 命令列表 / 动作 dict）转成 ActionRunner 动作表。"""
+    """把脚本层 action（字符串 / 命令列表 / 动作 dict / lupa table）转成 ActionRunner 动作表。"""
     if isinstance(action, dict):
         return [dict(action)]
+    if hasattr(action, "keys") and not isinstance(action, (list, tuple, set)):
+        # lupa table（类 dict）：转成普通 dict，避免后续 dict() 失败
+        try:
+            return [dict(action)]
+        except (TypeError, ValueError):
+            pass
     if isinstance(action, (list, tuple)):
         cmds = " ; ".join(str(c) for c in action)
         return [{"type": "cmd", "command": cmds}] if cmds.strip() else []
     if isinstance(action, str):
         return [{"type": "cmd", "command": action}] if action.strip() else []
+    # lupa table 可能不可 dict()：用 _coerce_list 兜底转命令串
+    items = _coerce_list(action, split=False)
+    if items:
+        cmds = " ; ".join(str(c) for c in items)
+        return [{"type": "cmd", "command": cmds}] if cmds.strip() else []
     raise ValueError("action 仅支持字符串命令 / 命令列表 / 动作表")
 
 
@@ -196,7 +207,16 @@ class LuaBindings:
             return True
 
         def unsubscribe(topic: str) -> None:
-            w._bus_cbs.pop(str(topic), None)
+            t = str(topic)
+            w._bus_cbs.pop(t, None)
+            # 同时移除对应转发 handler 并真正退订总线，避免事件仍被入队
+            for t2, handler in list(w._sub_handlers):
+                if t2 == t:
+                    try:
+                        s.app.bus.unsubscribe(t2, sub=handler)
+                    except Exception:
+                        pass
+                    w._sub_handlers.remove((t2, handler))
 
         def publish(topic: str, data=None) -> None:
             s.app.bus.publish(str(topic), account=s.account_id, data=data)

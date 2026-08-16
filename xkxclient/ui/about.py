@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QDialog
-from PyQt6.QtGui import QPixmap
 
 from xkxclient.core import resources
 from xkxclient.version import VERSION

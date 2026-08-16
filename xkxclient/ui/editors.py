@@ -197,7 +197,7 @@ class ActionEdit(QWidget):
 
     def _on_del(self) -> None:
         row = self.list.currentRow()
-        if row >= 0:
+        if 0 <= row < len(self.actions):
             self.actions.pop(row)
             self._refresh()
 
@@ -1033,6 +1033,14 @@ class MacroEditor(_EditorBase):
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
             retry = "" if s.get("auto_retry", True) else "（不回退）"
             return f"移动并触发: {s.get('command', '')} → {pat} {retry}"
+        if t == "cruise":
+            conds = s.get("conditions") or []
+            pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
+            mode = "顺序" if s.get("mode", "ordered") == "ordered" else "随机"
+            hm = {"home_exec": "返回起点执行", "exec_home": "执行后返回",
+                  "exec": "仅执行", "home": "仅返回"}.get(s.get("hit_mode"), "")
+            rh = f"·{hm}" if hm else ""
+            return f"巡航[{mode}]: {s.get('range', '')} → {pat}{rh}"
         return f"{t}"
 
     def _on_step_save(self) -> None:
@@ -1052,7 +1060,7 @@ class MacroEditor(_EditorBase):
         self._persist_current()
         self._refresh()
         self.session.app.bus.publish("ui.message", account=self.session.account_id,
-                                     message=f"宏已保存（可继续编辑）")
+                                     message="宏已保存（可继续编辑）")
 
     def _on_step_add(self) -> None:
         dlg = StepDialog(self._steps, None, self)
@@ -1156,7 +1164,8 @@ class StepDialog(QDialog):
                     ("input", "等待输入"), ("trigger", "触发"), ("captcha", "验证码"),
                     ("branch", "判断分支"), ("loop", "计数循环"),
                     ("call_trigger", "调用触发"), ("call", "调用"),
-                    ("hit", "等待命中"), ("move_trigger", "移动并触发")]
+                    ("hit", "等待命中"), ("move_trigger", "移动并触发"),
+                    ("cruise", "巡航")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -1346,6 +1355,37 @@ class StepDialog(QDialog):
         self.mt_note = QLabel("逐个发送移动命令，每个命令等待一次触发命中；命中后延时再发下一个；超时则跳过当前命令继续。")
         self.mt_note.setStyleSheet("color:#c08040;")
 
+        # ---- 巡航页：范围 + 模式 + 触发条件 + 执行命令 + 延时 + 条件超时 + 巡航超时 + 返回起点 ----
+        self.cr_range_ed = QLineEdit()
+        self.cr_range_ed.setPlaceholderText("如 s;s;s&s;w;w;w&s;e;e（多个范围用 & 连接，八方向）")
+        self.cr_mode_cb = QComboBox()
+        self.cr_mode_cb.addItem("顺序巡航", "ordered")
+        self.cr_mode_cb.addItem("随机巡航", "random")
+        self.cr_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.cr_cond.setMinimumHeight(140)
+        self.cr_cmd_ed = QLineEdit()
+        self.cr_cmd_ed.setPlaceholderText("条件命中后执行的命令（可含 {变量}）")
+        self.cr_delay_sb = QSpinBox(); self.cr_delay_sb.setRange(0, 3600000)
+        self.cr_delay_sb.setSuffix(" ms")
+        self.cr_delay_sb.setToolTip("条件命中后延时执行指令")
+        self.cr_cond_timeout_sb = QSpinBox(); self.cr_cond_timeout_sb.setRange(0, 3600000)
+        self.cr_cond_timeout_sb.setSuffix(" ms")
+        self.cr_cond_timeout_sb.setToolTip("单个房间停留的最长时间；超时未命中则前往下一个位置点（0 = 无限等）")
+        self.cr_cruise_timeout_sb = QSpinBox(); self.cr_cruise_timeout_sb.setRange(0, 3600000)
+        self.cr_cruise_timeout_sb.setSuffix(" ms")
+        self.cr_cruise_timeout_sb.setToolTip("整个巡航的总时长；到达立即返回起始房间（0 = 无限巡航）")
+        self.cr_hit_mode_cb = QComboBox()
+        self.cr_hit_mode_cb.addItem("返回起始点执行", "home_exec")
+        self.cr_hit_mode_cb.addItem("执行后返回起始点", "exec_home")
+        self.cr_hit_mode_cb.addItem("仅执行", "exec")
+        self.cr_hit_mode_cb.addItem("仅返回", "home")
+        self.cr_hit_mode_cb.setToolTip("条件命中后的处理：返回起始点执行 = 先回起点再执行；"
+                                       "执行后返回起始点 = 先执行再回起点；仅执行 = 只执行不返回；仅返回 = 只回起点不执行")
+        self.cr_note = QLabel("以当前房间为起点按范围巡航；每个位置点等待条件命中，条件超时=单房间停留上限，"
+                              "命中后延时执行指令；全部位置点遍历完未命中且未超时则再巡航一轮；巡航超时到达立即返回起点。")
+        self.cr_note.setWordWrap(True)
+        self.cr_note.setStyleSheet("color:#c08040;")
+
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
 
@@ -1464,6 +1504,19 @@ class StepDialog(QDialog):
         mf.addRow("异常回退", retry_row)
         self._pages["move_trigger"] = p_mt
 
+        p_cr = QWidget()
+        cf2 = QFormLayout(p_cr)
+        cf2.addRow(self.cr_note)
+        cf2.addRow("巡航范围", self.cr_range_ed)
+        cf2.addRow("模式", self.cr_mode_cb)
+        cf2.addRow("触发条件", self.cr_cond)
+        cf2.addRow("执行命令", self.cr_cmd_ed)
+        cf2.addRow("命中后延时", self.cr_delay_sb)
+        cf2.addRow("条件超时", self.cr_cond_timeout_sb)
+        cf2.addRow("巡航超时", self.cr_cruise_timeout_sb)
+        cf2.addRow("命中后处理", self.cr_hit_mode_cb)
+        self._pages["cruise"] = p_cr
+
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
             self.stack.addWidget(self._pages[code])
@@ -1524,7 +1577,10 @@ class StepDialog(QDialog):
         jt = cond.get("type")
         if jt in ("contains", "regex", "cmp"):
             self.jump_cond_type.setCurrentIndex(max(0, self.jump_cond_type.findData(jt)))
-        self.jump_cond_pat.setText(cond.get("pattern", ""))
+        if jt == "cmp":
+            self.jump_cond_pat.setText(cond.get("var", ""))
+        else:
+            self.jump_cond_pat.setText(cond.get("pattern", ""))
         self.jump_cond_op.setCurrentIndex(max(0, self.jump_cond_op.findData(cond.get("op", "="))))
         self.jump_cond_val.setText(cond.get("value", ""))
         self._set_target(self.jump_target_cb, s.get("then"))
@@ -1627,6 +1683,24 @@ class StepDialog(QDialog):
             self.mt_timeout_sb.setValue(self._timeout_ms(s))
             self.mt_retry_cb.setChecked(bool(s.get("auto_retry", True)))
             self.mt_retry_sb.setValue(int(s.get("retry_max", 3)))
+
+        # 巡航步骤
+        if t == "cruise":
+            self.cr_range_ed.setText(s.get("range", ""))
+            self.cr_mode_cb.setCurrentIndex(
+                max(0, self.cr_mode_cb.findData(s.get("mode", "ordered"))))
+            cr_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
+                                                "pattern": s.get("pattern", "")}]
+            self.cr_cond.set_conditions(cr_conds)
+            self.cr_cond.set_relation(s.get("relation", "or"))
+            self.cr_cmd_ed.setText(s.get("command", ""))
+            self.cr_delay_sb.setValue(int(s.get("delay_ms", 0)))
+            self.cr_cond_timeout_sb.setValue(int(s.get("cond_timeout_ms", 0)))
+            self.cr_cruise_timeout_sb.setValue(int(s.get("cruise_timeout_ms", 0)))
+            hm = s.get("hit_mode", "home_exec")
+            if hm not in ("home_exec", "exec_home", "exec", "home"):
+                hm = "home_exec"
+            self.cr_hit_mode_cb.setCurrentIndex(max(0, self.cr_hit_mode_cb.findData(hm)))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
@@ -1883,6 +1957,19 @@ class StepDialog(QDialog):
             s["timeout_ms"] = self.mt_timeout_sb.value()
             s["auto_retry"] = self.mt_retry_cb.isChecked()
             s["retry_max"] = self.mt_retry_sb.value()
+        elif t == "cruise":
+            conds = list(self.cr_cond.conditions)
+            s["range"] = self.cr_range_ed.text().strip()
+            s["mode"] = self.cr_mode_cb.currentData() or "ordered"
+            s["relation"] = self.cr_cond.relation()
+            s["conditions"] = conds
+            s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
+            s["pattern"] = conds[0].get("pattern", "") if conds else ""
+            s["command"] = self.cr_cmd_ed.text().strip()
+            s["delay_ms"] = self.cr_delay_sb.value()
+            s["cond_timeout_ms"] = self.cr_cond_timeout_sb.value()
+            s["cruise_timeout_ms"] = self.cr_cruise_timeout_sb.value()
+            s["hit_mode"] = self.cr_hit_mode_cb.currentData() or "home_exec"
         self._step = s
         self.accept()
 

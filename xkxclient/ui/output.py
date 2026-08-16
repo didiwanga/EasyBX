@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections import deque
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QKeyEvent, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocumentFragment
 from PyQt6.QtWidgets import (
     QDialog,
@@ -128,9 +128,7 @@ class OutputView(QPlainTextEdit):
         """追加若干行。B5d：未跟随（暂停）时不滚动，只累计浮动按钮计数。
         B5：若处于跟随窗口模式（非回看），插入后把超出 5000 行的最顶行移入历史队列。
         """
-        sb = self.verticalScrollBar()
         was_following = self._following or self._is_at_bottom()
-        pos = sb.value()
         # 用独立文档光标插入，不影响当前活动光标（避免滚回可见触发自动回底）
         cursor = QTextCursor(self.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -158,7 +156,7 @@ class OutputView(QPlainTextEdit):
         if was_following:
             self.setTextCursor(cursor)
             self.ensureCursorVisible()
-            self._trim_history()
+            QTimer.singleShot(0, self._trim_history)
         else:
             # 非跟随（回看历史）期间不 trim：避免删除顶部行导致滚动条持续扰动，
             # 待用户回到底部恢复跟随后再统一裁剪。
@@ -171,33 +169,43 @@ class OutputView(QPlainTextEdit):
     def _trim_history(self) -> None:
         """B5：显示窗口 5000 行。把文档最顶行移入 _history，保留最新 _WINDOW_MAX 行。"""
         doc = self.document()
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()  # 合并为一次编辑，避免逐块删除触发多次重排/撤销记录
         while doc.blockCount() - 1 > _WINDOW_MAX:      # blockCount 含末尾空块
             blk = doc.firstBlock()
             if not blk.isValid() or not blk.length():
                 break
             self._history.append(blk.text())
-            cur = QTextCursor(blk)
+            cur.setPosition(blk.position())
             cur.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
+        cur.endEditBlock()
         self._view_all = False if doc.blockCount() - 1 <= _WINDOW_MAX else self._view_all
+        if self._search_matches:
+            # 顶部行被裁剪后，已记录的命中位置全部失效：清空，避免后续用旧位置
+            # setPosition 构造 ExtraSelection 时访问越界导致崩溃。
+            self._search_matches = []
+            self._search_index = -1
+            self.setExtraSelections([])
 
     def _load_earlier(self) -> None:
         """B5d：回看到达文档顶部并且历史队列仍有更早行时，把更多历史插入顶部。
         插入后用滚动条偏移补偿视觉位置（等效“向上扩展内容”），保持当前可见内容原位不动。
         """
-        if not self._history or self._view_all:
+        if not self._history:
+            self._view_all = False
             return
-        self._view_all = True
         lines = list(self._history)
         self._history.clear()
         sb = self.verticalScrollBar()
         old_value = sb.value()
         old_h = self.document().size().height()
-        for text_line in lines:
-            cur = QTextCursor(self.document())
-            cur.movePosition(QTextCursor.MoveOperation.Start)
-            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
-            cur.insertText(text_line + "\n")   # 插到最前：每行插在段落开头的行上方
+        cursor = QTextCursor(self.document())
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        text = "".join(ln + "\n" for ln in lines)
+        cursor.insertText(text)   # 整段一次性插入，避免逐行 insertText 的重排开销
+        cursor.endEditBlock()
         new_h = self.document().size().height()
         # 顶部插入 N 行后，文档变高；把滚动值同步下移插入高度，让原本可见的内容保持原位
         sb.setValue(int(old_value + (new_h - old_h)))
@@ -223,17 +231,21 @@ class OutputView(QPlainTextEdit):
     # ---------- 滚屏（B5d） ----------
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
+        # 注意：此回调处于 Qt 滚动/布局处理栈内，绝不能在这里直接改文档
+        # （insertText/removeSelectedText），大量文本时会导致布局引擎崩溃闪退。
+        # 只做标记，真正的加载/裁剪延迟到事件循环再执行。
         if self._is_at_top():
             if not self._view_all:
-                self._load_earlier()
+                self._view_all = True  # 先置位，避免事件循环期间重复触发
+                QTimer.singleShot(0, self._load_earlier)
         if self._is_at_bottom():
             if self._following is False and self._new_since_pause:
                 self._new_since_pause = 0
                 self.new_btn.setVisible(False)
-                self.jump_to_bottom()
+                QTimer.singleShot(0, self.jump_to_bottom)
             self._following = True
             # 回到底部恢复跟随后：一次性裁剪到窗口上限（回看期间跳过的 trim）
-            self._trim_history()
+            QTimer.singleShot(0, self._trim_history)
         else:
             self._following = False
 
@@ -304,7 +316,6 @@ class OutputView(QPlainTextEdit):
         base = QColor("#3a4a66")
         current = QColor("#b34700")
         extras = []
-        n = len(self._search_matches)
         for i, (a, b) in enumerate(self._search_matches):
             c = QTextCursor(self.document())
             c.setPosition(a)
@@ -359,6 +370,10 @@ class OutputView(QPlainTextEdit):
         self._search_matches = []
         self._search_index = -1
         self.setExtraSelections([])
+        self._view_all = False
+        self._following = True
+        self._new_since_pause = 0
+        self.new_btn.setVisible(False)
         super().clear()
 
     def clear_history(self) -> None:

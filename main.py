@@ -82,7 +82,10 @@ def _self_test() -> int:
         except OSError:
             pass
 
-    QTimer.singleShot(200, _poll)
+    poller = QTimer()
+    poller.setInterval(200)
+    poller.timeout.connect(_poll)
+    poller.start()
     app.exec()
     return 0 if result.get("ok") else 1
 
@@ -93,7 +96,7 @@ def main() -> int:
     if os.environ.get("EASYX_SELFTEST"):
         try:
             code = _self_test()
-        except Exception as exc:  # 任何异常都要能回读，避免黑盒
+        except Exception:  # 任何异常都要能回读，避免黑盒
             import traceback
 
             out_path = os.environ.get("EASYX_SELFTEST_OUT") or os.path.join(
