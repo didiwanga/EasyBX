@@ -4,10 +4,16 @@
 Lua 绑定、自动更新）都必须从这里读取，禁止在别处硬编码版本号。
 """
 
-VERSION = "1.2.27"
+VERSION = "1.2.28"
 
 # 版本更新记录（追加式：最新在前，过往往后排；部署时写入服务器清单 changelog 字段）
 CHANGELOG: list[dict] = [
+    {
+        "v": "1.2.28", "date": "2026-08-16",
+        "items": [
+            "修复下载进度到 100% 后无下文：QProgressDialog 自动重置触发 canceled 被误判为用户取消，禁用 autoReset/autoClose 并增加完成保护",
+        ],
+    },
     {
         "v": "1.2.27", "date": "2026-08-16",
         "items": [

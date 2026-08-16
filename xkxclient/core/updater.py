@@ -331,8 +331,10 @@ class UpdateManager(QObject):
         self._progress.setWindowTitle("更新 EasyBXb")
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(300)
-        self._progress.setAutoClose(True)
-        self._progress.setAutoReset(True)
+        # 关键：禁用自动关闭/重置。setAutoReset(True) 会在进度达到 maximum 时
+        # 自动 reset() 并触发 canceled 信号，导致 100% 时被误判为"用户取消"。
+        self._progress.setAutoClose(False)
+        self._progress.setAutoReset(False)
         self._progress.canceled.connect(self._cancel_download)
 
         req = QNetworkRequest(QUrl(url))
@@ -343,6 +345,11 @@ class UpdateManager(QObject):
         reply.finished.connect(self._on_download_done)
 
     def _cancel_download(self) -> None:
+        # 若下载已完成（finished 已发出），canceled 信号通常是进度条到 100%
+        # 的副作用，不应视为用户取消。
+        if self._download_reply is not None and self._download_reply.isFinished():
+            _log("cancel ignored: download already finished")
+            return
         _log("download cancelled by user")
         self._cancelled = True
         if self._download_reply is not None:
