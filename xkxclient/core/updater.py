@@ -327,12 +327,13 @@ class UpdateManager(QObject):
         except OSError:
             pass
 
-        self._progress = QProgressDialog("正在下载新版本…", "取消", 0, 100)
+        # 不用取消按钮（cancelButtonText=""）：QProgressDialog 的取消按钮在
+        # 进度到 100% 时可能触发 canceled 信号，被误判为用户取消而跳过更新。
+        # 下载完成后由 _on_download_done 手动关闭进度条。
+        self._progress = QProgressDialog("正在下载新版本…", "", 0, 100)
         self._progress.setWindowTitle("更新 EasyBXb")
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(300)
-        # 关键：禁用自动关闭/重置。setAutoReset(True) 会在进度达到 maximum 时
-        # 自动 reset() 并触发 canceled 信号，导致 100% 时被误判为"用户取消"。
         self._progress.setAutoClose(False)
         self._progress.setAutoReset(False)
         self._progress.canceled.connect(self._cancel_download)
