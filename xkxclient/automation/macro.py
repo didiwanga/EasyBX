@@ -6,6 +6,7 @@ from typing import Callable
 from PyQt6.QtCore import QObject, QTimer
 
 from xkxclient.automation.runner import split_commands, substitute
+from xkxclient.automation.trigger import play_ding
 from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.map import _DIR_OPPOSITE as _MAP_OPPOSITE
 
@@ -420,6 +421,8 @@ class MacroEngine(QObject):
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
         self.bus.publish("macro.wait_input", account=self.session.account_id,
                          name=name, var=var, prompt=prompt)
+        if step.get("beep"):
+            play_ding()
         if timeout_ms > 0:
             self._wait_input_timer = QTimer(self)
             self._wait_input_timer.setSingleShot(True)
@@ -1002,6 +1005,8 @@ class MacroEngine(QObject):
             if self._captcha_timer is not None:
                 self._captcha_timer.stop()
                 self._captcha_timer = None
+            if step.get("beep"):
+                play_ding()
             self._open_captcha_win(name, pos, var, url)
 
         self._captcha_sub = self.bus.subscribe("net.text_display", on_line)

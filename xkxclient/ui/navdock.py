@@ -596,6 +596,15 @@ class NavDock(QWidget):
             self._cap_timer.stop()
             self.status.setText("当前房间没有内建路径")
             return
+        if "内建路径出发点" in line and "不明确" in line:
+            # 出发点不明确：服务器不会给出表格，直接终止，不等超时
+            self._walk_capturing = False
+            self._walk_seen_header = False
+            self._cap_timer.stop()
+            if self.session is not None:
+                self.session.abort_walk_capture()
+            self.status.setText("当前区域的内建路径出发点暂时不明确")
+            return
         if self._walk_seen_header is False:
             if has_vbar and "目的地" in line and "拼音" in line:
                 self._walk_seen_header = True

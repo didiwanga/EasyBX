@@ -742,21 +742,18 @@ class TriggerEditor(_EditorBase):
         self.setWindowTitle("触发器编辑器")
 
     def _build_form(self) -> None:
-        self.match_cb = QComboBox()
-        for code, lab in _MATCH_LABELS:
-            self.match_cb.addItem(lab, code)
-        self.pattern_ed = QLineEdit()
-        self.delay_sb = QSpinBox(); self.delay_sb.setRange(0, 3600000); self.delay_sb.setSuffix(" ms")
-        self.oneshot_cb = QCheckBox("仅执行一次")
-        self.form.addRow("匹配类型", self.match_cb)
-        self.form.addRow("模式", self.pattern_ed)
-        self.form.addRow("延时", self.delay_sb)
-        self.form.addRow(self.oneshot_cb)
-
         # B3 多条件：与/或 关系 + 条件列表（条件编辑器组件，模板可含 {变量} 捕获）
         self.cond_edit = ConditionListEdit(allow_cmp=False, allow_status=True)
         self.cond_edit.setMinimumHeight(170)
         self.form.addRow("条件列表", self.cond_edit)
+
+        self.delay_sb = QSpinBox(); self.delay_sb.setRange(0, 3600000); self.delay_sb.setSuffix(" ms")
+        self.oneshot_cb = QCheckBox("仅执行一次")
+        self.beep_cb = QCheckBox("声音提醒")
+        self.beep_cb.setToolTip("命中时播放一声「叮」提醒")
+        self.form.addRow("延时", self.delay_sb)
+        opt_row = QHBoxLayout(); opt_row.addWidget(self.oneshot_cb); opt_row.addWidget(self.beep_cb)
+        self.form.addRow(opt_row)
 
         # B3 计数器
         self.cn_label = QLabel("命中 0 次")
@@ -769,17 +766,15 @@ class TriggerEditor(_EditorBase):
         self.form.addRow(self.actions)
 
     def _fill_extra(self, item: dict) -> None:
-        mt = item.get("match_type", "contains")
-        self.match_cb.setCurrentIndex(max(0, self.match_cb.findData(mt)))
-        self.pattern_ed.setText(item.get("pattern", ""))
         self.delay_sb.setValue(int(item.get("delay_ms", 0)))
         self.oneshot_cb.setChecked(bool(item.get("one_shot", False)))
+        self.beep_cb.setChecked(bool(item.get("beep", False)))
         self.actions.set_actions(item.get("actions", []))
         # 条件集 = 主条件(顶层 pattern) + 附加条件；兼容旧数据（conditions 非空但主条件独立）
         conds = [dict(c) for c in (item.get("conditions") or [])]
-        main = {"match_type": mt, "pattern": item.get("pattern", "")}
+        main = {"match_type": item.get("match_type", "contains"), "pattern": item.get("pattern", "")}
         if main["pattern"]:
-            if conds and conds[0].get("match_type") == mt and conds[0].get("pattern") == main["pattern"]:
+            if conds and conds[0].get("match_type") == main["match_type"] and conds[0].get("pattern") == main["pattern"]:
                 pass  # 首条件即主条件，避免重复
             else:
                 conds.insert(0, main)
@@ -788,14 +783,14 @@ class TriggerEditor(_EditorBase):
         self._refresh_counter()
 
     def _extra(self, d: dict) -> dict:
-        mt = self.match_cb.currentData()
         conds = list(self.cond_edit.conditions)
-        if not conds:
-            conds = [{"match_type": mt, "pattern": self.pattern_ed.text()}]
         # 主条件与顶层 pattern/匹配类型保持一致（引擎旧路径读顶层）
-        return {"match_type": conds[0].get("match_type", mt),
-                "pattern": conds[0].get("pattern", ""),
+        top_mt = conds[0].get("match_type", "contains") if conds else "contains"
+        top_pat = conds[0].get("pattern", "") if conds else ""
+        return {"match_type": top_mt,
+                "pattern": top_pat,
                 "delay_ms": self.delay_sb.value(), "one_shot": self.oneshot_cb.isChecked(),
+                "beep": self.beep_cb.isChecked(),
                 "actions": list(self.actions.actions),
                 "conditions": conds,
                 "relation": self.cond_edit.relation(),
@@ -1249,6 +1244,8 @@ class StepDialog(QDialog):
         self.var_ed = QLineEdit(); self.var_ed.setPlaceholderText("等待赋值的变量名，如 {v01}")
         self.prompt_ed = QLineEdit(); self.prompt_ed.setPlaceholderText("提示词（如 口令）")
         self.timeout_sb = QSpinBox(); self.timeout_sb.setRange(0, 3600000); self.timeout_sb.setSuffix(" ms")
+        self.input_beep_cb = QCheckBox("声音提醒")
+        self.input_beep_cb.setToolTip("开始等待时播放一声「叮」提醒")
 
         # ---- 触发器页：复用 B3 条件表单 ----
         self.trg_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
@@ -1265,6 +1262,8 @@ class StepDialog(QDialog):
         self.cap_var_ed.setPlaceholderText("接收验证码的变量名，如 code")
         self.cap_timeout_sb = QSpinBox(); self.cap_timeout_sb.setRange(100, 3600000)
         self.cap_timeout_sb.setValue(3000); self.cap_timeout_sb.setSuffix(" ms")
+        self.cap_beep_cb = QCheckBox("声音提醒")
+        self.cap_beep_cb.setToolTip("检测到验证码弹窗时播放一声「叮」提醒")
 
         # ---- 判断分支页：可选触发条件 + 关键字列表（每个关键字一个动作）+ 延时/超时 ----
         self.br_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
@@ -1398,6 +1397,7 @@ class StepDialog(QDialog):
         QFormLayout(p_input).addRow("变量名", self.var_ed)
         QFormLayout(p_input).addRow("提示词", self.prompt_ed)
         QFormLayout(p_input).addRow("超时", self.timeout_sb)
+        QFormLayout(p_input).addRow(self.input_beep_cb)
         self._pages["input"] = p_input
 
         p_trg = QWidget()
@@ -1412,6 +1412,7 @@ class StepDialog(QDialog):
         cf.addRow("发送命令", self.cap_cmd_ed)
         cf.addRow("变量名", self.cap_var_ed)
         cf.addRow("检测超时", self.cap_timeout_sb)
+        cf.addRow(self.cap_beep_cb)
         self._pages["captcha"] = p_cap
 
         p_branch = QWidget()
@@ -1516,6 +1517,7 @@ class StepDialog(QDialog):
         self.var_ed.setText(s.get("var", "") or "")
         self.prompt_ed.setText(s.get("prompt", ""))
         self.timeout_sb.setValue(self._timeout_ms(s))
+        self.input_beep_cb.setChecked(bool(s.get("beep", False)))
 
         cond = s.get("condition") or {}
         # 跳转
@@ -1573,6 +1575,7 @@ class StepDialog(QDialog):
             self.cap_cmd_ed.setText(s.get("command", ""))
             self.cap_var_ed.setText(s.get("var", "") or "")
             self.cap_timeout_sb.setValue(self._timeout_ms(s))
+            self.cap_beep_cb.setChecked(bool(s.get("beep", False)))
 
         # 判断分支步骤
         if t == "branch":
@@ -1826,6 +1829,7 @@ class StepDialog(QDialog):
             s["var"] = self.var_ed.text().strip() or "input"
             s["prompt"] = self.prompt_ed.text()
             s["timeout_ms"] = self.timeout_sb.value()
+            s["beep"] = self.input_beep_cb.isChecked()
         elif t == "trigger":
             conds = list(self.trg_cond.conditions)
             s["relation"] = self.trg_cond.relation()
@@ -1838,6 +1842,7 @@ class StepDialog(QDialog):
             s["command"] = self.cap_cmd_ed.text().strip()
             s["var"] = self.cap_var_ed.text().strip() or "captcha"
             s["timeout_ms"] = self.cap_timeout_sb.value()
+            s["beep"] = self.cap_beep_cb.isChecked()
         elif t == "branch":
             s["relation"] = self.br_cond.relation()
             s["conditions"] = list(self.br_cond.conditions)

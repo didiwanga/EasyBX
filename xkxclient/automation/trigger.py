@@ -1,12 +1,51 @@
 from __future__ import annotations
 
+import math
 import re
 
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QBuffer, QObject, QTimer
+from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 
 from xkxclient.automation.runner import ActionRunner
 
 TEMPLATE_VAR_RE = re.compile(r"\{(\w+)(?::(\w+))?\}")
+
+_ding_players: list = []
+
+
+def play_ding() -> None:
+    """播放一声合成「叮」（正弦衰减音，无需音频文件）。"""
+    if _ding_players:
+        return
+    sample_rate = 44100
+    duration = 0.4
+    freq = 1046.5  # C6
+    n = int(sample_rate * duration)
+    raw = bytearray()
+    for i in range(n):
+        t = i / sample_rate
+        env = math.exp(-6.0 * t)
+        v = max(-1.0, min(1.0, math.sin(2 * math.pi * freq * t) * env * 0.55))
+        s = int(v * 32767)
+        raw += s.to_bytes(2, "little", signed=True)
+    fmt = QAudioFormat()
+    fmt.setSampleRate(sample_rate)
+    fmt.setChannelCount(1)
+    fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+    buf = QBuffer()
+    buf.setData(bytes(raw))
+    buf.open(QBuffer.OpenModeFlag.ReadOnly)
+    sink = QAudioSink(QMediaDevices.defaultAudioOutput(), fmt)
+    sink.setVolume(0.9)
+    sink.start(buf)
+    holder = [buf, sink]
+    _ding_players.append(holder)
+    QTimer.singleShot(int(duration * 1000) + 200, lambda: _release(holder))
+
+
+def _release(holder: list) -> None:
+    if holder in _ding_players:
+        _ding_players.remove(holder)
 
 
 class Trigger:
@@ -16,7 +55,7 @@ class Trigger:
                  conditions: list | None = None, actions: list | None = None,
                  delay_ms: int = 0, enabled: bool = True, one_shot: bool = False,
                  counter: int = 0, shared: bool = False, group: str = "",
-                 relation: str = "or") -> None:
+                 relation: str = "or", beep: bool = False) -> None:
         self.name = name
         self.match_type = match_type
         self.pattern = pattern
@@ -29,6 +68,7 @@ class Trigger:
         self.counter = counter
         self.shared = shared
         self.group = group
+        self.beep = beep
         self._tmpl_regex = None
 
     @property
@@ -84,6 +124,7 @@ class TriggerEngine(QObject):
                 shared=bool(dd.get("shared", False)),
                 group=dd.get("group", ""),
                 relation=dd.get("relation", "or"),
+                beep=bool(dd.get("beep", False)),
             )
             self.triggers.append(t)
 
@@ -103,6 +144,8 @@ class TriggerEngine(QObject):
             self.bus.publish("trigger.fired", account=self.session.account_id,
                              name=trg.name, line=line,
                              counter=trg.counter, captures=captures)
+            if trg.beep:
+                play_ding()
             self._schedule(trg)
             if trg.one_shot:
                 trg.enabled = False

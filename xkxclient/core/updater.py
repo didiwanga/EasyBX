@@ -185,6 +185,22 @@ def _cleanup_stale_update_dir() -> None:
 # Qt 交互部分：启动时检测 + 下载 + 提示
 # ---------------------------------------------------------------------------
 
+def _format_changelog(data: dict) -> str:
+    """把清单 changelog 格式化为 HTML（最新在前，逐条展示）。"""
+    rows: list[str] = []
+    for entry in data.get("changelog") or []:
+        ver = str(entry.get("v") or entry.get("version") or "")
+        date = str(entry.get("date") or "")
+        items = entry.get("items") or []
+        head = f"<b>v{ver}</b>"
+        if date:
+            head += f" <span style='color:gray'>（{date}）</span>"
+        rows.append(f"<p style='margin:6px 0 2px 0'>{head}</p>")
+        for it in items:
+            rows.append(f"<p style='margin:0 0 1px 12px'>· {it}</p>")
+    return "".join(rows)
+
+
 class UpdateManager(QObject):
     """启动后异步检查新版本；发现新版则引导下载、确认、启动更新器并退出主程序。"""
 
@@ -247,15 +263,40 @@ class UpdateManager(QObject):
 
     def _prompt_update(self, data: dict) -> None:
         new_ver = str(data.get("version", ""))
-        box = QMessageBox()
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle("发现新版本")
-        box.setText(f"EasyBXb 有新版本可用：v{VERSION} → v{new_ver}")
-        box.setInformativeText("是否现在下载并更新？")
-        upd = box.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
-        later = box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(upd)
-        box.exec()
+        from PyQt6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
+                                     QScrollArea, QVBoxLayout)
+        dlg = QDialog()
+        dlg.setWindowTitle("发现新版本")
+        dlg.setMinimumSize(480, 360)
+        lay = QVBoxLayout(dlg)
+        top = QLabel(f"<b>EasyBXb 有新版本可用：v{VERSION} → v{new_ver}</b>")
+        top.setWordWrap(True)
+        lay.addWidget(top)
+
+        changelog = _format_changelog(data)
+        if changelog:
+            note = QLabel(f"本次更新内容（共 {len(data.get('changelog') or [])} 个版本，最新在最上方）：")
+            lay.addWidget(note)
+            body = QLabel(changelog)
+            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body.setWordWrap(True)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            inner = QWidget()
+            ilay = QVBoxLayout(inner)
+            ilay.addWidget(body)
+            ilay.addStretch(1)
+            scroll.setWidget(inner)
+            lay.addWidget(scroll, 1)
+
+        box = QDialogButtonBox()
+        upd = box.addButton("立即更新", QDialogButtonBox.ButtonRole.AcceptRole)
+        later = box.addButton("稍后", QDialogButtonBox.ButtonRole.RejectRole)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        lay.addWidget(box)
+        dlg.exec()
         if box.clickedButton() is upd:
             _log("user chose: update now")
             self._start_download(data)
