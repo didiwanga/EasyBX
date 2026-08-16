@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
         am.addAction("新建标签…", self._new_connection)
         am.addAction("关闭当前标签", self._close_current)
         am.addSeparator()
+        am.addAction("客户端用户…", self._open_client_user)
         am.addAction("编辑账户信息…", self._manage_accounts)
 
         sm = bar.addMenu("脚本")
@@ -499,6 +500,12 @@ class MainWindow(QMainWindow):
         from xkxclient.ui.login import AccountManagerDialog
 
         AccountManagerDialog(cfg.ConfigManager.instance(), self).exec()
+
+    def _open_client_user(self) -> None:
+        """账号菜单：客户端用户（注册/登录/云同步设置与自动化）。"""
+        from xkxclient.ui.clientuser import ClientUserDialog
+
+        ClientUserDialog(self.app, self).exec()
 
     def _command_fill(self, name: str) -> None:
         tab = self._tab()

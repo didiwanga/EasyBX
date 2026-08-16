@@ -4,7 +4,7 @@
 Lua 绑定、自动更新）都必须从这里读取，禁止在别处硬编码版本号。
 """
 
-VERSION = "1.2.17"
+VERSION = "1.2.18"
 
 # 更新服务器：阿里云 pytools.cloud（同一文件也通过 http://47.104.0.91 提供）
 UPDATE_BASE = "http://pytools.cloud"
@@ -16,6 +16,16 @@ MACRO_SHARE_BASE = UPDATE_BASE + "/api/macros"
 MACRO_SHARE_LIST_URL = MACRO_SHARE_BASE + "/list"
 MACRO_SHARE_GET_URL = MACRO_SHARE_BASE + "/get"
 MACRO_SHARE_UPLOAD_URL = MACRO_SHARE_BASE + "/upload"
+MACRO_SHARE_DELETE_URL = MACRO_SHARE_BASE + "/delete"
+
+# 客户端账号接口（同服务器 /api/user/*）
+USER_API_BASE = UPDATE_BASE + "/api/user"
+USER_REGISTER_URL = USER_API_BASE + "/register"
+USER_LOGIN_URL = USER_API_BASE + "/login"
+USER_SETTINGS_UPLOAD_URL = USER_API_BASE + "/settings/upload"
+USER_SETTINGS_DOWNLOAD_URL = USER_API_BASE + "/settings/download"
+USER_AUTOMATION_UPLOAD_URL = USER_API_BASE + "/automation/upload"
+USER_AUTOMATION_DOWNLOAD_URL = USER_API_BASE + "/automation/download"
 
 
 def parse_version(text: str) -> tuple:

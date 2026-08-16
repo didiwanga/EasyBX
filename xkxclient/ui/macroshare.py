@@ -38,12 +38,11 @@ class MacroShareDialog(QDialog):
         ll.addWidget(QLabel("我的宏（上传到服务器）："))
         self.local_list = QListWidget()
         ll.addWidget(self.local_list, 1)
-        self.author_ed = QLineEdit()
-        self.author_ed.setPlaceholderText("作者署名（可选）")
         self.desc_ed = QLineEdit()
         self.desc_ed.setPlaceholderText("一句话说明（可选）")
-        ll.addWidget(self.author_ed)
         ll.addWidget(self.desc_ed)
+        self.author_lb = QLabel("作者署名：未登录（分享需先登录客户端账号）")
+        ll.addWidget(self.author_lb)
         up_btn = QPushButton("上传选中宏 ⬆")
         up_btn.clicked.connect(self._upload)
         ll.addWidget(up_btn)
@@ -65,8 +64,11 @@ class MacroShareDialog(QDialog):
         refresh_btn.clicked.connect(self._refresh)
         dl_btn = QPushButton("下载选中宏 ⬇")
         dl_btn.clicked.connect(self._download)
+        del_btn = QPushButton("删除自己的宏")
+        del_btn.clicked.connect(self._delete)
         btn_row.addWidget(refresh_btn)
         btn_row.addWidget(dl_btn, 1)
+        btn_row.addWidget(del_btn)
         rl.addLayout(btn_row)
 
         splitter.addWidget(left)
@@ -80,6 +82,7 @@ class MacroShareDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         lay.addWidget(close_btn)
 
+        self._refresh_auth()
         self._load_local()
         self._refresh()
 
@@ -103,10 +106,15 @@ class MacroShareDialog(QDialog):
         if it is None:
             QMessageBox.information(self, "宏分享", "请先选中要上传的本地宏。")
             return
+        author = self._username()
+        if not author:
+            QMessageBox.information(self, "宏分享", "分享宏需先登录客户端账号（账号菜单→客户端用户）。")
+            return
         m = dict(it.data(Qt.ItemDataRole.UserRole))
         m.pop("shared", None)
         m.pop("enabled", None)
-        m["author"] = self.author_ed.text().strip()
+        m["author"] = author
+        m["owner"] = author
         m["desc"] = self.desc_ed.text().strip()
         m["type"] = "node" if m.get("graph") else "macro"
         try:
@@ -131,11 +139,14 @@ class MacroShareDialog(QDialog):
         if not self._remote:
             self.remote_list.addItem("（暂无共享宏）")
             return
+        me = self._username()
         for r in self._remote:
             name = r.get("name", "")
             kind = "节点图" if r.get("node") else "步骤"
-            author = r.get("author") or "匿名"
+            author = r.get("owner") or r.get("author") or "匿名"
             label = f"{name}  [{kind}]  {author}"
+            if me and r.get("owner") == me:
+                label += "  (我)"
             it = QListWidgetItem(label)
             it.setData(Qt.ItemDataRole.UserRole, r.get("name"))
             self.remote_list.addItem(it)
@@ -148,12 +159,45 @@ class MacroShareDialog(QDialog):
             if r.get("name") == name:
                 self.remote_detail.setPlainText(
                     f"名称：{r.get('name', '')}\n"
-                    f"作者：{r.get('author') or '匿名'}\n"
+                    f"作者：{r.get('owner') or r.get('author') or '匿名'}\n"
                     f"类型：{'节点图' if r.get('node') else '步骤宏'}\n"
                     f"下载次数：{r.get('downloads', 0)}\n"
                     f"上传时间：{r.get('time', '')}\n"
                     f"说明：{r.get('desc') or ''}")
                 return
+
+    def _username(self) -> str:
+        cfg = self.session.app.config
+        return str(cfg.get("client_user.username") or "")
+
+    def _refresh_auth(self) -> None:
+        name = self._username()
+        if name:
+            self.author_lb.setText(f"作者署名：{name}（分享后以该账号署名）")
+        else:
+            self.author_lb.setText("作者署名：未登录（分享需先登录客户端账号）")
+
+    def _delete(self) -> None:
+        it = self.remote_list.currentItem()
+        if it is None:
+            QMessageBox.information(self, "宏分享", "请先选中要删除的服务器宏。")
+            return
+        name = it.data(Qt.ItemDataRole.UserRole)
+        token = str(self.session.app.config.get("client_user.token") or "")
+        if not token:
+            QMessageBox.information(self, "宏分享", "删除宏需先登录客户端账号。")
+            return
+        ret = QMessageBox.question(self, "删除宏", f"确定删除共享宏「{name}」？",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            macroshare.delete_macro(name, token)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        QMessageBox.information(self, "宏分享", f"宏「{name}」已删除。")
+        self._refresh()
 
     def _download(self) -> None:
         it = self.remote_list.currentItem()

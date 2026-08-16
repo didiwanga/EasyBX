@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 # 宏分享端点（server/macro_server.py 部署在同目录）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from macro_server import handle_get_macros, handle_post_macros
+from user_server import handle_get_user, handle_post_user, _check_token
 
 DB_PATH = os.environ.get("MAP_DB") or (sys.argv[2] if len(sys.argv) > 2 else "/var/www/pytools-releases/map_v2.db")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5001
@@ -690,6 +691,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"area": area})
             elif path == "/api/map/export":
                 self.send_json(export_all(conn))
+            elif path == "/api/user/list":
+                code, payload = handle_get_user(q, path)
+                self.send_json(payload, code=code)
+                return
             elif path.startswith("/api/macros/"):
                 code, payload = handle_get_macros(q, path)
                 self.send_json(payload, code=code)
@@ -874,6 +879,23 @@ class Handler(BaseHTTPRequestHandler):
                     "note": "use /api/map/moves",
                     "stats": stats(conn),
                 })
+                return
+
+            if path == "/api/user/register" or path == "/api/user/login" or path.startswith("/api/user/"):
+                code, payload = handle_post_user(path, body)
+                self.send_json(payload, code=code)
+                return
+
+            if path == "/api/macros/delete":
+                # 删除宏归属校验：token 对应账号 == 宏归属
+                token = str(body.get("token") or "")
+                uid = _check_token(token)
+                if uid is None:
+                    self.send_json({"ok": False, "error": "登录已失效，请重新登录"}, code=401)
+                    return
+                body["owner"] = uid
+                code, payload = handle_post_macros(path, body)
+                self.send_json(payload, code=code)
                 return
 
             if path.startswith("/api/macros/"):

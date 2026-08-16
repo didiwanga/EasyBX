@@ -1,12 +1,13 @@
 """宏分享服务器处理（纯标准库，无框架依赖，供 map_server_v3.py 集成）。
 
 存储：目录下 store/ 文件夹，每个宏一个 JSON 文件 <safe_name>.json，
-元数据（作者/说明/下载/上传次数/时间）汇总在 store/.index.json。
+元数据（作者/说明/下载/上传次数/时间/归属账号）汇总在 store/.index.json。
 
 端点约定（由调用方路由）：
     GET  /api/macros/list     → {ok, count, macros:[...]}
     GET  /api/macros/get?name → {ok, macro}
     POST /api/macros/upload   → {ok, name}
+    POST /api/macros/delete   → {ok, name}（需 token，仅归属人可删）
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store")
 MAX_SIZE = 262144          # 上传宏上限 256KB
 MAX_NAME = 40
 MAX_DESC = 200
+MAX_UID_LEN = 40
 
 
 def safe_name(name: str) -> str:
@@ -59,6 +61,7 @@ def list_macros() -> dict:
         out.append({
             "name": meta.get("name", name),
             "author": meta.get("author", ""),
+            "owner": meta.get("owner", ""),
             "type": meta.get("type", "macro"),
             "node": bool(meta.get("node")),
             "desc": meta.get("desc", ""),
@@ -108,6 +111,7 @@ def upload_macro(data: dict) -> tuple[str, str | None]:
     meta = {
         "name": name,
         "author": (data.get("author") or "")[:20],
+        "owner": (data.get("owner") or "")[:MAX_UID_LEN],
         "type": data.get("type") or "macro",
         "node": bool(data.get("graph")),
         "desc": (data.get("desc") or "")[:MAX_DESC],
@@ -119,6 +123,7 @@ def upload_macro(data: dict) -> tuple[str, str | None]:
     _write_index(idx)
     # 清理下发字段，避免泄露进宏文件
     data.pop("author", None)
+    data.pop("owner", None)
     data.pop("desc", None)
     data.pop("type", None)
     try:
@@ -127,6 +132,26 @@ def upload_macro(data: dict) -> tuple[str, str | None]:
     except OSError as exc:
         return "", f"写入失败：{exc}"
     return name, None
+
+
+def delete_macro(name: str, owner: str) -> tuple[int, str | None]:
+    """删除共享宏。仅归属账号（owner）本人可删。成功返回 (200, None)，失败 (code, error)。"""
+    key = safe_name(name)
+    idx = _read_index()
+    meta = idx.get(key)
+    if meta is None:
+        return 404, "宏不存在"
+    if str(meta.get("owner") or "") != owner:
+        return 403, "只能删除自己分享的宏"
+    f = os.path.join(STORE_DIR, key + ".json")
+    try:
+        if os.path.exists(f):
+            os.remove(f)
+    except OSError as exc:
+        return 500, f"删除失败：{exc}"
+    idx.pop(key, None)
+    _write_index(idx)
+    return 200, None
 
 
 def handle_get_macros(query: dict, path: str) -> dict:
@@ -149,4 +174,10 @@ def handle_post_macros(path: str, body: dict) -> tuple[int, dict]:
         if err:
             return 400, {"ok": False, "error": err}
         return 200, {"ok": True, "name": name}
+    if path == "/api/macros/delete":
+        # 删除权限校验：token 对应账号 == 宏归属账号（由调用方传入 owner 已校验）
+        code, err = delete_macro(str(body.get("name") or ""), str(body.get("owner") or ""))
+        if err:
+            return code, {"ok": False, "error": err}
+        return 200, {"ok": True, "name": str(body.get("name") or "")}
     return 404, {"ok": False, "error": "not found"}

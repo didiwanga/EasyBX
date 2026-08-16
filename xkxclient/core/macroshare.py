@@ -15,6 +15,7 @@ import urllib.error
 
 from xkxclient.version import (
     MACRO_SHARE_LIST_URL, MACRO_SHARE_GET_URL, MACRO_SHARE_UPLOAD_URL,
+    MACRO_SHARE_DELETE_URL,
 )
 
 _TIMEOUT = 15
@@ -82,3 +83,11 @@ def upload_macro(macro: dict) -> str:
     req.add_header("Content-Type", "application/json; charset=utf-8")
     data = _read_json(req)
     return str(data.get("name") or "")
+
+
+def delete_macro(name: str, token: str) -> None:
+    """删除自己分享的宏（服务器校验 token 归属）。"""
+    body = json.dumps({"name": name, "token": token}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(MACRO_SHARE_DELETE_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    _read_json(req)
