@@ -1,4 +1,4 @@
-"""宏分享服务器处理（纯标准库，无框架依赖，供 map_server_v3.py 集成）。
+"""宏分享服务器处理（纯标准库，无框架依赖，供 api_server.py 集成）。
 
 存储：目录下 store/ 文件夹，每个宏一个 JSON 文件 <safe_name>.json，
 元数据（作者/说明/下载/上传次数/时间/归属账号）汇总在 store/.index.json。
