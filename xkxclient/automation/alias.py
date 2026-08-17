@@ -54,7 +54,8 @@ class AliasEngine:
             if rx is None:
                 continue
             m = rx.match(text)
-            if not m:
+            # 必须匹配完整输入行：避免 aj 误吞 aj1、pr 误吞 print 等前缀误命中
+            if not m or m.end() != len(text):
                 continue
             if a.actions:
                 from xkxclient.automation.runner import ActionRunner

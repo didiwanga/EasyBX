@@ -1,13 +1,38 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtNetwork import QTcpSocket
 
+from xkxclient.core.config import APP_DATA_ROOT
 from xkxclient.net import ansi
 from xkxclient.net.telnet import TelnetParser, GMCP_OPT, IAC, DO, SB, SE
 from xkxclient.version import VERSION
 
 CLIENT_ID = "EasyBXb"
+
+# 开发者调试：勾选关于窗口的 Debug 后为 True（仅本次运行有效，不持久化）。
+# 开启时把收到的原始字节（含 ANSI 码）追加写入 APP_DATA_ROOT\raw_dump.bin，
+# 便于复现服务器图形类输出并逐字节回放分析。
+DEBUG_DUMP = False
+_DEBUG_DUMP_PATH = APP_DATA_ROOT / "raw_dump.bin"
+_DEBUG_DUMP_MAX = 100 * 1024 * 1024
+
+
+def debug_dump_path() -> Path:
+    return _DEBUG_DUMP_PATH
+
+
+def _dump_raw(data: bytes) -> None:
+    try:
+        if _DEBUG_DUMP_PATH.exists() and _DEBUG_DUMP_PATH.stat().st_size > _DEBUG_DUMP_MAX:
+            return
+        _DEBUG_DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEBUG_DUMP_PATH, "ab") as f:
+            f.write(data)
+    except OSError:
+        pass
 
 
 class Connection(QObject):
@@ -101,6 +126,8 @@ class Connection(QObject):
 
     def _on_ready_read(self) -> None:
         data = bytes(self.sock.readAll())
+        if DEBUG_DUMP and data:
+            _dump_raw(data)
         text = self._parser.feed(data)
         self._tbuf += text
         # 按 \n 切行（含 \r\n 归一化）

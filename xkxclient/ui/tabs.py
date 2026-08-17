@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from xkxclient.ui.automationdock import arrow_move
 from xkxclient.ui.commands import CommandStore
+from xkxclient.ui.editors import reverse_commands
 from xkxclient.ui.findbar import FindBar
 from xkxclient.ui.output import OutputView
 from xkxclient.ui.widgets import ChannelBar
@@ -32,7 +33,7 @@ class InputLine(QLineEdit):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setPlaceholderText("输入命令，回车发送（Ctrl+↑/↓ 历史，Tab 补全；空输入时方向键移动）")
+        self.setPlaceholderText("输入命令，回车发送（Ctrl+回车 反向发送，Ctrl+↑/↓ 历史，Tab 补全；空输入时方向键移动）")
         self._store = CommandStore()
         self._history = None           # HistoryStore，由 bind 注入
         self._session = None           # 房间出口来源
@@ -108,9 +109,33 @@ class InputLine(QLineEdit):
             self.clear()
         self._tab_cands = []
 
+    def _send_reversed(self) -> None:
+        """Ctrl+回车：把输入的命令反向（命令顺序倒序 + 方向取反）后直接发送。
+
+        不改动输入框内容；历史记录反向后的实际发送文本，保留按钮行为与普通回车一致。
+        """
+        text = self.text()
+        if not text.strip():
+            return
+        reversed_text = reverse_commands(text)
+        if not reversed_text:
+            return
+        self.submit.emit(reversed_text)
+        if self._history is not None:
+            self._history.record(reversed_text)
+        if self.keep_btn.isChecked():
+            self.selectAll()
+        else:
+            self.clear()
+        self._tab_cands = []
+
     def keyPressEvent(self, e: QKeyEvent) -> None:
         key = e.key()
         ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        # Ctrl+回车：反向发送（不触发默认 returnPressed，避免双发）
+        if ctrl and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._send_reversed()
+            return
         # 历史翻页：Ctrl+↑ / Ctrl+↓（方向键已让位给移动）
         if ctrl and key == Qt.Key.Key_Up and self._history is not None:
             self.setText(self._history.back())

@@ -4,10 +4,20 @@
 Lua 绑定、自动更新）都必须从这里读取，禁止在别处硬编码版本号。
 """
 
-VERSION = "1.2.39"
+VERSION = "1.2.40"
 
 # 版本更新记录（追加式：最新在前，过往往后排；部署时写入服务器清单 changelog 字段）
 CHANGELOG: list[dict] = [
+    {
+        "v": "1.2.40", "date": "2026-08-17",
+        "items": [
+            "新增 Ctrl+回车 反向发送：命令顺序倒序 + 每条移动方向取反后直接发送（原输入框内容不变）",
+            "修复主输出 ANSI 图形错位：方向图形（§Θóòō＝▂▃▅▃▂┗┛╰╯ 等全角字形）与下方玩家名渐进错位，现按服务器 GBK 全角网格补齐宽度对齐",
+            "修复别名前缀误命中：别名 aj 会误吞 aj1、pr 会误吞 print 等，现必须整行完全匹配才算命中",
+            "修复 node/walk 列表读取期间用户指令被吞：读取分页表格时用户手动指令先本地排队，读取结束后自动补发，一条不丢",
+            "开发者调试：关于窗口新增 Debug 原始数据落盘开关（默认关闭，仅排查问题用）",
+        ],
+    },
     {
         "v": "1.2.39", "date": "2026-08-17",
         "items": [
@@ -75,7 +85,7 @@ UPDATE_BASE = "http://pytools.cloud"
 UPDATE_MANIFEST_URL = UPDATE_BASE + "/EasyBXb_version.json"
 UPDATE_DOWNLOAD_URL = UPDATE_BASE + "/EasyBXb.exe"
 
-# 宏分享接口（nginx 反代到服务器 map_server 的 /api/macros/*）
+# 宏分享接口（nginx 反代到服务器 api_server 的 /api/macros/*）
 MACRO_SHARE_BASE = UPDATE_BASE + "/api/macros"
 MACRO_SHARE_LIST_URL = MACRO_SHARE_BASE + "/list"
 MACRO_SHARE_GET_URL = MACRO_SHARE_BASE + "/get"

@@ -136,6 +136,11 @@ class AccountSession(QObject):
         self._walk_capture = False
         self._walk_capture_start = 0.0
         self._walk_in_table = False
+        # node/walk 读取期间用户手动指令：排队缓存，捕获结束自动补发
+        # （服务器分页模式会把并发输入当翻页键吞掉，线程化无用——连接是单流，
+        #   只能先缓存在本地、等分页窗口关闭后原样发出）
+        self._pending_inputs: list[str] = []
+        self._pending_inputs_msg = False
         # 分页自动继续（持续看门狗，见 _NODE_PAGE_GAP）
         self._node_page_lines = 0      # 表内累计行数（数据行+分隔线）
         self._node_page_sent = False   # 当前页是否已发过自动翻页
@@ -227,6 +232,8 @@ class AccountSession(QObject):
         self._look_buf = ""
         self._node_page_stop()
         self._pager_close()
+        self._pending_inputs = []
+        self._pending_inputs_msg = False
         self._macro_captcha_active = False
         if self._login is not None:
             self._login.dispose()
@@ -289,13 +296,55 @@ class AccountSession(QObject):
                               for c in cmd.split(";") if c.strip())
             else:
                 pieces.append(p)
+        if (self._node_capture or self._walk_capture) and pieces:
+            # node/walk 分页读取窗口内：指令排队，捕获结束自动补发，不直接发送
+            # （此时直发会被服务器分页器当翻页键吞掉）
+            self._queue_pending_input(pieces)
+            return
+        self._send_pieces(pieces)
+
+    def _send_pieces(self, pieces: list[str]) -> None:
+        """把命令片段（已别名展开）发往服务器：含 #wa/#N 走节流队列，否则直发。"""
+        from xkxclient.core.specialcmd import build_items, is_special
         if any(is_special(p) for p in pieces):
-            # 含 #wa / #N cmd：走节流队列（支持延时/重复，保持顺序），
-            # 保证交互命令与自动化命令一致的时序语义。
             self.throttle.enqueue_items(build_items(pieces))
         else:
             for piece in pieces:
                 self.connection.send_line(piece)
+
+    def _queue_pending_input(self, pieces: list[str]) -> None:
+        """node/walk 读取窗口内：用户指令先本地排队，等分页窗口关闭后补发。
+
+        服务器分页（more 模式）期间任何输入都会被当作翻页键吞掉，线程化也无法
+        解决（连接单流、服务器侧模态）。排队补发是最可靠的方案：指令一条不丢，
+        只是略延后到表格读取结束。
+        """
+        self._pending_inputs.extend(pieces)
+        if not self._pending_inputs_msg:
+            self._pending_inputs_msg = True
+            self.app.bus.publish("ui.message", account=self.account_id,
+                                 message="node/walk 读取中，指令已排队，读取结束后自动发送")
+
+    def _flush_pending_inputs(self) -> None:
+        """捕获窗口关闭后补发排队指令；若又进入了新的捕获窗口则继续保留。"""
+        if self._node_capture or self._walk_capture:
+            return
+        pending = self._pending_inputs
+        self._pending_inputs = []
+        self._pending_inputs_msg = False
+        if pending:
+            self._send_pieces(pending)
+
+    def _stop_capture(self, kind: str) -> None:
+        """统一关闭 node/walk 捕获并补发排队指令（所有捕获结束点走这里）。"""
+        if kind == "node":
+            self._node_capture = False
+            self._node_in_table = False
+        else:
+            self._walk_capture = False
+            self._walk_in_table = False
+        self._node_page_stop()
+        self._flush_pending_inputs()
 
     def _track_pending(self, text: str) -> None:
         """MapSync：记录用户发出的方向命令（含多个短名），供 GMCP.Move 确认对边。"""
@@ -418,14 +467,11 @@ class AccountSession(QObject):
         frame = any(ch in text for ch in "├┤┼┬┴")
         if not self._node_in_table and time.time() - self._node_capture_start > 5.0:
             # 等表头超过 5s：直接关闭，不再等（进表后此分支不再生效）
-            self._node_capture = False
-            self._node_in_table = False
+            self._stop_capture("node")
             return False
         if _NODE_EMPTY_MSG in text:
             # 空路径：捕获到此结束并静默（不上主输出）
-            self._node_page_stop()
-            self._node_capture = False
-            self._node_in_table = False
+            self._stop_capture("node")
             return True
         if not self._node_in_table:
             # 确认进入表格：含竖线的表头（名称/目的地）或顶框线 `┌…─` 行。
@@ -442,9 +488,7 @@ class AccountSession(QObject):
 # 已在表格内：仅吞表格结构行
         if "└" in text and "─" in text:
             # 表尾框线行：吞掉并结束捕获，重置分页状态
-            self._node_page_stop()
-            self._node_capture = False
-            self._node_in_table = False
+            self._stop_capture("node")
             return True
         if has_vbar or frame:
             # 吞入表格结构行并累计行数
@@ -464,9 +508,7 @@ class AccountSession(QObject):
         if self._node_page_sent:
             self._node_stray += 1
             if self._node_stray >= _NODE_STRAY_MAX:
-                self._node_page_stop()
-                self._node_capture = False
-                self._node_in_table = False
+                self._stop_capture("node")
         return False      # 普通文本照常上屏
 
     def _node_page_touch(self) -> None:
@@ -516,9 +558,7 @@ class AccountSession(QObject):
         避免服务器分页卡死时主输出被长期抑制。"""
         if not self._node_capture:
             return
-        self._node_capture = False
-        self._node_in_table = False
-        self._node_page_stop()
+        self._stop_capture("node")
 
 # ---- walk 命令捕获（内建路径表：目的地/拼音/步数，dock 调用）----
     def request_walk(self) -> None:
@@ -546,13 +586,10 @@ class AccountSession(QObject):
             return False
         has_vbar = "│" in text or "|" in text
         if not self._walk_in_table and time.time() - self._walk_capture_start > 5.0:
-            self._walk_capture = False
-            self._walk_in_table = False
+            self._stop_capture("walk")
             return False
         if "这里没有内建路径" in text or "没有内建" in text:
-            self._node_page_stop()
-            self._walk_capture = False
-            self._walk_in_table = False
+            self._stop_capture("walk")
             return True
         if not self._walk_in_table:
             if (has_vbar and "目的地" in text and "拼音" in text) or \
@@ -563,9 +600,7 @@ class AccountSession(QObject):
                 return True
             return False
         if "└" in text and "─" in text:
-            self._node_page_stop()
-            self._walk_capture = False
-            self._walk_in_table = False
+            self._stop_capture("walk")
             return True
         if has_vbar or any(ch in text for ch in "├┤┼┬┴"):
             self._node_page_lines += 1
@@ -579,18 +614,14 @@ class AccountSession(QObject):
         if self._node_page_sent:
             self._node_stray += 1
             if self._node_stray >= _NODE_STRAY_MAX:
-                self._node_page_stop()
-                self._walk_capture = False
-                self._walk_in_table = False
+                self._stop_capture("walk")
         return False
 
     def abort_walk_capture(self) -> None:
         """外部强制中止 walk 捕获。"""
         if not self._walk_capture:
             return
-        self._walk_capture = False
-        self._walk_in_table = False
-        self._node_page_stop()
+        self._stop_capture("walk")
 
     def _route_line(self, text: str, spans: list, highlight: bool = False) -> None:
         """频道分流（B5e）：【频道】行进聊天栏（富文本），永不回主输出；说道等对话直接进主屏。"""

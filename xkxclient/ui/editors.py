@@ -835,7 +835,7 @@ class AliasEditor(_EditorBase):
         super().__init__("别名", session, parent)
 
     def _build_form(self) -> None:
-        self.pattern_ed = QLineEdit(); self.pattern_ed.setPlaceholderText("别名/前缀/正则")
+        self.pattern_ed = QLineEdit(); self.pattern_ed.setPlaceholderText("匹配整行命令（正则，如 aj 或 go (.+)）")
         self.replacement_ed = QLineEdit(); self.replacement_ed.setPlaceholderText("展开命令（%1 捕获）")
         self.form.addRow("别名", self.pattern_ed)
         self.form.addRow("展开为", self.replacement_ed)

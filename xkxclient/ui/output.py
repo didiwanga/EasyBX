@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import deque
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
@@ -29,6 +30,25 @@ _HISTORY_MAX = 20000
 
 # 触发器命中行的整行高亮背景（深金色，避免与普通前景/背景冲突）
 _HIGHLIGHT_BG = QColor("#3d3410")
+
+_WIDE_CACHE: dict[str, bool] = {}
+
+
+def is_mud_wide(ch: str) -> bool:
+    """MUD/GBK 全角网格判定：GBK 双字节字形 = 2 格，ASCII = 1 格。
+
+    服务器按 GBK 全角网格排版（§、Θ、ó、＝、▂▃▅▃▂、┗┛ 等 GBK 双字节
+    字符均占 2 格）。编码字体（如更纱 Mono）常把这些字形渲染成 1 格，
+    导致图形列宽逐块塌缩错位，渲染时需按此规则补齐。
+    """
+    v = _WIDE_CACHE.get(ch)
+    if v is None:
+        try:
+            v = len(ch.encode("gbk")) >= 2
+        except UnicodeEncodeError:
+            v = unicodedata.east_asian_width(ch) in ("W", "F")
+        _WIDE_CACHE[ch] = v
+    return v
 
 
 class OutputView(QPlainTextEdit):
@@ -67,6 +87,8 @@ class OutputView(QPlainTextEdit):
         self._search_index = -1
         self._history: deque[QTextDocumentFragment] = deque(maxlen=_HISTORY_MAX)   # 已移出显示窗口的更早行（B5，保留富文本格式）
         self._view_all = False           # True：正处于回看历史（doc 可超 5000 行）
+        self._space_adv = 1
+        self._pad_need: dict[str, bool] = {}
 
         self._apply_font(cfg.ConfigManager.instance().get("font", {"family": "SimHei", "size": 12}))
 
@@ -89,6 +111,34 @@ class OutputView(QPlainTextEdit):
         # QPlainTextEdit 默认 tab 距是固定 80px，不随字体宽度取整，导致制表符
         # 对齐错位（数据本身没丢，复制出去在 notepad++ 里是对齐的）。
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
+        # 全角补齐缓存随字体重置
+        self._space_adv = self.fontMetrics().horizontalAdvance(" ")
+        self._pad_need = {}
+
+    def _needs_pad(self, ch: str) -> bool:
+        """该全角字形是否被字体渲染不足 2 格（需补一个空格撑足宽度）。"""
+        v = self._pad_need.get(ch)
+        if v is None:
+            v = self.fontMetrics().horizontalAdvance(ch) < self._space_adv * 1.75
+            self._pad_need[ch] = v
+        return v
+
+    def _insert_span_text(self, cursor: QTextCursor, text: str, fmt: QTextCharFormat) -> None:
+        """插入一个 span 的文本；MUD 全角网格补齐。
+
+        全角字形若字体渲染不足 2 格，则在该字形后补一个空格（空格继承同一
+        前景/背景，视觉上等于把该格撑满；字形仍靠格左，与服务器网格假设一致）。
+        无全角字符时零开销直插。
+        """
+        if not any(is_mud_wide(ch) for ch in text):
+            cursor.insertText(text, fmt)
+            return
+        parts = []
+        for ch in text:
+            parts.append(ch)
+            if is_mud_wide(ch) and self._needs_pad(ch):
+                parts.append(" ")
+        cursor.insertText("".join(parts), fmt)
 
     def mouseReleaseEvent(self, e) -> None:
         """点击输出区（读only）：焦点还给命令输入框，不拦截右键菜单/拖选。"""
@@ -143,7 +193,7 @@ class OutputView(QPlainTextEdit):
                     fmt.setForeground(QColor("#" + s.fg))
                 if s.bg:
                     fmt.setBackground(QColor("#" + s.bg))
-                cursor.insertText(s.text, fmt)
+                self._insert_span_text(cursor, s.text, fmt)
             if fold_key is not None and spans:
                 n = self._fold_counts.get(fold_key, 1)
                 fmt = QTextCharFormat()
