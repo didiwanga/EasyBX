@@ -90,7 +90,58 @@ def _self_test() -> int:
     return 0 if result.get("ok") else 1
 
 
+def _install_crash_logging() -> None:
+    """崩溃诊断：未捕获 Python 异常、faulthandler、Qt 消息全部落盘。
+
+    客户端曾出现 Qt6Core.dll 内 0xc0000409 断言崩溃（多账号跑宏时无预兆闪退），
+    无任何日志无法定位。这里三路记录，下次崩溃可从日志反推现场。
+    日志：%APPDATA%\\XkxClient\\crash.log 与 faulthandler.log。
+    """
+    import faulthandler
+    import time
+    import traceback
+
+    base = os.path.join(os.environ.get("APPDATA", ""), "XkxClient")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = ""
+
+    crash_path = os.path.join(base, "crash.log") if base else "crash.log"
+    fh_path = os.path.join(base, "faulthandler.log") if base else "faulthandler.log"
+
+    def _dump(kind: str, text: str) -> None:
+        try:
+            with open(crash_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write("=== %s %s ===\n%s\n" % (kind, time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        except OSError:
+            pass
+
+    def _excepthook(etype, value, tb) -> None:
+        _dump("PY-EXCEPTION", "".join(traceback.format_exception(etype, value, tb)))
+        sys.__excepthook__(etype, value, tb)
+
+    sys.excepthook = _excepthook
+
+    try:
+        faulthandler.enable(open(fh_path, "a", encoding="utf-8", errors="replace"))
+    except Exception:
+        pass
+
+    try:
+        from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
+
+        def _qt_handler(mode, _ctx, msg) -> None:
+            if int(mode.value) >= int(QtMsgType.QtWarningMsg.value):
+                _dump("QT-%s" % mode, msg)
+
+        qInstallMessageHandler(_qt_handler)
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _install_crash_logging()
     if _run_updater():
         return 0
     if os.environ.get("EASYX_SELFTEST"):

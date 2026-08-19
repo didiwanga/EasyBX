@@ -14,7 +14,8 @@ from xkxclient.core.fullme import extract_fullme_url
 # 泼皮等 NPC 瞬时拦路 / busy（不能移动）时移动通常仍会成功（GMCP.Move result=true 会推），
 # 立即判定失败并反向回退反而造成走位错乱。命中后延迟确认，等待 GMCP 结果或超时；
 # 只有 GMCP.Move result=false（撞墙/真失败）才触发失败回退。
-_MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动")
+# 「一脚深一脚浅」为河边/江边移动艰难：移动未完成，同样延迟确认等待 GMCP true。
+_MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动", "一脚深一脚浅")
 
 # 泼皮等 NPC 拦路造成的 busy 通常持续 2-5 秒：拦路/失败后等待确认或停顿重试的时长。
 # 太短会在 busy 未结束时重发而反复失败；3-5 秒停顿后 busy 结束即可正常推进下一步。
@@ -614,6 +615,9 @@ class MacroEngine(QObject):
                 self._trigger_timer = None
             # 模板变量捕获（B3：命名/编号都支持）；只取命中条件的模板名，
             # 保证 or 关系下 names 与 captures 一一对应不错位。
+            # 颜色捕获：模板声明 `{名:color}` 时把捕获段前景色写入 `名:color` 变量。
+            from xkxclient.net.ansi import fg_at
+            segments = payload.get("segments") or []
             names: list = []
             if relation == "and":
                 for c in conds:
@@ -632,10 +636,21 @@ class MacroEngine(QObject):
                 var = self._varname(var)
                 if var:
                     self.session.vars[var] = g
+                    if _color:
+                        fg = fg_at(segments, line, str(g))
+                        if fg:
+                            self.session.vars[f"{var}:color"] = fg
             if not names:
                 for i, cap in enumerate(captures or [], 1):
                     self.session.vars[f"v{i:02d}"] = cap
-            self._goto(name, return_pos)
+                    fg = fg_at(segments, line, str(cap))
+                    if fg:
+                        self.session.vars[f"v{i:02d}:color"] = fg
+            on_hit = step.get("on_hit") or {}
+            if on_hit.get("type"):
+                self._exec_on_hit(name, on_hit, pos, return_pos)
+            else:
+                self._goto(name, return_pos)
 
         self._trigger_sub = self.bus.subscribe("net.text_display", on_line)
         if timeout_ms > 0:
@@ -731,7 +746,11 @@ class MacroEngine(QObject):
                 tm.stop()
             if name in self._active:
                 if ok:
-                    self._goto(name, pos + 1)
+                    on_hit = step.get("on_hit") or {}
+                    if on_hit.get("type"):
+                        self._exec_on_hit(name, on_hit, pos, pos + 1)
+                    else:
+                        self._goto(name, pos + 1)
                 else:
                     self._halt(name)
 
@@ -754,12 +773,8 @@ class MacroEngine(QObject):
 
         # 周期重发：每 delay_ms 未命中则重发命令
         if delay_ms > 0:
-            from PyQt6.QtCore import QTimer as _QT
-            tm = _QT(self)
-            tm.setSingleShot(False)
-            tm.timeout.connect(lambda: (send_cmd() if not done[0] else None))
-            tm.start(delay_ms)
-            self._timers[name] = tm
+            self._arm_timer(name, delay_ms, lambda: (send_cmd() if not done[0] else None),
+                            repeat=True)
 
     def _hit_match(self, c: dict, line: str) -> bool:
         from xkxclient.automation.trigger import Trigger
@@ -898,11 +913,7 @@ class MacroEngine(QObject):
             if skip:
                 # 括号命令：只按延时执行，不走触发/超时
                 if delay_ms > 0:
-                    tm = QTimer(self)
-                    tm.setSingleShot(True)
-                    tm.timeout.connect(lambda: next_or_finish(idx + 1))
-                    tm.start(delay_ms)
-                    self._timers[name] = tm
+                    self._arm_timer(name, delay_ms, lambda: next_or_finish(idx + 1))
                 else:
                     next_or_finish(idx + 1)
             else:
@@ -946,11 +957,7 @@ class MacroEngine(QObject):
                         block_timer[0] = None
                     unsubscribe()
                     if delay_ms > 0:
-                        tm = QTimer(self)
-                        tm.setSingleShot(True)
-                        tm.timeout.connect(lambda: next_or_finish(idx + 1))
-                        tm.start(delay_ms)
-                        self._timers[name] = tm
+                        self._arm_timer(name, delay_ms, lambda: next_or_finish(idx + 1))
                     else:
                         next_or_finish(idx + 1)
 
@@ -973,11 +980,7 @@ class MacroEngine(QObject):
                         waited[0] = True
                         unsubscribe()
                         if delay_ms > 0:
-                            tm = QTimer(self)
-                            tm.setSingleShot(True)
-                            tm.timeout.connect(lambda: next_or_finish(idx + 1))
-                            tm.start(delay_ms)
-                            self._timers[name] = tm
+                            self._arm_timer(name, delay_ms, lambda: next_or_finish(idx + 1))
                         else:
                             next_or_finish(idx + 1)
                     return
@@ -1029,11 +1032,7 @@ class MacroEngine(QObject):
                 return
             # 原地延时重发原命令（走完整 wait：订阅触发 + GMCP）。
             # 停顿 _RETRY_WAIT_MS 覆盖泼皮 busy 周期：busy 结束后重发即成功。
-            tm = QTimer(self)
-            tm.setSingleShot(True)
-            tm.timeout.connect(lambda: send(idx))
-            tm.start(max(_RETRY_WAIT_MS, delay_ms))
-            self._timers[name] = tm
+            self._arm_timer(name, max(_RETRY_WAIT_MS, delay_ms), lambda: send(idx))
 
         def finish() -> None:
             if done[0]:
@@ -1041,7 +1040,11 @@ class MacroEngine(QObject):
             done[0] = True
             cleanup()
             if name in self._active:
-                self._goto(name, pos + 1)
+                on_hit = step.get("on_hit") or {}
+                if on_hit.get("type"):
+                    self._exec_on_hit(name, on_hit, pos, pos + 1)
+                else:
+                    self._goto(name, pos + 1)
 
         def next_or_finish(idx: int) -> None:
             if idx >= len(cmds):
@@ -1206,11 +1209,7 @@ class MacroEngine(QObject):
                     if name in self._active:
                         handle_hit()
                 if delay_ms > 0:
-                    tm = QTimer(self)
-                    tm.setSingleShot(True)
-                    tm.timeout.connect(fire)
-                    tm.start(delay_ms)
-                    self._timers[name] = tm
+                    self._arm_timer(name, delay_ms, fire)
                 else:
                     fire()
 
@@ -1411,12 +1410,41 @@ class MacroEngine(QObject):
             self._close_captcha()
         self.bus.publish("macro.end", account=self.session.account_id, name=name)
 
+    def _arm_timer(self, name: str, ms: int, callback, repeat: bool = False) -> None:
+        """延时/周期定时：复用每宏名常驻 QTimer（_timers[name]），不在每次调用时新建。
+
+        Windows 下 Qt 定时器 ID 复用会让新 QTimer 立即触发（qutebrowser #8191），
+        判断/判断分支/等待命中/移动并触发命中后若每次新建定时器会立刻递归执行导致闪退。
+        复用同一 timer：先 stop+disconnect 旧连接再 start 新延时，同一宏任一时刻只有一个待触发的定时器。
+        """
+        tm = self._timers.get(name)
+        if tm is None:
+            tm = QTimer(self)
+            self._timers[name] = tm
+        try:
+            tm.timeout.disconnect()
+        except TypeError:
+            pass  # 无旧连接
+        tm.stop()
+        tm.setSingleShot(not repeat)
+        tm.timeout.connect(callback)
+        tm.start(ms)
+
     def _chain(self, name: str, ms: int, next_pos: int) -> None:
-        tm = QTimer(self)
-        tm.setSingleShot(True)
+        # 复用每个宏名的 QTimer，而非每次新建：Windows 下 Qt 定时器 ID 复用
+        # 会让新 QTimer 立即触发（qutebrowser #8191），长时运行后宏延时也会
+        # 变成立即执行。每宏名常驻一个定时器，反复 start 即可。
+        tm = self._timers.get(name)
+        if tm is None:
+            tm = QTimer(self)
+            tm.setSingleShot(True)
+            self._timers[name] = tm
+        try:
+            tm.timeout.disconnect()
+        except TypeError:
+            pass  # 无旧连接
         tm.timeout.connect(lambda: self._goto(name, next_pos))
         tm.start(ms)
-        self._timers[name] = tm
 
     def _goto(self, name: str, target) -> None:
         m = self._active.get(name)
@@ -1589,16 +1617,27 @@ class MacroEngine(QObject):
         self._trigger_timer.start(timeout_ms)
 
     def _branch_later(self, name: str, pos: int, branch, ms: int) -> None:
-        """延时后执行判断/状态分支（含动作 + 去向）。"""
-        tm = QTimer(self)
-        tm.setSingleShot(True)
+        """延时后执行判断/状态分支（含动作 + 去向）。
+
+        复用每宏名常驻 QTimer（_timers[name]），不在每次调用时新建——
+        Windows 下 Qt 定时器 ID 复用会让新 QTimer 立即触发（qutebrowser #8191），
+        判断/判断分支命中且配置延时后会立刻递归执行分支导致闪退。
+        """
+        tm = self._timers.get(name)
+        if tm is None:
+            tm = QTimer(self)
+            tm.setSingleShot(True)
+            self._timers[name] = tm
+        try:
+            tm.timeout.disconnect()
+        except TypeError:
+            pass
 
         def go():
             if name in self._active:
                 self._goto_branch(name, pos, branch)
         tm.timeout.connect(go)
         tm.start(ms)
-        self._timers[name] = tm
 
     def _goto_branch(self, name: str, pos: int, branch) -> None:
         """执行判断/状态分支：可选动作（cmd/set）+ 去向（标签/序号），缺省继续下一行。"""
@@ -1686,11 +1725,17 @@ class MacroEngine(QObject):
                 self._trigger_timer = None
             action = kw.get("action") or {}
             if delay_ms > 0:
-                tm = QTimer(self)
-                tm.setSingleShot(True)
+                tm = self._timers.get(name)
+                if tm is None:
+                    tm = QTimer(self)
+                    tm.setSingleShot(True)
+                    self._timers[name] = tm
+                try:
+                    tm.timeout.disconnect()
+                except TypeError:
+                    pass
                 tm.timeout.connect(lambda: self._exec_branch_action(name, action, pos))
                 tm.start(delay_ms)
-                self._timers[name] = tm
             else:
                 self._exec_branch_action(name, action, pos)
 
@@ -1723,6 +1768,32 @@ class MacroEngine(QObject):
                 self._goto(name, pos + 1)
         else:
             self._goto(name, pos + 1)
+
+    def _exec_on_hit(self, name: str, on_hit: dict, pos: int, return_pos: int) -> None:
+        """触发/等待命中/移动并触发步骤的「命中后操作」：cmd(发命令) / jump(跳转) / set(变量赋值)。
+
+        执行后去向：cmd 发完继续 return_pos；jump 跳 target（缺省 return_pos）；
+        set 赋值后带 target 跳转，否则继续 return_pos。jump/set 带 target 走异步跳转避免递归。
+        """
+        t = on_hit.get("type")
+        if t == "cmd":
+            for cmd in split_commands(substitute(on_hit.get("command", ""), self.session.vars)):
+                self.session.send_auto(cmd)
+            self._goto(name, return_pos)
+        elif t == "jump":
+            target = on_hit.get("target")
+            self._goto_later(name, target if target not in (None, "") else return_pos)
+        elif t == "set":
+            var = self._varname(on_hit.get("var", ""))
+            if var:
+                self.session.vars[var] = substitute(str(on_hit.get("value", "")), self.session.vars)
+            target = on_hit.get("target")
+            if target not in (None, ""):
+                self._goto_later(name, target)
+            else:
+                self._goto(name, return_pos)
+        else:
+            self._goto(name, return_pos)
 
     def _status(self, name: str, step: dict, pos: int) -> None:
         """状态步骤（B3b 新增 ⑧）：判断 GMCP 状态属性是否满足比较条件。

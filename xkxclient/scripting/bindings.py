@@ -200,6 +200,12 @@ class LuaBindings:
             w._bus_cbs.setdefault(str(topic), []).append(callback)
 
             def handler(payload: dict) -> None:
+                # 多开隔离：事件带 account 时只入队本账户的；不带 account 的
+                # 全局事件（如 config.changed）放行。否则别的标签页的文本/状态
+                # 会串进本脚本回调，造成脚本逻辑串台。
+                acc = payload.get("account")
+                if acc is not None and acc != s.account_id:
+                    return
                 w._enqueue(str(topic), payload)
 
             w._sub_handlers.append((str(topic), handler))

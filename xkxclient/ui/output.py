@@ -66,6 +66,7 @@ class OutputView(QPlainTextEdit):
     command_send_requested = pyqtSignal(str)   # 右键：发送命令（填入并执行）
     look_send_requested = pyqtSignal(str)      # 右键：直接发送 look + 选中文本
     ask_fill_requested = pyqtSignal(str)       # 右键：填入 ask + 选中文本 + about
+    localmaps_requested = pyqtSignal(str)      # 右键：发送 localmaps + 选中文本（本地地图查找）
     notepad_add_requested = pyqtSignal(object) # 右键：添加到记事本（QTextDocumentFragment）
     autopage_hit = pyqtSignal(int)
     search_hits_updated = pyqtSignal(list)   # B5：当前命中行列表 [(行号1基, 全文)]，供分屏显示
@@ -447,6 +448,7 @@ class OutputView(QPlainTextEdit):
         menu.addAction("填写命令", lambda: self.command_fill_requested.emit(sel))
         menu.addAction("发送命令", lambda: self.command_send_requested.emit(sel))
         menu.addAction("看", lambda: self.look_send_requested.emit(sel))
+        menu.addAction("在本地地图中查找", lambda: self.localmaps_requested.emit(sel))
         menu.addAction("NPC对话", lambda: self.ask_fill_requested.emit(sel))
         menu.addSeparator()
         menu.addAction("搜索…", lambda: self.search_requested.emit(raw))

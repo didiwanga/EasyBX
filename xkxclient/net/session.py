@@ -12,6 +12,7 @@ from xkxclient.core.dsl import DslEngine
 from xkxclient.core.fullme import extract_fullme_url
 from xkxclient.core.history import HistoryStore
 from xkxclient.core.map import MapCache
+from xkxclient.core.mapsync import MapSync
 from xkxclient.core.state import CharacterState
 from xkxclient.net.connection import Connection
 from xkxclient.parse.look import LookParser
@@ -26,6 +27,12 @@ _BUF_PROMPTS = ("命令进入缓冲", "命令缓冲", "指令进入缓冲")
 # node 表格框线字符：捕获期间仅抑制含这些字符的行，其余信息照常上屏
 _NODE_BOX_CHARS = "│┌┐└┘├┤─"
 _NODE_EMPTY_MSG = "这里没有玩家定义的路径"
+# walk -c 在无内建路径区域的各种失败回显（navdock 自动刷新时会频繁出现，
+# 属正常现象，捕获窗口内一律静默吞掉，不上主输出打扰）
+_WALK_NO_PATH_MSGS = (
+    "这里没有内建路径", "没有内建",
+    "你不能在这里定义路径", "内建路径出发点",
+)
 # node 数据行兜底：`[│|]?[★☆]?ASCII名称│`（表头页丢失时也能进表）
 _NODE_ROW_RE = re.compile(r"^\s*[│|]?\s*[★☆]?\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[│|]")
 # node 表格分页自动继续（持续看门狗）。服务器每页约 40 行内容 + 一条
@@ -36,7 +43,7 @@ _NODE_ROW_RE = re.compile(r"^\s*[│|]?\s*[★☆]?\s*[a-zA-Z_][a-zA-Z0-9_]*\s*[
 #   进表即启动；每次收到表格行/提示行都刷新时间戳并重排定时器；
 #   超过 _NODE_PAGE_GAP 秒没有表格活动 → 判定服务器等翻页输入 → 自动补发
 #   空指令；翻页生效收到新行后复位；多次补发仍无进展则停止探测。
-_NODE_PAGE_GAP = 2.0          # 表格停摆多少秒判定为等待分页输入（>提示行 ~1s 延迟）
+_NODE_PAGE_GAP = 1.0          # 表格停摆多少秒判定为等待分页输入（正常由提示行即时翻页，停摆 1s 才兜底补发）
 _NODE_PAGE_RETRY_MAX = 4      # 单次停摆最多补发几次空指令，之后静默等超时收尾
 # 自动翻页后：连续收到这么多非表格行 ⇒ 判定 node 已无数据，关闭捕获。
 _NODE_STRAY_MAX = 2
@@ -45,9 +52,8 @@ _NODE_STRAY_MAX = 2
 # 提示行即进入分页会话，此后内容/提示行停摆超过 _PAGER_GAP 秒仍无进展 →
 # 判定服务器分页在等输入，自动补发翻页；补发仍无进展则按上限重试后放弃。
 # 结束条件：裸 `> ` 提示行（服务器已回到正常命令环）、用户新发命令、或重试封顶。
-# 间隔取 1.5s：大于提示行晚于页内容 ~1s 的典型延迟（正常流程不会误触），
-# 又足够快地兜住「首次回车未生效」的情况（实测 help list 即需补发）。
-_PAGER_GAP = 1.5
+# 间隔取 1s：提示行正常到达时即时翻页，这里仅兜底「提示行漏识别/首次回车未生效」的情况。
+_PAGER_GAP = 1.0
 _PAGER_RETRY_MAX = 4
 
 DEFAULT_PROMPTS = {
@@ -117,6 +123,12 @@ class AccountSession(QObject):
         self.look_capture = LookCapture(app.bus, self.map_cache, self)
         self.navigator = Navigator(self.map_cache, self, app.bus, self)
         self.auto_look = ConfigManager.instance().get("map.auto_look", False)
+        # 地图上下端同步（mapsync.py）：登录后拉全量、行走上报、定时拉增量
+        self.map_sync = MapSync(
+            self.map_cache, account_id,
+            on_status=lambda ok, err: self.app.bus.publish(
+                "map.sync_state", account=self.account_id, ok=ok, error=err))
+        self._map_sync_timer: QTimer | None = None
 
         # 技能/look 文本捕获
         self._capture_skills = False
@@ -132,15 +144,23 @@ class AccountSession(QObject):
         self._node_capture = False
         self._node_capture_start = 0.0
         self._node_in_table = False
+        self._node_pending = False   # 顶框线 `┌…─` 待确认（区分技能面板等外部表格）
+        self._node_foreign = False  # 外部表格（技能面板等）穿插中：吞行不上表
         # walk 命令捕获：目的地/拼音/步数表格，拦截方式同 node
         self._walk_capture = False
         self._walk_capture_start = 0.0
         self._walk_in_table = False
+        self._walk_pending = False   # 顶框线待确认
+        self._walk_foreign = False   # 外部表格穿插中
         # node/walk 读取期间用户手动指令：排队缓存，捕获结束自动补发
         # （服务器分页模式会把并发输入当翻页键吞掉，线程化无用——连接是单流，
         #   只能先缓存在本地、等分页窗口关闭后原样发出）
         self._pending_inputs: list[str] = []
         self._pending_inputs_msg = False
+        # 自动导航刷新最近时间戳（request_node/request_walk 更新）：用于兜底静默
+        # node/walk 自动刷新在无路径区域产生的噪声提示（如"你不能在这里定义路径"），
+        # 即使捕获窗口因超时/交错关闭，也能按时间窗口吞掉，不打扰主输出。
+        self._nav_auto_recent = 0.0
         # 分页自动继续（持续看门狗，见 _NODE_PAGE_GAP）
         self._node_page_lines = 0      # 表内累计行数（数据行+分隔线）
         self._node_page_sent = False   # 当前页是否已发过自动翻页
@@ -215,6 +235,9 @@ class AccountSession(QObject):
 
     def _on_connected(self, host: str) -> None:
         self.connected = True
+        # 重连/重登后恢复发送泵：close() 曾停掉的 throttle timer 需重启，
+        # 否则宏指令全部积压（手动直发不受影响，表现为"宏启动无反应"）。
+        self.throttle.start()
         # 重连后恢复定时器（interval 由 _schedule_all 重启，日历式由 tick 恢复）
         self.timers.load(list(ConfigManager.instance().automation(self.account_id).get("timers", [])))
         self.app.bus.publish("net.connected", account=self.account_id, host=host)
@@ -296,12 +319,30 @@ class AccountSession(QObject):
                               for c in cmd.split(";") if c.strip())
             else:
                 pieces.append(p)
+        # 变量代入：命令框/快捷动作输入 `{变量}` 引用触发器/宏捕获的变量
+        from xkxclient.automation.runner import substitute
+        pieces = [substitute(p, self.vars) for p in pieces]
         if (self._node_capture or self._walk_capture) and pieces:
             # node/walk 分页读取窗口内：指令排队，捕获结束自动补发，不直接发送
             # （此时直发会被服务器分页器当翻页键吞掉）
+            self._echo_command(text)
             self._queue_pending_input(pieces)
             return
+        self._echo_command(text)
         self._send_pieces(pieces)
+
+    def _echo_command(self, text: str) -> None:
+        """用户指令回显：真正发送前把 `> <指令>` 上屏主输出，便于确认已发出。
+
+        仅手动发送路径（命令框/快捷动作/移动）触发；宏/触发器/导航等自动
+        指令不发回显。node/walk 排队补发不重复回显（排队时已回显一次）。
+        """
+        t = (text or "").strip()
+        if not t:
+            return
+        from xkxclient.net.ansi import Span
+
+        self.line_displayed.emit([Span("> " + t)], False)
 
     def _send_pieces(self, pieces: list[str]) -> None:
         """把命令片段（已别名展开）发往服务器：含 #wa/#N 走节流队列，否则直发。"""
@@ -340,9 +381,13 @@ class AccountSession(QObject):
         if kind == "node":
             self._node_capture = False
             self._node_in_table = False
+            self._node_pending = False
+            self._node_foreign = False
         else:
             self._walk_capture = False
             self._walk_in_table = False
+            self._walk_pending = False
+            self._walk_foreign = False
         self._node_page_stop()
         self._flush_pending_inputs()
 
@@ -371,11 +416,14 @@ class AccountSession(QObject):
     def _on_line(self, spans: list) -> None:
         text = "".join(s.text for s in spans)
         self.last_line = text
-        self.app.bus.publish("net.text_display", account=self.account_id, line=text)
+        self.app.bus.publish("net.text_display", account=self.account_id, line=text,
+                             segments=[{"t": s.text, "fg": s.fg, "bg": s.bg, "bold": s.bold}
+                                       for s in spans])
+        self._maybe_tough(text)
         if self._login and not self._login.finished:
             self._login.on_line(text)
         if self.logged_in:
-            fired = self.triggers.handle_line(text)
+            fired = self.triggers.handle_line(text, spans)
             hit_player = self.player_watch.peek_hit(text)
             if not self._consume_line(text):
                 self._route_line(text, spans, bool(fired) or hit_player)
@@ -385,6 +433,19 @@ class AccountSession(QObject):
         self._maybe_buffer_warning(text)
         self._maybe_cap_look(text)
         self._maybe_fullme(text)
+
+    def _maybe_tough(self, text: str) -> None:
+        """河边/江边移动艰难（「一脚深一脚浅」类提示）：移动仍在推进未到达新房间。
+        导航器自动重发当前方向，直到 GMCP.Move true 才步进。"""
+        nav = getattr(self, "navigator", None)
+        if nav is None or not nav.running:
+            return
+        pats = self.app.config.get("map.tough_patterns", None)
+        if not pats:
+            from xkxclient.core.map import TOUGH_PATTERNS
+            pats = TOUGH_PATTERNS
+        if any(p in text for p in pats):
+            nav.on_tough_terrain()
 
     def _consume_line(self, text: str) -> bool:
         """统一消费层：判断本行是否被客户端静默消费（不进主输出）。
@@ -403,6 +464,21 @@ class AccountSession(QObject):
             # 裸 `>` 提示行：回显噪声，静默吞掉；分页会话在此回到正常命令环
             self._pager_close()
             return True
+        if any(k in text for k in (_WALK_NO_PATH_MSGS + (_NODE_EMPTY_MSG,))):
+            # 自动导航刷新（navdock 请求 node/walk -c）在无路径区域产生的噪声提示
+            # 兜底静默：自动请求后 10s 内到达一律吞掉，即使捕获窗口已因超时/交错关闭。
+            # 用户手动输入 walk/node 也会命中，但紧跟在自动刷新后 10s 内的概率很低。
+            if time.time() - self._nav_auto_recent < 10.0:
+                # 同步清理捕获状态，避免无路径提示后捕获滞留
+                self._walk_capture = False
+                self._walk_in_table = False
+                self._walk_pending = False
+                self._walk_foreign = False
+                self._node_capture = False
+                self._node_in_table = False
+                self._node_pending = False
+                self._node_foreign = False
+                return True
         if self._consume_node_line(text):
             return True
         if self._consume_walk_line(text):
@@ -445,8 +521,11 @@ class AccountSession(QObject):
             return
         self._node_capture = True
         self._node_in_table = False
+        self._node_pending = False
+        self._node_foreign = False
         self._node_capture_start = time.time()
         self._node_page_stop()
+        self._nav_auto_recent = time.time()
         self.connection.send_line("node")
 
     def _consume_node_line(self, text: str) -> bool:
@@ -473,22 +552,46 @@ class AccountSession(QObject):
             # 空路径：捕获到此结束并静默（不上主输出）
             self._stop_capture("node")
             return True
+        if self._node_foreign:
+            # 外部表格（技能面板等）穿插在 node 表格中：整段吞掉不上表，
+            # 直到其表尾 `└…─…┘` 结束，回到 node 表继续捕获
+            if "└" in text and "─" in text:
+                self._node_foreign = False
+            return True
         if not self._node_in_table:
             # 确认进入表格：含竖线的表头（名称/目的地）或顶框线 `┌…─` 行。
             # 兜底：表头页丢失（分页交互/首段被吞）时，数据行本身也能进表
             # —— 首列 `[★☆]?ASCII名称` 后跟竖线即判定为 node 数据行。
+            # 顶框线改为待确认：技能面板等其他表格也以 `┌…─` 开头，须下一行
+            # 验证是真表头/数据行才进表，否则取消待确认、放行（技能面板上屏）。
+            if self._node_pending:
+                if (has_vbar and "名称" in text and "目的地" in text) or \
+                   (_NODE_ROW_RE.match(text) is not None):
+                    self._node_pending = False
+                    self._node_in_table = True
+                    self._node_page_lines = 1   # 进表首行计入服务器分的页行数
+                    self._node_page_touch()     # 进表即启动持续看门狗
+                    return True
+                self._node_pending = False
+                return False  # 非 node 表（技能面板等）：取消待确认，本行上屏
             if (has_vbar and "名称" in text and "目的地" in text) or \
-               (text.startswith("┌") and "─" in text) or \
                (_NODE_ROW_RE.match(text) is not None):
                 self._node_in_table = True
                 self._node_page_lines = 1   # 进表首行计入服务器分的页行数
                 self._node_page_touch()     # 进表即启动持续看门狗
                 return True
+            if text.startswith("┌") and "─" in text:
+                self._node_pending = True
+                return True  # 吞掉顶框线，等下一行确认
             return False  # 未进表：不吞，继续等表头（超时兜底）
 # 已在表格内：仅吞表格结构行
         if "└" in text and "─" in text:
             # 表尾框线行：吞掉并结束捕获，重置分页状态
             self._stop_capture("node")
+            return True
+        if text.startswith("┌") and "─" in text:
+            # node 表格中出现新顶框线 = 外部表格（技能面板等）穿插开始
+            self._node_foreign = True
             return True
         if has_vbar or frame:
             # 吞入表格结构行并累计行数
@@ -571,8 +674,11 @@ class AccountSession(QObject):
             return
         self._walk_capture = True
         self._walk_in_table = False
+        self._walk_pending = False
+        self._walk_foreign = False
         self._walk_capture_start = time.time()
         self._node_page_stop()
+        self._nav_auto_recent = time.time()
         self.connection.send_line("walk -c")
 
     def _consume_walk_line(self, text: str) -> bool:
@@ -588,19 +694,43 @@ class AccountSession(QObject):
         if not self._walk_in_table and time.time() - self._walk_capture_start > 5.0:
             self._stop_capture("walk")
             return False
-        if "这里没有内建路径" in text or "没有内建" in text:
+        if any(k in text for k in _WALK_NO_PATH_MSGS):
             self._stop_capture("walk")
             return True
+        if self._walk_foreign:
+            # 外部表格（技能面板等）穿插在 walk 表格中：整段吞掉不上表，
+            # 直到其表尾 `└…─…┘` 结束，回到 walk 表继续捕获
+            if "└" in text and "─" in text:
+                self._walk_foreign = False
+            return True
         if not self._walk_in_table:
-            if (has_vbar and "目的地" in text and "拼音" in text) or \
-               (text.startswith("┌") and "─" in text):
+            # 表头含「目的地/拼音」强判定进表；顶框线 `┌…─` 待确认——
+            # 技能面板等其他表格也以 `┌…─` 开头，须下一行验证是真表头才进表，
+            # 否则取消待确认、放行（技能面板上屏，不误读进 walk 列表）。
+            if self._walk_pending:
+                if has_vbar and "目的地" in text and "拼音" in text:
+                    self._walk_pending = False
+                    self._walk_in_table = True
+                    self._node_page_lines = 1
+                    self._node_page_touch()
+                    return True
+                self._walk_pending = False
+                return False  # 非 walk 表（技能面板等）：取消待确认，本行上屏
+            if has_vbar and "目的地" in text and "拼音" in text:
                 self._walk_in_table = True
                 self._node_page_lines = 1
                 self._node_page_touch()
                 return True
+            if text.startswith("┌") and "─" in text:
+                self._walk_pending = True
+                return True  # 吞掉顶框线，等下一行确认
             return False
         if "└" in text and "─" in text:
             self._stop_capture("walk")
+            return True
+        if text.startswith("┌") and "─" in text:
+            # walk 表格中出现新顶框线 = 外部表格（技能面板等）穿插开始
+            self._walk_foreign = True
             return True
         if has_vbar or any(ch in text for ch in "├┤┼┬┴"):
             self._node_page_lines += 1
@@ -966,6 +1096,7 @@ class AccountSession(QObject):
                 self.map_cache.on_move(d)
                 self.app.bus.publish("GMCP.Move", account=self.account_id, data=d)
                 self.app.bus.publish("state.room", account=self.account_id, name=self.room_name, exits=self.exits)
+                self._map_sync_push()
                 if self.auto_look:
                     self._send_look()
         elif module == "GMCP.Combat":
@@ -1018,8 +1149,90 @@ class AccountSession(QObject):
         ch[name] = on
         cfg.set("channels", ch)
 
+    # ---- 地图同步（mapsync.py）----
+    def _start_map_sync(self) -> None:
+        """登录后启动：后台拉全量合并一次，然后按配置间隔定时上报+拉增量，
+        并独立定时刷新同步统计（状态栏实时展示）。"""
+        sync = self.map_sync
+        if sync is None or not sync.active:
+            return
+        self._map_sync_worker(sync, full=True)
+        interval = int(ConfigManager.instance().get("map.sync_interval", 60) or 60)
+        self._map_sync_timer = QTimer(self)
+        self._map_sync_timer.setInterval(max(30, interval) * 1000)
+        self._map_sync_timer.timeout.connect(self._map_sync_tick)
+        self._map_sync_timer.start()
+        self._map_stats_timer = QTimer(self)
+        self._map_stats_timer.setInterval(15000)
+        self._map_stats_timer.timeout.connect(self._map_stats_refresh)
+        self._map_stats_timer.start()
+        self._map_stats_refresh()
+
+    def _map_stats_refresh(self) -> None:
+        """后台线程刷新同步统计并发布 map.sync_stats（bus 回主线程，状态栏订阅）。"""
+        sync = self.map_sync
+        if sync is None or not sync.active:
+            return
+
+        def _run() -> None:
+            try:
+                sync.get_stats()
+            except Exception:
+                pass
+            try:
+                st = sync.stat_summary()
+            except Exception:
+                return
+            self.app.bus.publish("map.sync_stats", account=self.account_id, stats=st)
+
+        import threading as _th
+        _th.Thread(target=_run, daemon=True).start()
+
+    def _map_sync_tick(self) -> None:
+        self._map_sync_worker(self.map_sync, full=False)
+
+    def _map_sync_push(self) -> None:
+        """GMCP.Move 后节流上报增量（后台线程，不阻塞 UI/网络事件循环）。"""
+        sync = self.map_sync
+        if sync is None or not sync.active:
+            return
+        if not hasattr(sync, "_last_push"):
+            sync._last_push = 0.0
+        import time as _t
+        throttle = int(ConfigManager.instance().get("map.sync_throttle", 5) or 5)
+        if _t.time() - getattr(sync, "_last_push", 0) < max(1, throttle):
+            return
+        sync._last_push = _t.time()
+        self._map_sync_worker(sync, full=False)
+
+    def _map_sync_worker(self, sync, full: bool) -> None:
+        """后台线程执行同步（urllib 阻塞调用不入 UI 线程）。"""
+        def _run():
+            try:
+                if full:
+                    snap = sync.pull(0)
+                    if snap.get("nodes") or snap.get("rooms"):
+                        sync.apply_snapshot(snap)
+                    sync._set_status(True)
+                else:
+                    sync.tick()
+            except Exception as exc:
+                sync._set_status(False, str(exc))
+        import threading as _th
+        t = _th.Thread(target=_run, daemon=True)
+        t.start()
+
+    def _stop_map_sync(self) -> None:
+        if self._map_sync_timer is not None:
+            self._map_sync_timer.stop()
+            self._map_sync_timer = None
+        if getattr(self, "_map_stats_timer", None) is not None:
+            self._map_stats_timer.stop()
+            self._map_stats_timer = None
+
     def close(self) -> None:
         self._manual_close = True
+        self._stop_map_sync()
         self.map_cache.flush()
         if self._reconnect_timer is not None:
             self._reconnect_timer.stop()
@@ -1248,6 +1461,8 @@ class LoginMachine:
         self.session._look_buf = ""
         # 登录后统一发送一次状态/频道指令，确保所需状态与频道正常开启
         self.session.connection.send_line(_LOGIN_TUNES)
+        # 地图同步：登录后异步拉全量合并；随后按 map.sync_interval 定时上报+拉增量
+        self.session._start_map_sync()
 
     def dispose(self) -> None:
         """断开/关闭时调用：取消挂起的定时器，避免退出时 QTimer 竞争崩溃。"""

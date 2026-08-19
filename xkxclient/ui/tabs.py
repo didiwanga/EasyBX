@@ -3,6 +3,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QStringListModel, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QCompleter,
     QHBoxLayout,
     QLineEdit,
@@ -321,6 +322,7 @@ class AccountTab(QWidget):
         self.output.command_fill_requested.connect(self._fill_command)
         self.output.command_send_requested.connect(self._send_command)
         self.output.look_send_requested.connect(self._look_selection)
+        self.output.localmaps_requested.connect(self._localmaps_selection)
         self.output.ask_fill_requested.connect(self._ask_fill)
         self.output.notepad_add_requested.connect(self._notepad_add)
         self.output.autopage_hit.connect(self._on_autopage)
@@ -392,6 +394,11 @@ class AccountTab(QWidget):
     def _look_selection(self, text: str) -> None:
         """右键「看」：直接发送 look + 选中文本。"""
         self.session.send(f"look {text}")
+
+    def _localmaps_selection(self, text: str) -> None:
+        """右键「在本地地图中查找」：发送 localmaps + 选中文本，同时复制选中内容到剪贴板。"""
+        self.session.send(f"localmaps {text}")
+        QApplication.clipboard().setText(text)
 
     def _ask_fill(self, text: str) -> None:
         """右键「NPC对话」：填入 ask + 选中文本 + about，等待补充提问词。"""

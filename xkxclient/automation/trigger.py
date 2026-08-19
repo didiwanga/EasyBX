@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 from PyQt6.QtCore import QBuffer, QObject, QTimer
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
@@ -11,6 +12,11 @@ from xkxclient.automation.runner import ActionRunner
 TEMPLATE_VAR_RE = re.compile(r"\{(\w+)(?::(\w+))?\}")
 
 _ding_players: list = []
+
+# 高频触发保护：同一触发器在窗口内触发超限即自动停用（疑似死循环/错误配置），
+# 避免命令疯狂囤积拖垮其他触发器与命令缓冲。
+_HOT_WINDOW = 5.0        # 秒
+_HOT_LIMIT = 30          # 窗口内触发次数上限
 
 
 def play_ding() -> None:
@@ -104,8 +110,16 @@ class TriggerEngine(QObject):
         self.session = session
         self.triggers: list[Trigger] = []
         self.runner = ActionRunner(bus, session)
-        self.pending = {}  # name -> QTimer
+        # 延时调度：单一共享 tick 定时器 + 到期时间表（monotonic）。
+        # 不采用"每次命中新建一个 QTimer"：Windows 下 Qt 定时器 ID 复用
+        # 会让新 QTimer 立即触发（qutebrowser #8191），长时运行后所有延时
+        # 变成立即执行。单 tick + 时间表则无此问题。
+        self.pending: dict[str, tuple[float, Trigger]] = {}  # name -> (到期monotonic, 触发器)
+        self._delay_tick = QTimer(self)
+        self._delay_tick.setInterval(50)
+        self._delay_tick.timeout.connect(self._on_delay_tick)
         self.master_on = True  # B9 全局开关
+        self._hot: dict[str, list[float]] = {}   # name -> 最近触发时刻（monotonic），高频保护用
 
     def load(self, definitions: list[dict]) -> None:
         self.triggers = []
@@ -128,8 +142,12 @@ class TriggerEngine(QObject):
             )
             self.triggers.append(t)
 
-    def handle_line(self, line: str) -> list[str]:
-        """处理一行文本，返回本行命中的触发器名列表（空 = 未命中）。"""
+    def handle_line(self, line: str, spans: list | None = None) -> list[str]:
+        """处理一行文本，返回本行命中的触发器名列表（空 = 未命中）。
+
+        spans 为带颜色分段的 Span 列表（可选）：模板捕获同时把捕获段颜色
+        写入 `变量名:color` 变量（`{名:color}` 语法，供 substitute 读取）。
+        """
         if not self.master_on:
             return []
         fired: list[str] = []
@@ -140,10 +158,14 @@ class TriggerEngine(QObject):
             if not matched:
                 continue
             trg.counter += 1
-            self._apply_captures(trg, captures)
+            self._apply_captures(trg, captures, line, spans)
             self.bus.publish("trigger.fired", account=self.session.account_id,
                              name=trg.name, line=line,
                              counter=trg.counter, captures=captures)
+            # 高频触发保护：超限自动停用，本行仅高亮不再执行步骤，避免拖累其他触发器
+            if self._maybe_overheat(trg):
+                fired.append(trg.name)
+                continue
             if trg.beep:
                 play_ding()
             self._schedule(trg)
@@ -151,6 +173,24 @@ class TriggerEngine(QObject):
                 trg.enabled = False
             fired.append(trg.name)
         return fired
+
+    def _maybe_overheat(self, t: Trigger) -> bool:
+        """高频触发检测：窗口内触发超限 → 自动停用并提示，返回 True（本行不再执行）。
+
+        已停用状态直接返回 True（引擎不再重入提示），避免提示刷屏。
+        """
+        if not t.enabled:
+            return True
+        now = time.monotonic()
+        q = self._hot.setdefault(t.name, [])
+        q.append(now)
+        self._hot[t.name] = [x for x in q if now - x <= _HOT_WINDOW]
+        if len(self._hot[t.name]) > _HOT_LIMIT:
+            t.enabled = False
+            self.bus.publish("ui.message", account=self.session.account_id,
+                             message=f"触发器「{t.name}」{_HOT_WINDOW:.0f}秒内触发超过 {_HOT_LIMIT} 次，已自动停用（疑似循环）")
+            return True
+        return False
 
     # ---- B3 多条件：全与(and) / 全或(or)，默认 or；模板变量捕获 ----
     def _match_conditions(self, t: Trigger, line: str) -> tuple[bool, list]:
@@ -227,20 +267,38 @@ class TriggerEngine(QObject):
         tmp = Trigger("_c", match_type=match_type, pattern=pattern)
         return self._match(tmp, line)
 
-    def _apply_captures(self, t: Trigger, captures: list) -> None:
-        """模板命名/编号变量写入 session.vars（B3 全局变量域）。"""
+    def _apply_captures(self, t: Trigger, captures: list, line: str | None = None,
+                        spans: list | None = None) -> None:
+        """模板命名/编号变量写入 session.vars（B3 全局变量域）。
+
+        仅当捕获数量与主 pattern 模板变量数一致时按名字写入；不一致（and 多
+        条件捕获合并、或 or 模式命中附加条件）时退化为 v01.. 编号写入，避免
+        捕获错位写进错误变量。
+
+        颜色捕获：模板声明 `{名:color}` 时（_color 非空），把捕获段前景色写入
+        `名:color` 变量；编号退化情形总是写入 `vXX:color`。需要 spans 提供颜色。
+        """
+        from xkxclient.net.ansi import fg_at
         if not captures:
             return
         names = list(getattr(t, "_names", []) or [])
-        if names:
+        if not names and getattr(t, "match_type", "") == "template":
+            t.template_regex  # 访问 property 填充 _names（主 pattern 为模板时命名捕获生效）
+            names = list(getattr(t, "_names", []) or [])
+        if names and len(names) == len(captures):
             for i, (var, _color) in enumerate(names):
-                if i < len(captures):
-                    self.session.vars[var] = captures[i]
-        # 无命名模板（编号占据符结构）时按 v1..vN 写入
-        named = [n for n, _ in (names or []) if n]
-        if not named:
-            for i, cap in enumerate(captures, 1):
-                self.session.vars[f"v{i:02d}"] = cap
+                self.session.vars[var] = captures[i]
+                if _color and line is not None and spans:
+                    fg = fg_at(spans, line, str(captures[i]))
+                    if fg:
+                        self.session.vars[f"{var}:color"] = fg
+            return
+        for i, cap in enumerate(captures, 1):
+            self.session.vars[f"v{i:02d}"] = cap
+            if line is not None and spans:
+                fg = fg_at(spans, line, str(cap))
+                if fg:
+                    self.session.vars[f"v{i:02d}:color"] = fg
 
     def _match(self, t: Trigger, line: str) -> list | None:
         mt = t.match_type
@@ -279,16 +337,21 @@ class TriggerEngine(QObject):
 
     def _schedule(self, t: Trigger) -> None:
         if t.delay_ms > 0:
-            old = self.pending.pop(t.name, None)
-            if old is not None:
-                old.stop()  # 旧定时器未触发：先停掉，避免与新的重复执行动作
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(lambda tt=t: self._fire_now(tt))
-            timer.start(t.delay_ms)
-            self.pending[t.name] = timer
+            # 同名单次命中的旧延时覆盖为新延时（语义同旧实现：先停旧再起新）
+            self.pending[t.name] = (time.monotonic() + t.delay_ms / 1000.0, t)
+            if not self._delay_tick.isActive():
+                self._delay_tick.start()
         else:
             self._fire_now(t)
+
+    def _on_delay_tick(self) -> None:
+        now = time.monotonic()
+        for name in [n for n, (fire_at, _t) in self.pending.items() if fire_at <= now]:
+            item = self.pending.pop(name, None)
+            if item is not None:
+                self._fire_now(item[1])
+        if not self.pending:
+            self._delay_tick.stop()
 
     def _fire_now(self, t: Trigger) -> None:
         self.pending.pop(t.name, None)
@@ -304,9 +367,9 @@ class TriggerEngine(QObject):
             if t.name == name:
                 t.enabled = False
                 if stop:
-                    timer = self.pending.pop(t.name, None)
-                    if timer:
-                        timer.stop()
+                    self.pending.pop(t.name, None)
+                    if not self.pending:
+                        self._delay_tick.stop()
 
     def enable_all(self) -> None:
         for t in self.triggers:
@@ -315,6 +378,31 @@ class TriggerEngine(QObject):
     def disable_all(self) -> None:
         for t in self.triggers:
             t.enabled = False
+        # 全局停用：清空待执行延时、计数器、高频记录
+        self._reset_state()
+
+    def set_master(self, on: bool) -> None:
+        """全局开关（UI 总开关调用）。
+
+        停用时清空全部状态：待执行延时、已触发未执行的排队命令、计数器、高频记录；
+        重新启用时以初始状态重新检测触发，避免错误操作/死循环大量囤积。
+        """
+        on = bool(on)
+        if on == self.master_on:
+            return
+        self.master_on = on
+        self._reset_state()
+        if not on:
+            thr = getattr(self.session, "throttle", None)
+            if thr is not None:
+                thr.cancel_all()
+
+    def _reset_state(self) -> None:
+        self.pending.clear()
+        self._delay_tick.stop()
+        self._hot.clear()
+        for t in self.triggers:
+            t.counter = 0
 
     def enable_group(self, group: str) -> None:
         for t in self.triggers:

@@ -468,11 +468,16 @@ class MoveControlDock(QWidget):
     def __init__(self, session, parent=None) -> None:
         super().__init__(parent)
         self.session = session
+        self._subs: list = []
         self.setMinimumWidth(170)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
-        lay.addWidget(QLabel("移动 (GMCP)"))
+        lay.setSpacing(8)   # 各区块间（3×3 与上下进出按钮）间距同按钮间距
+        self.room_label = QLabel("当前位置: -")
+        self.room_label.setWordWrap(True)
+        lay.addWidget(self.room_label)
         grid = QGridLayout()
+        grid.setSpacing(8)   # 行/列间距统一（多余宽度由居中容器吸收，恒定不随 dock 宽变化）
         self._btns: dict[str, QPushButton] = {}
         for r, row in enumerate(_DIR_BUTTONS):
             for c, name in enumerate(row):
@@ -495,15 +500,31 @@ class MoveControlDock(QWidget):
                 grid.addWidget(btn, r, c)
                 if name != "look":
                     self._btns[name] = btn
-        lay.addLayout(grid)
+        # 水平居中容器：吸收 dock 多余宽度，让 3×3 列距恒定 4px（不随 dock 宽伸展）
+        grid_host = QHBoxLayout()
+        grid_host.setSpacing(0)
+        grid_host.addStretch(1)
+        grid_host.addLayout(grid)
+        grid_host.addStretch(1)
+        lay.addLayout(grid_host)
         row2 = QHBoxLayout()
+        row2.setSpacing(8)   # 与 3×3 按钮间距一致
         for name in _ROW2:
             btn = QPushButton({"u": "上", "d": "下", "enter": "进", "out": "出"}[name])
             btn.setProperty("dirBtn", True)
+            btn.setFixedSize(42, 32)   # 宽度与 3×3 方向按钮一致
             btn.clicked.connect(lambda _=False, d=name: self._move(d))
             self._btns[name] = btn
             row2.addWidget(btn)
-        lay.addLayout(row2)
+        # 水平居中容器：上下进出按钮与 3×3 同宽居中，间距恒定；
+        # 顶部额外 8px，使 3×3 与四键行间距 = lay 8px + margin 8px = 16px（加倍）
+        row2_host = QHBoxLayout()
+        row2_host.setSpacing(0)
+        row2_host.setContentsMargins(0, 8, 0, 0)
+        row2_host.addStretch(1)
+        row2_host.addLayout(row2)
+        row2_host.addStretch(1)
+        lay.addLayout(row2_host)
 
         # 其他出口区：除八方向/上下/进出外的出口（含纯数字出口）动态按钮，
         # 有几个显示几个；无此类出口时整区隐藏。
@@ -526,8 +547,50 @@ class MoveControlDock(QWidget):
         self.set_exits([])
 
     def bind(self, session) -> None:
+        self._unsub()
         self.session = session
         self.set_exits(getattr(session, "exits", []) or [])
+        bus = getattr(getattr(session, "app", None), "bus", None)
+        if bus is not None:
+            for ev in ("state.room", "GMCP.Move", "map.pushed"):
+                sub = bus.subscribe(ev, self._on_event)
+                self._subs.append((ev, sub))
+        self._sync_room(getattr(session, "room_name", "") or "")
+
+    def _unsub(self) -> None:
+        bus = getattr(getattr(self.session, "app", None), "bus", None)
+        if bus is not None:
+            for ev, sub in self._subs:
+                try:
+                    bus.unsubscribe(ev, sub)
+                except Exception:
+                    pass
+        self._subs = []
+
+    def _on_event(self, payload: dict) -> None:
+        acc = payload.get("account")
+        if acc is not None and getattr(self.session, "account_id", None) not in (None, acc):
+            return
+        ev = payload.get("event", "")
+        name = ""
+        if ev == "state.room":
+            name = str(payload.get("name") or "")
+        elif ev == "GMCP.Move":
+            d = payload.get("data")
+            if not isinstance(d, dict):
+                d = {}
+            if str(d.get("result", "")).lower() in ("true", "1",):
+                name = str(d.get("short") or "")
+        elif ev == "map.pushed":
+            cache = getattr(self.session, "map_cache", None)
+            if cache is not None:
+                name = getattr(cache, "current", "") or ""
+        if name:
+            self._sync_room(name)
+
+    def _sync_room(self, name: str) -> None:
+        if name:
+            self.room_label.setText(f"当前位置: {name}")
 
     def _move(self, d: str) -> None:
         if self.session is None:
@@ -940,8 +1003,10 @@ class MacroRecorderDock(QWidget):
         if t == "trigger":
             conds = s.get("conditions") or []
             if conds:
-                return f"触发: {conds[0].get('pattern', '')}"
-            return f"触发: {s.get('pattern', '')}"
+                base = f"触发: {conds[0].get('pattern', '')}"
+            else:
+                base = f"触发: {s.get('pattern', '')}"
+            return base + self._onhit_suffix(s.get("on_hit"))
         if t == "cruise":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
@@ -953,14 +1018,25 @@ class MacroRecorderDock(QWidget):
         if t == "move_trigger":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
-            return f"移动并触发: {s.get('command', '')} → {pat}"
+            return f"移动并触发: {s.get('command', '')} → {pat}" + self._onhit_suffix(s.get("on_hit"))
         if t == "captcha":
             return f"验证码: {s.get('command', '')} → ${s.get('var', 'captcha')}"
         if t == "hit":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
-            return f"等待命中: {s.get('command', '')} → {pat}"
+            return f"等待命中: {s.get('command', '')} → {pat}" + self._onhit_suffix(s.get("on_hit"))
         return t
+
+    def _onhit_suffix(self, on_hit: dict | None) -> str:
+        on_hit = on_hit or {}
+        t = on_hit.get("type")
+        if t == "cmd":
+            return f" ·命中→{on_hit.get('command', '')}"
+        if t == "jump":
+            return f" ·命中→跳{on_hit.get('target', '')}"
+        if t == "set":
+            return f" ·命中→{on_hit.get('var', '')}={on_hit.get('value', '')}"
+        return ""
 
     def _refresh(self) -> None:
         self.step_list.clear()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 
 from PyQt6.QtCore import Qt
@@ -394,13 +395,18 @@ class _EditorBase(QDialog):
         self.item_list.customContextMenuRequested.connect(self._list_menu)
         self.new_btn = QPushButton("新建")
         self.del_btn = QPushButton("删除")
+        self.dup_btn = QPushButton("复制")
+        self.dup_btn.setToolTip("完整复制当前选中的宏，新名称在原名后追加（副本）")
         self.save_btn = QPushButton("保存")
         self.save_btn.setToolTip("保存当前项到列表并落盘（不关闭窗口），可继续编辑")
         self.save_btn.clicked.connect(self._on_save_no_close)
         if not self._show_left_save:
             self.save_btn.hide()
+        if self._key != "macros":
+            self.dup_btn.hide()
         self.new_btn.clicked.connect(self._on_new)
         self.del_btn.clicked.connect(self._on_delete)
+        self.dup_btn.clicked.connect(self._on_dup)
 
         self.form = QFormLayout()
         self.name_ed = QLineEdit()
@@ -426,6 +432,7 @@ class _EditorBase(QDialog):
         left.addWidget(QLabel(f"{title}列表"))
         left.addWidget(self.item_list, 1)
         left.addWidget(self.new_btn)
+        left.addWidget(self.dup_btn)
         left.addWidget(self.del_btn)
         left.addWidget(self.save_btn)
 
@@ -639,6 +646,28 @@ class _EditorBase(QDialog):
             self._edit_idx = None
             self._refresh()
             self._persist()   # 删除即时落盘，避免重开后复活
+
+    def _on_dup(self) -> None:
+        """完整复制当前选中的宏：全部字段（含步骤/节点图）深拷贝，新名在原名后
+        追加（副本），仍重名则继续追加（副本）直到唯一。即时落盘。"""
+        item = self.item_list.currentItem()
+        if item is None or item.data(0, Qt.ItemDataRole.UserRole + 1):
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is None or not (0 <= idx < len(self.items)):
+            return
+        src = self.items[idx]
+        new = copy.deepcopy(src)
+        base = (src.get("name") or "").strip() or f"{self._key}_new"
+        existing = {d.get("name") for d in self.items}
+        name = base
+        while name in existing:
+            name += "（副本）"
+        new["name"] = name
+        self.items.append(new)
+        self._refresh()
+        self._select_index(len(self.items) - 1)
+        self._persist()
 
     def _on_save_no_close(self) -> None:
         """「保存」按钮：保存当前项到列表并落盘，不关闭窗口（可继续编辑其他项）。"""
@@ -1004,10 +1033,12 @@ class MacroEditor(_EditorBase):
             conds = s.get("conditions") or []
             if conds:
                 c = conds[0]
-                return f"触发: {c.get('match_type', 'contains')} {c.get('pattern', '')}"
-            cond = s.get("condition") or {}
-            pat = s.get("pattern") or cond.get("pattern", "")
-            return f"触发: {cond.get('type', s.get('match_type', 'contains'))} {pat}"
+                base = f"触发: {c.get('match_type', 'contains')} {c.get('pattern', '')}"
+            else:
+                cond = s.get("condition") or {}
+                pat = s.get("pattern") or cond.get("pattern", "")
+                base = f"触发: {cond.get('type', s.get('match_type', 'contains'))} {pat}"
+            return base + self._onhit_suffix(s.get("on_hit"))
         if t == "captcha":
             return f"验证码: {s.get('command', '')} → ${s.get('var', 'captcha')}"
         if t == "branch":
@@ -1027,12 +1058,13 @@ class MacroEditor(_EditorBase):
         if t == "hit":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
-            return f"等待命中: {s.get('command', '')} → {pat} (重发{s.get('delay_ms', 0)}ms/超时{s.get('timeout_ms', 0)}ms)"
+            return f"等待命中: {s.get('command', '')} → {pat} (重发{s.get('delay_ms', 0)}ms/超时{s.get('timeout_ms', 0)}ms)" \
+                + self._onhit_suffix(s.get("on_hit"))
         if t == "move_trigger":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
             retry = "" if s.get("auto_retry", True) else "（不回退）"
-            return f"移动并触发: {s.get('command', '')} → {pat} {retry}"
+            return f"移动并触发: {s.get('command', '')} → {pat} {retry}" + self._onhit_suffix(s.get("on_hit"))
         if t == "cruise":
             conds = s.get("conditions") or []
             pat = conds[0].get("pattern", "") if conds else s.get("pattern", "")
@@ -1042,6 +1074,17 @@ class MacroEditor(_EditorBase):
             rh = f"·{hm}" if hm else ""
             return f"巡航[{mode}]: {s.get('range', '')} → {pat}{rh}"
         return f"{t}"
+
+    def _onhit_suffix(self, on_hit: dict | None) -> str:
+        on_hit = on_hit or {}
+        t = on_hit.get("type")
+        if t == "cmd":
+            return f" ·命中→{on_hit.get('command', '')}"
+        if t == "jump":
+            return f" ·命中→跳{on_hit.get('target', '')}"
+        if t == "set":
+            return f" ·命中→{on_hit.get('var', '')}={on_hit.get('value', '')}"
+        return ""
 
     def _on_step_save(self) -> None:
         """保存当前宏到列表并落盘，不关闭窗口（可继续编辑其他项）。"""
@@ -1263,6 +1306,10 @@ class StepDialog(QDialog):
         self.trg_delay_sb.setSuffix(" ms")
         self.trg_timeout_sb = QSpinBox(); self.trg_timeout_sb.setRange(0, 3600000)
         self.trg_timeout_sb.setSuffix(" ms")
+        # 命中后操作：cmd(命令) / jump(跳转步骤/标签) / set(变量=值)
+        self.trg_hit_type = self._make_onhit_combo()
+        self.trg_hit_ed = QLineEdit()
+        self.trg_hit_ed.setPlaceholderText("命令 / 步骤序号或标签 / {变量}=值")
 
         # ---- 验证码页 ----
         self.cap_cmd_ed = QLineEdit()
@@ -1333,6 +1380,9 @@ class StepDialog(QDialog):
         self.hit_timeout_sb.setToolTip("总超时；超时即终止宏（0 = 永不超时）")
         self.hit_note = QLabel("先发送命令，等待条件命中；未命中则周期重发命令，直到命中或超时终止宏。")
         self.hit_note.setStyleSheet("color:#c08040;")
+        self.hit_hit_type = self._make_onhit_combo()
+        self.hit_hit_ed = QLineEdit()
+        self.hit_hit_ed.setPlaceholderText("命令 / 步骤序号或标签 / {变量}=值")
 
         # ---- 移动并触发页：;分割多命令逐个发送，每个命令等待一次触发 ----
         self.mt_cmd_ed = QLineEdit()
@@ -1354,6 +1404,9 @@ class StepDialog(QDialog):
         self.mt_retry_sb.setToolTip("同一命令连续失败重试上限；超过后跳过当前命令继续")
         self.mt_note = QLabel("逐个发送移动命令，每个命令等待一次触发命中；命中后延时再发下一个；超时则跳过当前命令继续。")
         self.mt_note.setStyleSheet("color:#c08040;")
+        self.mt_hit_type = self._make_onhit_combo()
+        self.mt_hit_ed = QLineEdit()
+        self.mt_hit_ed.setPlaceholderText("命令 / 步骤序号或标签 / {变量}=值")
 
         # ---- 巡航页：范围 + 模式 + 触发条件 + 执行命令 + 延时 + 条件超时 + 巡航超时 + 返回起点 ----
         self.cr_range_ed = QLineEdit()
@@ -1443,6 +1496,9 @@ class StepDialog(QDialog):
         p_trg = QWidget()
         tf = QFormLayout(p_trg)
         tf.addRow("条件列表", self.trg_cond)
+        trg_hit_row = QHBoxLayout(); trg_hit_row.addWidget(self.trg_hit_type)
+        trg_hit_row.addWidget(self.trg_hit_ed, 1)
+        tf.addRow("命中后操作", trg_hit_row)
         tf.addRow("延时", self.trg_delay_sb)
         tf.addRow("超时", self.trg_timeout_sb)
         self._pages["trigger"] = p_trg
@@ -1488,6 +1544,9 @@ class StepDialog(QDialog):
         hf.addRow(self.hit_note)
         hf.addRow("发送命令", self.hit_cmd_ed)
         hf.addRow("触发条件", self.hit_cond)
+        hit_hit_row = QHBoxLayout(); hit_hit_row.addWidget(self.hit_hit_type)
+        hit_hit_row.addWidget(self.hit_hit_ed, 1)
+        hf.addRow("命中后操作", hit_hit_row)
         hf.addRow("等待延时", self.hit_delay_sb)
         hf.addRow("超时终止", self.hit_timeout_sb)
         self._pages["hit"] = p_hit
@@ -1497,6 +1556,9 @@ class StepDialog(QDialog):
         mf.addRow(self.mt_note)
         mf.addRow("移动命令", self.mt_cmd_ed)
         mf.addRow("触发条件", self.mt_cond)
+        mt_hit_row = QHBoxLayout(); mt_hit_row.addWidget(self.mt_hit_type)
+        mt_hit_row.addWidget(self.mt_hit_ed, 1)
+        mf.addRow("命中后操作", mt_hit_row)
         mf.addRow("命中后延时", self.mt_delay_sb)
         mf.addRow("等待超时", self.mt_timeout_sb)
         retry_row = QHBoxLayout(); retry_row.addWidget(self.mt_retry_cb)
@@ -1625,6 +1687,7 @@ class StepDialog(QDialog):
             self.trg_cond.set_relation(s.get("relation", "or"))
             self.trg_delay_sb.setValue(int(s.get("delay_ms", 0)))
             self.trg_timeout_sb.setValue(self._timeout_ms(s))
+            self._load_onhit(self.trg_hit_type, self.trg_hit_ed, s.get("on_hit"))
 
         # 验证码步骤
         if t == "captcha":
@@ -1666,23 +1729,25 @@ class StepDialog(QDialog):
         if t == "hit":
             self.hit_cmd_ed.setText(s.get("command", ""))
             hit_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
-                                                 "pattern": s.get("pattern", "")}]
+                                                  "pattern": s.get("pattern", "")}]
             self.hit_cond.set_conditions(hit_conds)
             self.hit_cond.set_relation(s.get("relation", "or"))
             self.hit_delay_sb.setValue(int(s.get("delay_ms", 0)))
             self.hit_timeout_sb.setValue(self._timeout_ms(s))
+            self._load_onhit(self.hit_hit_type, self.hit_hit_ed, s.get("on_hit"))
 
         # 移动并触发步骤
         if t == "move_trigger":
             self.mt_cmd_ed.setText(s.get("command", ""))
             mt_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
-                                                "pattern": s.get("pattern", "")}]
+                                                 "pattern": s.get("pattern", "")}]
             self.mt_cond.set_conditions(mt_conds)
             self.mt_cond.set_relation(s.get("relation", "or"))
             self.mt_delay_sb.setValue(int(s.get("delay_ms", 0)))
             self.mt_timeout_sb.setValue(self._timeout_ms(s))
             self.mt_retry_cb.setChecked(bool(s.get("auto_retry", True)))
             self.mt_retry_sb.setValue(int(s.get("retry_max", 3)))
+            self._load_onhit(self.mt_hit_type, self.mt_hit_ed, s.get("on_hit"))
 
         # 巡航步骤
         if t == "cruise":
@@ -1835,6 +1900,40 @@ class StepDialog(QDialog):
         return {"keyword": k, "action": action}
 
     # ---- 收集 ----
+    @staticmethod
+    def _make_onhit_combo() -> QComboBox:
+        """命中后操作类型下拉：无 / 执行命令 / 跳转步骤·标签 / 变量赋值。"""
+        cb = QComboBox()
+        for code, lab in [("none", "无动作"), ("cmd", "执行命令"),
+                          ("jump", "跳转步骤/标签"), ("set", "变量赋值")]:
+            cb.addItem(lab, code)
+        return cb
+
+    def _collect_onhit(self, type_cb: QComboBox, ed: QLineEdit) -> dict | None:
+        at = type_cb.currentData()
+        if at == "cmd":
+            return {"type": "cmd", "command": ed.text().strip()}
+        if at == "jump":
+            return {"type": "jump", "target": ed.text().strip()}
+        if at == "set":
+            txt = ed.text().strip()
+            if "=" in txt:
+                var, val = txt.split("=", 1)
+                return {"type": "set", "var": var.strip(), "value": val.strip()}
+            return {"type": "set", "var": txt.strip(), "value": ""}
+        return None
+
+    def _load_onhit(self, type_cb: QComboBox, ed: QLineEdit, on_hit: dict | None) -> None:
+        on_hit = on_hit or {}
+        at = on_hit.get("type")
+        type_cb.setCurrentIndex(max(0, type_cb.findData(at if at in ("cmd", "jump", "set") else "none")))
+        if at == "cmd":
+            ed.setText(on_hit.get("command", ""))
+        elif at == "jump":
+            ed.setText(on_hit.get("target", ""))
+        elif at == "set":
+            ed.setText(f"{on_hit.get('var', '')}={on_hit.get('value', '')}")
+
     def _collect_action(self, type_cb: QComboBox, ed: QLineEdit) -> dict | None:
         at = type_cb.currentData()
         if at == "cmd":
@@ -1912,6 +2011,9 @@ class StepDialog(QDialog):
             s["pattern"] = conds[0].get("pattern", "") if conds else ""
             s["delay_ms"] = self.trg_delay_sb.value()
             s["timeout_ms"] = self.trg_timeout_sb.value()
+            oh = self._collect_onhit(self.trg_hit_type, self.trg_hit_ed)
+            if oh:
+                s["on_hit"] = oh
         elif t == "captcha":
             s["command"] = self.cap_cmd_ed.text().strip()
             s["var"] = self.cap_var_ed.text().strip() or "captcha"
@@ -1946,6 +2048,9 @@ class StepDialog(QDialog):
             s["pattern"] = conds[0].get("pattern", "") if conds else ""
             s["delay_ms"] = self.hit_delay_sb.value()
             s["timeout_ms"] = self.hit_timeout_sb.value()
+            oh = self._collect_onhit(self.hit_hit_type, self.hit_hit_ed)
+            if oh:
+                s["on_hit"] = oh
         elif t == "move_trigger":
             conds = list(self.mt_cond.conditions)
             s["command"] = self.mt_cmd_ed.text().strip()
@@ -1957,6 +2062,9 @@ class StepDialog(QDialog):
             s["timeout_ms"] = self.mt_timeout_sb.value()
             s["auto_retry"] = self.mt_retry_cb.isChecked()
             s["retry_max"] = self.mt_retry_sb.value()
+            oh = self._collect_onhit(self.mt_hit_type, self.mt_hit_ed)
+            if oh:
+                s["on_hit"] = oh
         elif t == "cruise":
             conds = list(self.cr_cond.conditions)
             s["range"] = self.cr_range_ed.text().strip()

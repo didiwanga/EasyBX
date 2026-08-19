@@ -17,7 +17,6 @@ from xkxclient.ui.automationdock import (MacroControlDock, MacroRecorderDock,
 from xkxclient.ui.combatdock import CombatAssistDock
 from xkxclient.ui.commands import CommandPanel, CommandStore
 from xkxclient.ui.dslmanual import DslManualPanel
-from xkxclient.ui.lookdock import LookDock
 from xkxclient.ui.mapdock import MapDock
 from xkxclient.ui.navdock import NavDock
 from xkxclient.ui.notepaddock import NotepadDock
@@ -83,29 +82,8 @@ class MainWindow(QMainWindow):
         self.xiuxian_dock = self._make_dock("辅助修炼", XiuxianDock(None))
         self.map_dock = self._make_dock("地图", MapDock(None))
         self.nav_dock = self._make_dock("导航目的地", NavDock(None))
-        self.look_dock = self._make_dock("房间详情", LookDock(None))
         self.notepad_dock = self._make_dock("记事本", NotepadDock(None))
-# dock 布局（默认）：左=房间详情(上1/3)+[导航/战斗/修炼](下2/3)，
-        # 右=上[快捷/宏控制/宏录制] 中[状态/技能/记事本] 下[移动控制]；
-        # 命令速查/DSL手册/地图 默认隐藏（菜单打开时悬浮）。
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.look_dock)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.nav_dock)
-        self.splitDockWidget(self.look_dock, self.nav_dock, Qt.Orientation.Vertical)
-        self.tabifyDockWidget(self.nav_dock, self.combat_dock)
-        self.tabifyDockWidget(self.combat_dock, self.xiuxian_dock)
-        self.nav_dock.raise_()
-
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.quick_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.state_dock)
-        self.splitDockWidget(self.quick_dock, self.state_dock, Qt.Orientation.Vertical)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.move_dock)
-        self.splitDockWidget(self.state_dock, self.move_dock, Qt.Orientation.Vertical)
-        self.tabifyDockWidget(self.quick_dock, self.macro_dock)
-        self.tabifyDockWidget(self.macro_dock, self.recorder_dock)
-        self.tabifyDockWidget(self.state_dock, self.skills_dock)
-        self.tabifyDockWidget(self.skills_dock, self.notepad_dock)
-        self.quick_dock.raise_()
-        self.state_dock.raise_()
+        self._apply_default_layout()
 
         self.commands_dock.hide()
         self.dsl_dock.hide()
@@ -138,6 +116,8 @@ class MainWindow(QMainWindow):
         self.app.bus.subscribe("macro.end", self._on_macro_progress)
         self.app.bus.subscribe("macro.wait_input", self._on_macro_wait)
         self.app.bus.subscribe("net.throttle", self._on_throttle)
+        self.app.bus.subscribe("map.sync_state", self._on_map_sync_state)
+        self.app.bus.subscribe("map.sync_stats", self._on_map_sync_stats)
 
         self.tray = AppTray(self)
         self.tray.show()
@@ -164,6 +144,37 @@ class MainWindow(QMainWindow):
         dock.setWidget(widget)
         dock.setObjectName(f"dock_{title}")
         return dock
+
+    def _apply_default_layout(self) -> None:
+        """默认 dock 布局：左=[导航目的地/记事本/自动战斗/辅助修炼]（标签切换一组），
+        右=上[快捷动作/宏控制/宏录制] 中[状态/技能面板] 下[移动控制]；
+        命令速查/DSL手册/地图 隐藏（菜单打开时悬浮）。"""
+        # 全部先 addDockWidget，再 tabify/split 分组（先 add 后 tabify，
+        # 避免 dock 在 show 前被排到负坐标/不可见）
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.nav_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.notepad_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.combat_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.xiuxian_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.quick_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.macro_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.recorder_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.state_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.skills_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.move_dock)
+        # 左侧一组（标签切换），右侧上/中/下三组（addDockWidget 顺序 + tabify
+        # 由布局引擎排布；不用 splitDockWidget，避免 dock 被排到负坐标/不可见）
+        self.tabifyDockWidget(self.nav_dock, self.notepad_dock)
+        self.tabifyDockWidget(self.notepad_dock, self.combat_dock)
+        self.tabifyDockWidget(self.combat_dock, self.xiuxian_dock)
+        self.tabifyDockWidget(self.quick_dock, self.macro_dock)
+        self.tabifyDockWidget(self.macro_dock, self.recorder_dock)
+        self.tabifyDockWidget(self.state_dock, self.skills_dock)
+        # 每组默认激活
+        self.nav_dock.raise_()
+        self.quick_dock.raise_()
+        self.state_dock.raise_()
+        for d in (self.commands_dock, self.dsl_dock, self.map_dock):
+            d.hide()
 
     def _build_menus(self) -> None:
         bar = self.menuBar()
@@ -202,11 +213,11 @@ class MainWindow(QMainWindow):
         pm.addAction("🕹 移动控制", self._toggle_dock(self.move_dock))
         pm.addAction("▶️ 宏控制", self._toggle_dock(self.macro_dock))
         pm.addAction("🧭 导航目的地", self._toggle_dock(self.nav_dock))
+        pm.addAction("🗺️ 地图", self._toggle_dock(self.map_dock))
         pm.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
         pm.addAction("⏺ 宏录制", self._toggle_dock(self.recorder_dock))
         pm.addAction("🥊 自动战斗", self._toggle_dock(self.combat_dock))
         pm.addAction("🧘 辅助修炼", self._toggle_dock(self.xiuxian_dock))
-        pm.addAction("🏠 房间详情", self._toggle_dock(self.look_dock))
         pm.addAction("📖 命令速查", self._toggle_float_dock(self.commands_dock))
         pm.addAction("📚 DSL 手册", self._toggle_float_dock(self.dsl_dock))
         pm.addAction("🗺 世界地图", self._open_world_map)
@@ -339,12 +350,30 @@ class MainWindow(QMainWindow):
         self.xiuxian_dock.widget().bind(session)
         self.map_dock.widget().bind(session)
         self.nav_dock.widget().bind(session)
-        self.look_dock.widget().bind(session)
         self.notepad_dock.widget().bind(session)
         self.skills_dock_widget().bind(session)
         self._subscribe_nav(session)
         tab._sync_channels()
         self._update_status(session)
+        self._refresh_status_flags(session)
+
+    def _refresh_status_flags(self, session) -> None:
+        if session.logged_in:
+            self.status.set_login_status(f"{session.account_id} 已登录", True)
+        else:
+            self.status.set_login_status("未登录", False)
+        sync = getattr(session, "map_sync", None)
+        if sync is None or not sync.active:
+            self.status.set_map_server(False, "地图同步未启用")
+        elif sync.status_ok is None:
+            self.status.set_map_server(False, "地图服务器未连接")
+        else:
+            self.status.set_map_server(sync.status_ok, sync.last_error or "")
+        # 同步统计：切 tab/登录时立即刷新一次（独立 15s 定时器之外）
+        if sync is not None and sync.active and getattr(session, "logged_in", False):
+            refresh = getattr(session, "_map_stats_refresh", None)
+            if refresh is not None:
+                refresh()
 
     def skills_dock_widget(self) -> SkillsDock:
         return self.skills_dock.widget()
@@ -356,6 +385,15 @@ class MainWindow(QMainWindow):
         self._nav_subscribed = True
         self.app.bus.subscribe_pattern("nav.*", self.map_dock.widget().on_nav_state)
         self.app.bus.subscribe_pattern("nav.*", self.nav_dock.widget()._nav_state)
+        # 每次 GMCP.Move 后自动重绘地图，跑图时地图即时更新
+        self.app.bus.subscribe("map.pushed", self._on_map_pushed)
+
+    def _on_map_pushed(self, payload: dict) -> None:
+        account = payload.get("account")
+        if account is not None and self.session is not None and account != self.session.account_id:
+            return
+        self.map_dock.widget().map_view.reload()
+        self.nav_dock.widget()._refresh_from_cache()
 
     def _update_status(self, session) -> None:
         st = session.state
@@ -370,10 +408,13 @@ class MainWindow(QMainWindow):
         account = payload.get("account") or "?"
         if payload["event"] == "net.connecting":
             self.status.set_connection(f"{account} {payload.get('status', '连接中')}")
+            self.status.set_login_status("未登录", False)
         elif payload["event"] == "net.connected":
             self.status.set_connection(f"{account} 已连接")
+            self.status.set_login_status("未登录", False)
         else:
             self.status.set_connection(f"{account} 断开")
+            self.status.set_login_status("未登录", False)
 
     def _on_state_changed(self, payload: dict) -> None:
         if payload.get("account") != getattr(self._cur_tab, "account_id", None):
@@ -414,6 +455,7 @@ class MainWindow(QMainWindow):
 
     def _on_login_done(self, payload: dict) -> None:
         self.status.set_connection(f"{payload.get('account')} 登录成功")
+        self.status.set_login_status(f"{payload.get('account')} 已登录", True)
         self._layout_diag = True
         if self._cur_tab is not None and self._cur_tab.account_id == payload.get("account"):
             self.skills_dock_widget().refresh()
@@ -428,6 +470,16 @@ class MainWindow(QMainWindow):
         w._debug_log = lambda msg: self.status.showMessage(str(msg)[:120], 5000)
         self._hongbao_win = w
         w.show()
+
+    def _on_map_sync_state(self, payload: dict) -> None:
+        if payload.get("account") != getattr(self._cur_tab, "account_id", None):
+            return
+        self.status.set_map_server(bool(payload.get("ok")), payload.get("error") or "")
+
+    def _on_map_sync_stats(self, payload: dict) -> None:
+        if payload.get("account") != getattr(self._cur_tab, "account_id", None):
+            return
+        self.status.set_sync_stats(payload.get("stats"))
 
     def _on_status_message(self, payload: dict) -> None:
         msg = str(payload.get("message", ""))
@@ -611,7 +663,8 @@ class MainWindow(QMainWindow):
         for i in range(self.tabs.count()):
             t = self.tabs.widget(i)
             if isinstance(t, AccountTab):
-                t.session.triggers.master_on = on
+                # 走 set_master：停用即清空全部触发器状态与排队命令，启用从头检测
+                t.session.triggers.set_master(on)
         self._update_master_action(self._trg_on_act, "触发器", on)
 
     def _toggle_timer_master(self, on: bool) -> None:
@@ -748,19 +801,21 @@ class MainWindow(QMainWindow):
         self._macro_share.show()
 
     # ---- 布局持久化 ----
-    # 默认启动布局：以用户当前 dock 布局固化（8 方向各 dock 位置/尺寸）。
+    # 默认启动布局（saveState 固化）：左=[导航目的地/记事本/自动战斗/辅助修炼]（标签一组），
+    # 右=上[快捷动作/宏控制/宏录制] 中[状态/技能面板] 下[移动控制]。
     _DEFAULT_LAYOUT = (
-        "000000ff00000000fd0000000200000000000001b200000330fc0200000002fb000000120064006f0063006b005f623f95f48be660c50100000030000000b0000000b000fffffffc000000e60000027a0000027a01000017fa000000000200000003fb000000140064006f0063006b005f5bfc822a76ee768457300100000000ffffffff0000019400fffffffb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff0000026200fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff0000005600ffffff000000010000017200000330fc0200000003fc0000003000000136000000d801000017fa000000000200000003fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000008800fffffffb000000100064006f0063006b005f5b8f63a752360100000000ffffffff0000009c00fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff000000c000fffffffc0000016c00000139000000a201000017fa000000000200000003fb0000000e0064006f0063006b005f72b660010100000000ffffffff0000005600fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff0000008a00fffffffb000000100064006f0063006b005f8bb04e8b672c0100000000ffffffff0000007800fffffffb000000120064006f0063006b005f79fb52a863a7523601000002ab000000b5000000b000ffffff000001d00000033000000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
+        "000000ff00000000fd0000000200000000000001440000038dfc0200000001fc000000420000038d000002b201000019fa000000000200000004fb000000140064006f0063006b005f5bfc822a76ee768457300100000000ffffffff000001ce00fffffffb000000100064006f0063006b005f8bb04e8b672c0100000000ffffffff0000007d00fffffffb000000120064006f0063006b005f81ea52a8621865970100000000ffffffff0000029800fffffffb000000120064006f0063006b005f8f8552a94fee70bc0100000000ffffffff0000005700ffffff00000001000001580000038dfc0200000003fc0000004200000123000000ee01000019fa000000000200000003fb000000120064006f0063006b005f5feb637752a84f5c0100000000ffffffff0000009100fffffffb000000100064006f0063006b005f5b8f63a752360100000000ffffffff000000a900fffffffb000000100064006f0063006b005f5b8f5f5552360100000000ffffffff000000d400fffffffc0000016900000177000000ad01000019fa000000000200000002fb0000000e0064006f0063006b005f72b660010100000000ffffffff0000005700fffffffb000000120064006f0063006b005f628080fd9762677f0100000000ffffffff0000009300fffffffb000000120064006f0063006b005f79fb52a863a7523601000002e4000000eb000000c100ffffff000004070000038d00000004000000040000000800000008fc00000001000000020000000100000024006100750074006f006d006100740069006f006e005f0074006f006f006c0062006100720100000000ffffffff0000000000000000"
     )
 
     def _restore_layout(self) -> None:
         raw = cfg.ConfigManager.instance().get("layout_state")
-        if not (isinstance(raw, str) and raw):
-            raw = self._DEFAULT_LAYOUT  # 无已存布局：用默认启动布局
-        try:
-            self.restoreState(bytes.fromhex(raw))
-        except (ValueError, TypeError):
-            pass
+        if isinstance(raw, str) and raw:
+            try:
+                self.restoreState(bytes.fromhex(raw))
+            except (ValueError, TypeError):
+                pass
+        # 无已存布局：保持 __init__ 建立的默认布局（_apply_default_layout），
+        # 不再用旧快照覆盖（旧快照可能固化了 dock 不显示的错误状态）。
         # 登录前主窗口未显示：仅隐藏浮动 dock（它是独立顶层窗口，停靠 dock 随
         # 主窗口隐藏不会显示）。避免 hide 停靠 dock 打乱 QMainWindow 停靠布局。
         if not self._docks_restored:
@@ -775,8 +830,10 @@ class MainWindow(QMainWindow):
             # 主窗口显示后恢复浮动 dock 可见性（停靠 dock 由主窗口 show 自动布局，
             # 不应重新 restoreState——窗口显示过程中重放布局会把 dock 排到未就绪的
             # 负坐标几何，导致控件被撑出窗口）。
+            # 只恢复「保存布局中可见」的浮动 dock：尊重用户关闭 dock 的持久化状态
+            #（toggleViewAction 的 checked 反映保存的可见性），避免关闭后重启又显示。
             for d in self.findChildren(QDockWidget):
-                if d.isFloating():
+                if d.isFloating() and d.toggleViewAction().isChecked():
                     d.setVisible(True)
             # 恢复后强制重算布局，避免 dock 几何与窗口尺寸不同步
             QTimer.singleShot(0, self._relayout)
@@ -825,25 +882,26 @@ class MainWindow(QMainWindow):
                 pass
 
     def _heal_dock_layout(self) -> None:
-        """自愈：停靠 dock 若被排到主窗口可视区外（负坐标），重新应用布局纠正。
+        """自愈：所有停靠 dock 都被排到主窗口可视区外（负坐标）时重新恢复布局。
 
-        偶发竞态下 QMainWindow 可能把 dock 排到负坐标（控件被撑出窗口），
-        检测到异常时重新 restoreState 一次，且只在本次显示期间纠正一次避免死循环。
+        tab 化的 dock 折叠时几何会是负坐标（Qt 正常行为），不能误判为损坏；
+        只有「所有可见停靠 dock 都在窗口外」才算真正错乱，才触发恢复。
         """
         if getattr(self, "_layout_healed", False):
             return
         if not self.isVisible():
             return
         vw = self.width()
-        bad = False
-        for d in self.findChildren(QDockWidget):
-            if not d.isFloating() and d.isVisible():
-                g = d.geometry()
-                if g.x() < -80 or g.y() < -80 or g.x() > vw:
-                    bad = True
-                    break
-        if not bad:
+        vh = self.height()
+        visible = [d for d in self.findChildren(QDockWidget)
+                   if not d.isFloating() and d.isVisible()]
+        if not visible:
             return
+        # 任一个可见停靠 dock 在窗口内 → 布局正常
+        for d in visible:
+            g = d.geometry()
+            if -80 <= g.x() <= vw and -80 <= g.y() <= vh:
+                return
         self._layout_healed = True
         try:
             raw = cfg.ConfigManager.instance().get("layout_state")

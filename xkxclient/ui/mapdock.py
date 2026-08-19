@@ -5,6 +5,7 @@ import json
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -24,16 +25,24 @@ class MapDock(QWidget):
         self.session = session
         self.cache = getattr(session, "map_cache", None) if session else None
         self.map_view = LocalMapWidget(self.cache)
+        self._plan_route: list[str] | None = None
 
         self.cur_label = QLabel("当前位置: -")
         self.target = QLineEdit()
         self.target.setPlaceholderText("目标房间名…")
-        self.walk_btn = QPushButton("寻路并走")
+        self.plan_btn = QPushButton("寻路")
+        self.go_btn = QPushButton("行走")
+        self.go_btn.setEnabled(False)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
-        self.walk_btn.clicked.connect(self._on_walk)
+        self.refresh_btn = QPushButton("刷新位置")
+        self.plan_btn.clicked.connect(self._on_plan)
+        self.go_btn.clicked.connect(self._on_go)
         self.stop_btn.clicked.connect(self._on_stop)
-        self.target.returnPressed.connect(self._on_walk)
+        self.refresh_btn.clicked.connect(self._on_refresh)
+        self.target.returnPressed.connect(self._on_plan)
+        self.path_label = QLabel("")
+        self.path_label.setWordWrap(True)
 
         step_row = QHBoxLayout()
         step_row.addWidget(QLabel("步速"))
@@ -48,12 +57,15 @@ class MapDock(QWidget):
         top = QHBoxLayout()
         top.addWidget(self.cur_label, 1)
         top.addWidget(self.target, 1)
-        top.addWidget(self.walk_btn)
+        top.addWidget(self.plan_btn)
+        top.addWidget(self.go_btn)
         top.addWidget(self.stop_btn)
+        top.addWidget(self.refresh_btn)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.addLayout(top)
+        lay.addWidget(self.path_label)
         lay.addWidget(self.map_view, 1)
         lay.addLayout(step_row)
 
@@ -70,22 +82,78 @@ class MapDock(QWidget):
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.config_step_ms(int(sec * 1000))
 
-    def _on_walk(self) -> None:
+    def _on_plan(self) -> None:
+        """寻路：只列出路径，是否行走由用户点「行走」决定。"""
         if self.session is None:
             return
         target = self.target.text().strip()
         if not target:
             return
-        route = self._find_route(target)
-        if not route:
+        route: list[str] | None = None
+        if self.cache is not None:
+            cands = self.cache.find_targets(target)
+            if len(cands) == 1:
+                route = cands[0][2]
+            elif len(cands) > 1:
+                route = self._choose_target(target, cands)
+        if route is None:
+            route = self._find_route(target)  # 本地无路/被取消 -> 服务端兜底
+        self._plan_route = route
+        self.go_btn.setEnabled(False)
+        if route is None:
             self.cur_label.setText(f"无路可走: {target}")
+            self.path_label.setText("")
             return
-        self.cur_label.setText(f"→ {target} ({len(route)} 步)")
-        self.walk_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        if not route:
+            self.path_label.setText(f"已在目标房间: {target}")
+        else:
+            self.path_label.setText(f"路径 → {target}（{len(route)} 步）: " + " → ".join(route))
+        self.cur_label.setText(f"已规划 → {target}（{len(route)} 步）")
+        self.go_btn.setEnabled(True)
+
+    def _on_go(self) -> None:
+        """开始行走已规划的路径。"""
+        if self.session is None or not self._plan_route:
+            return
         nav = self.session.navigator
-        if nav is not None:
-            nav.start(route)
+        if nav is None:
+            return
+        self.go_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        nav.start(self._plan_route)
+
+    def _on_refresh(self) -> None:
+        """刷新当前位置：发 look 让采集器回写当前位置，并重绘地图。"""
+        if self.session is not None and getattr(self.session, "logged_in", False):
+            self.session.send("look")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(600, self._refresh_cur)
+
+    def _refresh_cur(self) -> None:
+        name = self.cache.current if self.cache is not None else ""
+        self.cur_label.setText(f"当前位置: {name or '-'}")
+        if self.cache is not None:
+            self.map_view.reload()
+
+    def _choose_target(self, name: str, cands) -> list[str] | None:
+        items = []
+        for i, (_nid, dist, path) in enumerate(cands, 1):
+            if dist == 0:
+                tag = "当前所在"
+            elif dist == float("inf"):
+                tag = "距离未知"
+            else:
+                tag = f"距离 {int(dist)} 步"
+            if path:
+                tag += f" · 首步 {path[0]}"
+            items.append(f"#{i} {tag} · {name}")
+        chosen, ok = QInputDialog.getItem(
+            self, "选择目的地",
+            f"同名房间 {len(cands)} 个（按距离由近到远）：",
+            items, 0, False)
+        if not ok or chosen is None:
+            return None
+        return cands[items.index(chosen)][2]
 
     def _find_route(self, target: str) -> list[str] | None:
         route = self.cache.route(target) if self.cache is not None else None
@@ -114,8 +182,8 @@ class MapDock(QWidget):
     def _on_stop(self) -> None:
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.stop()
-        self.walk_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.go_btn.setEnabled(bool(self._plan_route))
 
     def on_nav_state(self, payload: dict) -> None:
         ev = payload.get("event", "")
@@ -123,18 +191,18 @@ class MapDock(QWidget):
         if account is not None and self.session is not None and account != self.session.account_id:
             return
         if ev == "nav.start":
-            self.walk_btn.setEnabled(False)
+            self.go_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
         elif ev == "nav.arrived":
             self.cur_label.setText("已到达")
-            self.walk_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.go_btn.setEnabled(bool(self._plan_route))
             if self.cache is not None:
                 self.map_view.reload()
         elif ev in ("nav.stuck", "nav.stopped"):
             self.cur_label.setText(f"停止: {payload.get('reason', '')}")
-            self.walk_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.go_btn.setEnabled(bool(self._plan_route))
         elif ev == "nav.step":
             if self.cache is not None:
                 self.map_view.reload()

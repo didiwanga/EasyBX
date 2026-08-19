@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
@@ -28,20 +29,30 @@ class NotepadDock(QWidget):
         self._subscribed = False
         self.setMinimumWidth(220)
 
+        self._font_zoom = 0
         self.editor = QTextEdit()
         self.editor.setPlaceholderText("右键输出区选中文本 → 添加到记事本；此处可编辑/删除。")
+        self._apply_font()
         self.del_btn = QPushButton("删除选中")
         self.del_btn.setToolTip("删除编辑区内当前选中的内容")
         self.del_btn.clicked.connect(self._delete_selection)
         self.clear_btn = QPushButton("清空")
         self.clear_btn.setToolTip("清空记事本全部内容")
         self.clear_btn.clicked.connect(self._clear_all)
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setToolTip("放大记事本字体")
+        self.zoom_in_btn.clicked.connect(self._zoom_in)
+        self.zoom_out_btn = QPushButton("-")
+        self.zoom_out_btn.setToolTip("缩小记事本字体")
+        self.zoom_out_btn.clicked.connect(self._zoom_out)
 
         btns = QHBoxLayout()
         btns.setSpacing(4)
         btns.addWidget(self.del_btn)
         btns.addWidget(self.clear_btn)
         btns.addStretch(1)
+        btns.addWidget(self.zoom_out_btn)
+        btns.addWidget(self.zoom_in_btn)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -52,6 +63,26 @@ class NotepadDock(QWidget):
             self._subscribe()
 
         self._load()
+
+    def _zoom_in(self) -> None:
+        self._font_zoom = min(self._font_zoom + 1, 20)
+        # QTextEdit.zoomIn 对整个文档生效（含 setHtml 加载的旧信息内联字号），
+        # 避免仅 setFont 改默认字体时旧内容无法缩放
+        self.editor.zoomIn(1)
+
+    def _zoom_out(self) -> None:
+        self._font_zoom = max(self._font_zoom - 1, -10)
+        self.editor.zoomOut(1)
+
+    def _apply_font(self) -> None:
+        """与主输出同款渲染：等宽字体 + 制表位=空格宽×4 + 不换行，保证 MUD 表格对齐。"""
+        spec = ConfigManager.instance().get("font", {"family": "SimHei", "size": 12})
+        size = max(6, int(spec.get("size", 12)) + self._font_zoom)
+        f = QFont(spec.get("family", "SimHei"), size)
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        self.editor.setFont(f)
+        self.editor.setTabStopDistance(self.editor.fontMetrics().horizontalAdvance(" ") * 4)
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
 
     def _subscribe(self) -> None:
         if self.bus is not None and not self._subscribed:

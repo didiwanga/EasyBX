@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import re
 
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import QRectF, Qt, QTimer, QUrl
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
     QGridLayout,
@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 _IMG_RE = re.compile(rb"<img[^>]+src\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
@@ -28,6 +29,123 @@ _FAIL_MSG = "好像什么都没有发生，但是又好像有什么事情做错�
 _MAX_ATTEMPTS = 3
 # 发送验证码后超时无任何回话（成功/失败均未收到）→ 按失败处理，提示重输
 _RESULT_TIMEOUT_MS = 180000
+
+# ---- 四格同步的缩放/平移视图 ----
+_MIN_ZOOM = 1.0
+_MAX_ZOOM = 8.0
+
+
+class _ViewState:
+    """四个验证码格子共享的缩放/平移状态：任一格操作，四格同步。"""
+
+    def __init__(self) -> None:
+        self.zoom = 1.0
+        self.off_x = 0.0  # 相对适配居中位置的平移量（像素）
+        self.off_y = 0.0
+        self.widgets: list["ZoomImageView"] = []
+
+    def reset(self) -> None:
+        self.zoom = 1.0
+        self.off_x = 0.0
+        self.off_y = 0.0
+
+    def sync(self) -> None:
+        for w in self.widgets:
+            w.update()
+
+
+class ZoomImageView(QWidget):
+    """单格验证码图：滚轮缩放 / 左键拖动平移 / 双击复位。
+
+    图片每次按当前控件尺寸等比适配绘制（跟随窗口拉伸），
+    再叠加共享的缩放与平移 → 四格同步。
+    """
+
+    def __init__(self, state: _ViewState, parent=None) -> None:
+        super().__init__(parent)
+        self._state = state
+        self._pix: QPixmap | None = None
+        self._text = "加载中…"
+        self._drag_anchor = None  # (global_pos, off_x, off_y)
+        self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        self.setMinimumSize(200, 120)
+        self.setStyleSheet("background:#1a1a1a; border:1px solid #333;")
+
+    # ---- 兼容 QLabel 的对外接口 ----
+    def setText(self, text: str) -> None:
+        self._text = text
+        self._pix = None
+        self.update()
+
+    def setPixmap(self, pix: QPixmap) -> None:
+        self._pix = pix
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        try:
+            p.fillRect(self.rect(), QColor(26, 26, 26))
+            pix = self._pix
+            ws, hs = self.width(), self.height()
+            if pix is not None and not pix.isNull() and ws > 0 and hs > 0:
+                iw, ih = pix.width(), pix.height()
+                if iw > 0 and ih > 0:
+                    st = self._state
+                    scale = min(ws / iw, hs / ih) * st.zoom
+                    dw, dh = iw * scale, ih * scale
+                    x = (ws - dw) / 2 + st.off_x
+                    y = (hs - dh) / 2 + st.off_y
+                    p.drawPixmap(
+                        QRectF(x, y, dw, dh),
+                        pix,
+                        QRectF(0.0, 0.0, float(iw), float(ih)),
+                    )
+            else:
+                p.setPen(QColor(160, 160, 160))
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+        finally:
+            p.end()
+
+    def wheelEvent(self, event) -> None:
+        if self._pix is None:
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        st = self._state
+        st.zoom = max(_MIN_ZOOM, min(_MAX_ZOOM, st.zoom * factor))
+        st.sync()
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._pix is not None:
+            st = self._state
+            self._drag_anchor = (event.globalPosition().toPoint(), st.off_x, st.off_y)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_anchor is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            gpos, ox, oy = self._drag_anchor
+            d = event.globalPosition().toPoint() - gpos
+            st = self._state
+            st.off_x = ox + d.x()
+            st.off_y = oy + d.y()
+            st.sync()
+            event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_anchor = None
+            self.unsetCursor()
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._state.reset()
+            self._state.sync()
+            event.accept()
 
 
 class FullmeGridWindow(QDialog):
@@ -59,18 +177,17 @@ class FullmeGridWindow(QDialog):
         self.setMinimumSize(460, 300)
 
         grid = QGridLayout()
-        labels: list[QLabel] = []
+        labels: list[ZoomImageView] = []
+        self._view_state = _ViewState()
         for idx in range(4):
-            cell = QLabel("加载中…")
-            cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cell.setMinimumSize(200, 120)
-            cell.setFrameShape(QLabel.Shape.StyledPanel)
+            cell = ZoomImageView(self._view_state)
             if self._url:
                 cell.setProperty("url", self._url)
             else:
                 cell.setText("无验证码")
             grid.addWidget(cell, idx // 2, idx % 2)
             labels.append(cell)
+        self._view_state.widgets = labels
         self._labels = labels
 
         self.desc_label = QLabel()
@@ -97,7 +214,7 @@ class FullmeGridWindow(QDialog):
         # 会导致 Qt 的 DNS 解析偶尔失败（界面显示「无法解析地址」）。
         self._nam.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
         self._replies: list[QNetworkReply] = []
-        self._label_urls: dict[QLabel, str] = {}
+        self._label_urls: dict[QWidget, str] = {}
         for label in self._labels:
             url = label.property("url")
             if url:
@@ -207,9 +324,7 @@ class FullmeGridWindow(QDialog):
             return
         pix = QPixmap()
         if pix.loadFromData(data):
-            label.setPixmap(pix.scaled(label.width() if label.width() > 100 else 220,
-                                       160, Qt.AspectRatioMode.KeepAspectRatio,
-                                       Qt.TransformationMode.SmoothTransformation))
+            label.setPixmap(pix)
         else:
             label.setText(f"无法解析图片\n{url}")
 
@@ -271,6 +386,16 @@ class FullmeGridWindow(QDialog):
         self.input_row.clear()
         self.input_row.setFocus()
         self._sent = False  # 允许重输再提交
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 弹窗显示后默认把焦点放在输入框，便于直接输入验证码
+        QTimer.singleShot(0, self._focus_input)
+
+    def _focus_input(self) -> None:
+        if self.isVisible():
+            self.input_row.setFocus()
+            self.input_row.selectAll()
 
     def closeEvent(self, event) -> None:
         if self._sub is not None:

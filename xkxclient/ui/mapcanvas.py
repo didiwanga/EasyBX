@@ -96,32 +96,70 @@ class LocalMapWidget(QWidget):
 
     # ---- 布局 ----
     def _layout_coords(self) -> dict[str, tuple[float, float]]:
-        """方向感知 BFS 布局：从当前房间向外扩展，同方向并列避让。"""
+        """房间定位：优先使用全局坐标系（实例坐标已按区域/全局对齐）；无坐标房间
+        沿已定位邻居方向 BFS 展开；完全孤立房间放到空位（不重叠）。
+
+        探针数据以 [0,0,0] 作为占位锚点（无实际空间意义），room_coords 已过滤；
+        网格按 step 对齐，展开时目标格被占则向外螺旋找最近空格，避免重叠。
+        """
         step = 90.0
         coord: dict[str, tuple[float, float]] = {}
-        cur = self._cache.current
-        if cur:
-            coord[cur] = (0.0, 0.0)
+        grid: set[tuple[float, float]] = set()
+        cache = self._cache
+
+        # 统计名字键坐标重复度：同一坐标被多个房间共享说明是占位/合并锚点，不可靠
+        nc: dict[tuple[float, float], list[str]] = {}
+        for name in cache.rooms:
+            c = cache.room_coords(name)
+            if c and len(c) >= 2:
+                nc.setdefault((c[0] * step, c[1] * step), []).append(name)
+
+        for name in cache.rooms:
+            c = cache.room_coords(name)
+            if not c or len(c) < 2:
+                continue
+            pos = (c[0] * step, c[1] * step)
+            if len(nc[pos]) > 1:
+                continue  # 共享坐标视为锚点，交给 BFS 展开
+            coord[name] = pos
+            grid.add(pos)
+
+        def free_nearest(gx: float, gy: float) -> tuple[float, float]:
+            """从 (gx,gy) 起按半径螺旋找最近未被占用的网格格点。"""
+            cands = []
+            for r in range(0, 32):
+                ring = []
+                for k in range(-r, r + 1):
+                    ring.append((gx + k * step, gy - r * step))
+                    ring.append((gx + k * step, gy + r * step))
+                    ring.append((gx - r * step, gy + k * step))
+                    ring.append((gx + r * step, gy + k * step))
+                for p in ring:
+                    if p not in grid:
+                        cands.append(p)
+                if cands:
+                    return cands[0]
+            return gx, gy
+
         while True:
             changed = False
             for name, (px, py) in list(coord.items()):
-                for d, nxt in self._cache.edges.get(name, {}).items():
+                for d, nxt in cache.edges.get(name, {}).items():
                     if nxt in coord:
                         continue
                     dx, dy = _DIR_DELTA.get(d, (0, 0))
-                    x, y = px + dx * step, py + dy * step
-                    # 冲突避让：已占用则斜向错一位
-                    while True:
-                        clash = any(abs(ex - x) < step * 0.4 and abs(ey - y) < step * 0.4
-                                    for (ex, ey) in coord.values())
-                        if not clash:
-                            break
-                        x += step * 0.5
-                        y += step * 0.5
-                    coord[nxt] = (x, y)
+                    pos = free_nearest(px + dx * step, py + dy * step)
+                    coord[nxt] = pos
+                    grid.add(pos)
                     changed = True
             if not changed:
                 break
+        for name in cache.rooms:
+            if name in coord:
+                continue
+            pos = free_nearest(0.0, 0.0)
+            coord[name] = pos
+            grid.add(pos)
         return coord
 
     def reload(self) -> None:

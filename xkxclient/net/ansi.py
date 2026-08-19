@@ -56,6 +56,34 @@ def _sgr_bg(params: list[int]) -> str | None:
     return None
 
 
+def fg_at(segments, line: str, text: str) -> str | None:
+    """在纯文本 line 中定位 text 首次出现位置，返回该子串范围内第一个前景色（#RRGGBB）。
+
+    segments 为对应行的分段列表，元素可为 Span 对象或 {"t","fg","bg","bold"} dict
+    （text 拼接 == line）；无颜色信息或未找到返回 None。
+    """
+    if not segments or not text:
+        return None
+    idx = line.find(text)
+    if idx < 0:
+        return None
+    end = idx + len(text)
+    off = 0
+    for s in segments:
+        if hasattr(s, "text"):
+            s_text, s_fg = s.text, s.fg
+        else:
+            s_text, s_fg = (s.get("t", "") if isinstance(s, dict) else ""), \
+                           (s.get("fg") if isinstance(s, dict) else None)
+        start = off
+        off += len(s_text)
+        if off <= idx or start >= end:
+            continue
+        if s_fg:
+            return s_fg
+    return None
+
+
 def _brighten(fg: str) -> str:
     """bold(SGR 1) 的终端语义是"增亮"：把 30-37 标准色映射到 90-97 亮色变体。
 

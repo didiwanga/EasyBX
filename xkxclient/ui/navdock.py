@@ -19,6 +19,19 @@ from PyQt6.QtWidgets import (
 )
 
 
+def _npc_names(node: dict) -> list[str]:
+    """取房间 node 的 NPC 中文名列表（兼容 str 旧格式 / {"name","id"} 新格式）。"""
+    out = []
+    for v in (node.get("npc") or []):
+        if isinstance(v, dict):
+            nm = v.get("name") or ""
+        else:
+            nm = str(v)
+        if nm and nm not in out:
+            out.append(nm)
+    return out
+
+
 class FlowLayout(QLayout):
     """流式布局：按可用宽度自动换行（Qt 官方 QFlowLayout 精简实现）。
 
@@ -124,6 +137,7 @@ class NavDock(QWidget):
         self._capturing = False
         self._seen_header = False
         self._after_node = None
+        self._bound_account = None
         self._walk_capturing = False
         self._walk_seen_header = False
         self._idle_timer = QTimer(self)
@@ -132,7 +146,7 @@ class NavDock(QWidget):
         self._idle_timer.timeout.connect(self._idle_refresh)
         self._cap_timer = QTimer(self)
         self._cap_timer.setSingleShot(True)
-        self._cap_timer.setInterval(20000)
+        self._cap_timer.setInterval(5000)
         self._cap_timer.timeout.connect(self._capture_timeout)
 
         self.exits_box = QWidget()
@@ -250,7 +264,11 @@ class NavDock(QWidget):
             "exits": list(getattr(session, "exits", []) or []),
         })
         self._capturing = False
-        self._fetch_node_list()
+        # 仅首次绑定该账号时刷新 node 列表；切换标签复用已有数据，避免频繁
+        # 自动 node/walk 请求产生噪声（无路径区域的"你不能在这里定义路径"等）。
+        if getattr(self, "_bound_account", None) != self._account:
+            self._bound_account = self._account
+            self._fetch_node_list()
 
     def _unsub(self) -> None:
         if self._bus is not None:
@@ -310,7 +328,7 @@ class NavDock(QWidget):
         if cache is not None:
             node = cache.rooms.get(name) or {}
             cat = node.get("category") or ""
-            npc = list(node.get("npc") or [])
+            npc = _npc_names(node)
             desc = list(node.get("desc") or [])
         self.cat_label.setText(f"类别: {cat}" if cat else "")
         self.npc_label.setText("NPC: " + "、".join(npc) if npc else "")
@@ -328,7 +346,7 @@ class NavDock(QWidget):
         node = cache.rooms.get(name) or {}
         self.room_label.setText(f"当前位置: {name}")
         cat = node.get("category") or ""
-        npc = list(node.get("npc") or [])
+        npc = _npc_names(node)
         desc = list(node.get("desc") or [])
         self.cat_label.setText(f"类别: {cat}" if cat else "")
         self.npc_label.setText("NPC: " + "、".join(npc) if npc else "")
@@ -413,6 +431,8 @@ class NavDock(QWidget):
         self._after_node = "walk" if follow == "walk" else None
         self._capturing = True
         self._seen_header = False
+        self._node_pending = False
+        self._node_foreign = False
         self._node_rows: list[tuple[str, str]] = []
         self.dest_list.clear()
         self.status.setText("正在读取 node 列表…")
@@ -450,6 +470,8 @@ class NavDock(QWidget):
         elif self._walk_capturing:
             self._walk_capturing = False
             self._walk_seen_header = False
+            self._walk_pending = False
+            self._walk_foreign = False
             self._cap_timer.stop()
             if s is not None:
                 s.abort_walk_capture()
@@ -572,6 +594,8 @@ class NavDock(QWidget):
             return
         self._walk_capturing = True
         self._walk_seen_header = False
+        self._walk_pending = False
+        self._walk_foreign = False
         self._walk_rows: list[tuple[str, str, str]] = []
         self.walk_list.clear()
         self.status.setText("正在读取 walk 列表…")
@@ -590,9 +614,11 @@ class NavDock(QWidget):
         if "未完继续" in line and "%" in line:
             self._cap_timer.start()
             return
-        if "没有内建路径" in line or "没有内建" in line:
+        if "没有内建路径" in line or "没有内建" in line or "你不能在这里定义路径" in line:
             self._walk_capturing = False
             self._walk_seen_header = False
+            self._walk_pending = False
+            self._walk_foreign = False
             self._cap_timer.stop()
             self.status.setText("当前房间没有内建路径")
             return
@@ -600,28 +626,51 @@ class NavDock(QWidget):
             # 出发点不明确：服务器不会给出表格，直接终止，不等超时
             self._walk_capturing = False
             self._walk_seen_header = False
+            self._walk_pending = False
+            self._walk_foreign = False
             self._cap_timer.stop()
             if self.session is not None:
                 self.session.abort_walk_capture()
             self.status.setText("当前区域的内建路径出发点暂时不明确")
             return
+        if self._walk_foreign:
+            # 外部表格（技能面板等）穿插在 walk 表格中：整段不上表，
+            # 直到其表尾 `└…─…┘` 结束，回到 walk 表继续解析
+            if "└" in line and "─" in line:
+                self._walk_foreign = False
+            return
         if "└" in line and "─" in line:
             # 表尾框线，本次捕获结束（在表头门之前判断：表头页丢失时也能正常收尾）
             self._walk_capturing = False
             self._walk_seen_header = False
+            self._walk_pending = False
+            self._walk_foreign = False
             self._cap_timer.stop()
             self.status.setText(f"walk 路径 {len(self._walk_rows)} 条")
             return
         if self._walk_seen_header is False:
+            # 顶框线 `┌…─` 待确认：技能面板等其他表格也以 `┌…─` 开头，
+            # 须下一行验证是真表头（含「目的地/拼音」）才进表，否则取消
+            # 待确认并忽略（技能面板行不上表，避免误读进 walk 列表）。
+            if self._walk_pending:
+                if has_vbar and "目的地" in line and "拼音" in line:
+                    self._walk_seen_header = True
+                    self._walk_pending = False
+                else:
+                    self._walk_pending = False
+                return
             if has_vbar and "目的地" in line and "拼音" in line:
                 self._walk_seen_header = True
                 return
             elif line.startswith("┌") and "─" in line:
-                self._walk_seen_header = True
+                self._walk_pending = True
                 return
             else:
                 return
         if not has_vbar:
+            if line.startswith("┌") and "─" in line:
+                # walk 表格中出现新顶框线 = 外部表格（技能面板等）穿插开始
+                self._walk_foreign = True
             return
         # 表头行（含「目的地/拼音/步数」列名）跳过，不当作数据
         if "目的地" in line and "拼音" in line and "步数" in line:

@@ -7,3 +7,6 @@ dist/
 build/
 *.spec
 .DS_Store
+hh*.bin*
+kf*.bin*
+*.uploading.cfg

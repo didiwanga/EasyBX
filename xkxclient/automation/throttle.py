@@ -53,10 +53,12 @@ class CommandThrottle(QObject):
             self._queue.append(("delay", ms))
 
     def enqueue_items(self, items: list) -> None:
-        """排队一组动作序列：str=命令，("delay", ms)=延时，按顺序执行。"""
+        """排队一组动作序列：str=命令，("delay", ms)=延时，("beep", None)=提示音。"""
         for it in items:
             if isinstance(it, tuple) and len(it) == 2 and it[0] == "delay":
                 self.enqueue_delay(it[1])
+            elif isinstance(it, tuple) and len(it) >= 1 and it[0] == "beep":
+                self._queue.append(("beep", None))
             else:
                 self.enqueue(it)
 
@@ -101,6 +103,12 @@ class CommandThrottle(QObject):
             self._delay_until = now + float(item[1]) / 1000.0
             self._busy = True
             return
+        if isinstance(item, tuple) and item[0] == "beep":
+            # 「叮」命令：播放提示音，不发往服务器
+            self._busy = True
+            from xkxclient.automation.trigger import play_ding
+            play_ding()
+            return
         self._busy = True
         self._sent = now
         self.connection.send_line(item)
@@ -114,3 +122,9 @@ class CommandThrottle(QObject):
 
     def close(self) -> None:
         self._timer.stop()
+
+    def start(self) -> None:
+        """连接恢复/重登后重启发送泵（close 停掉的 timer 不会自动恢复，
+        否则该账号所有宏指令将积压队列永不发送，而手动直发不受影响）。"""
+        if not self._timer.isActive():
+            self._timer.start()
