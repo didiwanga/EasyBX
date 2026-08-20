@@ -993,8 +993,8 @@ class MacroEditor(_EditorBase):
 
     def _refresh_steps(self) -> None:
         self.step_list.clear()
-        for s in self._steps:
-            self.step_list.addItem(self._step_desc(s))
+        for i, s in enumerate(self._steps, 1):
+            self.step_list.addItem(f"{i}. {self._step_desc(s)}")
 
     def _step_desc(self, s: dict) -> str:
         t = s.get("type")
@@ -1046,7 +1046,19 @@ class MacroEditor(_EditorBase):
             kws = s.get("keywords") or []
             dm = s.get("delay_ms") or 0
             tm = s.get("timeout_ms") or 0
-            return f"判断分支: 条件{len(conds)} 关键字{len(kws)} 延时{dm} 超时{tm}"
+            nk = s.get("no_keyword") or {}
+            nk_desc = ""
+            if nk.get("type"):
+                nk_desc = f" 无关键字→{nk.get('type')}"
+                if nk.get("type") == "cmd":
+                    nk_desc += f":{nk.get('command', '')}"
+                elif nk.get("type") == "jump":
+                    nk_desc += f" {nk.get('target', '')}"
+                elif nk.get("type") == "set":
+                    nk_desc += f" {nk.get('var', '')}={nk.get('value', '')}"
+                elif nk.get("type") == "notify":
+                    nk_desc += f":{nk.get('message', '')}"
+            return f"判断分支: 条件{len(conds)} 关键字{len(kws)} 延时{dm} 超时{tm}{nk_desc}"
         if t == "loop":
             return f"计数循环: 起点{s.get('start', '')} 次数{s.get('count', 0)}"
         if t == "call_trigger":
@@ -1073,6 +1085,11 @@ class MacroEditor(_EditorBase):
                   "exec": "仅执行", "home": "仅返回"}.get(s.get("hit_mode"), "")
             rh = f"·{hm}" if hm else ""
             return f"巡航[{mode}]: {s.get('range', '')} → {pat}{rh}"
+        if t == "resident":
+            n_cond = len(s.get("conditions") or [])
+            n_act = len(s.get("actions") or [])
+            beep = "·提示音" if s.get("beep") else ""
+            return f"常驻触发: {n_cond}条件/{n_act}动作{beep}"
         return f"{t}"
 
     def _onhit_suffix(self, on_hit: dict | None) -> str:
@@ -1108,6 +1125,17 @@ class MacroEditor(_EditorBase):
     def _on_step_add(self) -> None:
         dlg = StepDialog(self._steps, None, self)
         if dlg.exec() and dlg.result_step():
+            step = dlg.result_step()
+            if step.get("type") == "resident":
+                # 常驻触发：自动排为第一步，且每个宏仅能添加一个
+                if any(s.get("type") == "resident" for s in self._steps):
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "常驻触发", "每个宏仅能添加一个「常驻触发」步骤")
+                    return
+                self._steps.insert(0, step)
+                self._refresh_steps()
+                self.step_list.setCurrentRow(0)
+                return
             row = self.step_list.currentRow()
             if 0 <= row < len(self._steps):
                 self._steps.insert(row + 1, dlg.result_step())
@@ -1208,7 +1236,7 @@ class StepDialog(QDialog):
                     ("branch", "判断分支"), ("loop", "计数循环"),
                     ("call_trigger", "调用触发"), ("call", "调用"),
                     ("hit", "等待命中"), ("move_trigger", "移动并触发"),
-                    ("cruise", "巡航")]
+                    ("cruise", "巡航"), ("resident", "常驻触发")]
 
     def __init__(self, steps: list | None = None, default: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -1343,6 +1371,19 @@ class StepDialog(QDialog):
         self.br_timeout_sb = QSpinBox(); self.br_timeout_sb.setRange(0, 3600000)
         self.br_timeout_sb.setSuffix(" ms")
         self.br_timeout_sb.setToolTip("等待触发条件/关键字命中的超时；超时继续下一步")
+        # 条件命中但无关键字命中（超时后）的可选操作
+        self.br_nk_type = QComboBox()
+        for code, lab in [("none", "无动作(超时继续)"), ("cmd", "执行命令"),
+                          ("jump", "跳转步骤/标签"), ("set", "变量赋值"), ("notify", "提示通知")]:
+            self.br_nk_type.addItem(lab, code)
+        self.br_nk_type.currentIndexChanged.connect(lambda _i: self._br_nk_sync())
+        self.br_nk_cmd = QLineEdit()
+        self.br_nk_cmd.setPlaceholderText("命令（可含 {变量}）")
+        self.br_nk_tgt = QComboBox()
+        self.br_nk_set = QLineEdit()
+        self.br_nk_set.setPlaceholderText("{变量}=值")
+        self.br_nk_msg = QLineEdit()
+        self.br_nk_msg.setPlaceholderText("提示内容（可含 {变量}）")
 
         # ---- 计数循环页 ----
         self.lp_start_cb = QComboBox()
@@ -1402,6 +1443,9 @@ class StepDialog(QDialog):
         self.mt_retry_sb.setValue(3)
         self.mt_retry_sb.setSuffix(" 次")
         self.mt_retry_sb.setToolTip("同一命令连续失败重试上限；超过后跳过当前命令继续")
+        self.mt_loop_cb = QCheckBox("循环执行至命中")
+        self.mt_loop_cb.setChecked(False)
+        self.mt_loop_cb.setToolTip("命令全部执行完仍未命中时，从头重复执行命令，直至触发条件命中")
         self.mt_note = QLabel("逐个发送移动命令，每个命令等待一次触发命中；命中后延时再发下一个；超时则跳过当前命令继续。")
         self.mt_note.setStyleSheet("color:#c08040;")
         self.mt_hit_type = self._make_onhit_combo()
@@ -1438,6 +1482,26 @@ class StepDialog(QDialog):
                               "命中后延时执行指令；全部位置点遍历完未命中且未超时则再巡航一轮；巡航超时到达立即返回起点。")
         self.cr_note.setWordWrap(True)
         self.cr_note.setStyleSheet("color:#c08040;")
+
+        # ---- 常驻触发页：触发条件(全与/全或) + 触发后执行列表 + 提示音 ----
+        self.rs_cond = ConditionListEdit(allow_cmp=False, allow_status=True)
+        self.rs_cond.setMinimumHeight(120)
+        self.rs_actions = QListWidget()
+        self.rs_actions.setMaximumHeight(150)
+        self.rs_act_add = QPushButton("＋动作")
+        self.rs_act_edit = QPushButton("编辑")
+        self.rs_act_del = QPushButton("－删除")
+        self.rs_act_add.clicked.connect(self._rs_act_add)
+        self.rs_act_edit.clicked.connect(self._rs_act_edit)
+        self.rs_act_del.clicked.connect(self._rs_act_del)
+        self.rs_beep_cb = QCheckBox("命中提示音（默认不勾选）")
+        self.rs_beep_cb.setToolTip("触发命中时播放一声「叮」")
+        self.rs_note = QLabel("常驻触发会自动排为宏第一步（每个宏仅能有一个）。宏运行期间该触发始终等待，"
+                              "不阻塞宏其他步骤；命中时停止所有其他步骤、按序执行下列动作（含跳转可重新激活宏），"
+                              "执行完宏保持停止。")
+        self.rs_note.setWordWrap(True)
+        self.rs_note.setStyleSheet("color:#c08040;")
+        self._resident_actions: list[dict] = []
 
         # ---- 组装（每页一个 QWidget） ----
         self._pages: dict[str, QWidget] = {}
@@ -1518,6 +1582,12 @@ class StepDialog(QDialog):
         bf.addRow(br_kw_btns)
         bf.addRow("命中后延时", self.br_delay_sb)
         bf.addRow("等待超时", self.br_timeout_sb)
+        self.br_nk_tgt_label = QLabel("跳转到")
+        bf.addRow("条件命中无关键字(超时后)", self.br_nk_type)
+        bf.addRow("命令", self.br_nk_cmd)
+        bf.addRow(self.br_nk_tgt_label, self.br_nk_tgt)
+        bf.addRow("赋值", self.br_nk_set)
+        bf.addRow("提示内容", self.br_nk_msg)
         self._pages["branch"] = p_branch
 
         p_loop = QWidget()
@@ -1561,6 +1631,7 @@ class StepDialog(QDialog):
         mf.addRow("命中后操作", mt_hit_row)
         mf.addRow("命中后延时", self.mt_delay_sb)
         mf.addRow("等待超时", self.mt_timeout_sb)
+        mf.addRow("循环执行", self.mt_loop_cb)
         retry_row = QHBoxLayout(); retry_row.addWidget(self.mt_retry_cb)
         retry_row.addSpacing(8); retry_row.addWidget(self.mt_retry_sb)
         mf.addRow("异常回退", retry_row)
@@ -1578,6 +1649,19 @@ class StepDialog(QDialog):
         cf2.addRow("巡航超时", self.cr_cruise_timeout_sb)
         cf2.addRow("命中后处理", self.cr_hit_mode_cb)
         self._pages["cruise"] = p_cr
+
+        p_rs = QWidget()
+        rf = QFormLayout(p_rs)
+        rf.addRow(self.rs_note)
+        rf.addRow("触发条件", self.rs_cond)
+        rs_act_btns = QHBoxLayout()
+        rs_act_btns.addWidget(self.rs_act_add)
+        rs_act_btns.addWidget(self.rs_act_edit)
+        rs_act_btns.addWidget(self.rs_act_del)
+        rf.addRow("执行列表", self.rs_actions)
+        rf.addRow(rs_act_btns)
+        rf.addRow(self.rs_beep_cb)
+        self._pages["resident"] = p_rs
 
         self.stack = QStackedWidget()
         for code, _lab in self._STEP_LABELS:
@@ -1609,7 +1693,8 @@ class StepDialog(QDialog):
 
     def _populate_targets(self) -> None:
         for cb in (self.jump_target_cb, self.if_then_target, self.if_else_target,
-                   self.status_then_target, self.status_else_target, self.lp_start_cb):
+                   self.status_then_target, self.status_else_target, self.lp_start_cb,
+                   self.br_nk_tgt):
             cb.clear()
             for val, lab in self._target_options():
                 cb.addItem(lab, val)
@@ -1704,6 +1789,14 @@ class StepDialog(QDialog):
             self._br_kw_refresh()
             self.br_delay_sb.setValue(int(s.get("delay_ms", 0)))
             self.br_timeout_sb.setValue(self._timeout_ms(s))
+            nk = s.get("no_keyword") or {}
+            nkt = nk.get("type") if nk.get("type") in ("cmd", "jump", "set", "notify", "continue") else "none"
+            self.br_nk_type.setCurrentIndex(max(0, self.br_nk_type.findData(nkt)))
+            self.br_nk_cmd.setText(nk.get("command", "") if nkt == "cmd" else "")
+            self._set_target(self.br_nk_tgt, nk.get("target") if nkt in ("jump", "set") else "")
+            self.br_nk_set.setText(f"{nk.get('var', '')}={nk.get('value', '')}" if nkt == "set" else "")
+            self.br_nk_msg.setText(nk.get("message", "") if nkt == "notify" else "")
+            self._br_nk_sync()
 
         # 计数循环步骤
         if t == "loop":
@@ -1747,6 +1840,7 @@ class StepDialog(QDialog):
             self.mt_timeout_sb.setValue(self._timeout_ms(s))
             self.mt_retry_cb.setChecked(bool(s.get("auto_retry", True)))
             self.mt_retry_sb.setValue(int(s.get("retry_max", 3)))
+            self.mt_loop_cb.setChecked(bool(s.get("loop_until_hit", False)))
             self._load_onhit(self.mt_hit_type, self.mt_hit_ed, s.get("on_hit"))
 
         # 巡航步骤
@@ -1766,6 +1860,16 @@ class StepDialog(QDialog):
             if hm not in ("home_exec", "exec_home", "exec", "home"):
                 hm = "home_exec"
             self.cr_hit_mode_cb.setCurrentIndex(max(0, self.cr_hit_mode_cb.findData(hm)))
+
+        # 常驻触发步骤
+        if t == "resident":
+            rs_conds = s.get("conditions") or [{"match_type": s.get("match_type", "contains"),
+                                                "pattern": s.get("pattern", "")}]
+            self.rs_cond.set_conditions(rs_conds)
+            self.rs_cond.set_relation(s.get("relation", "or"))
+            self._resident_actions = [dict(a) for a in (s.get("actions") or [])]
+            self._rs_act_refresh()
+            self.rs_beep_cb.setChecked(bool(s.get("beep", False)))
 
     def _set_target(self, cb: QComboBox, val) -> None:
         if val is None:
@@ -1899,6 +2003,37 @@ class StepDialog(QDialog):
             action = {}
         return {"keyword": k, "action": action}
 
+    # ---- 条件命中无关键字（超时后）可选操作 ----
+    def _br_nk_sync(self) -> None:
+        t = self.br_nk_type.currentData()
+        self.br_nk_cmd.setVisible(t == "cmd")
+        self.br_nk_tgt.setVisible(t in ("jump", "set"))
+        self.br_nk_tgt_label.setVisible(t in ("jump", "set"))
+        self.br_nk_set.setVisible(t == "set")
+        self.br_nk_msg.setVisible(t == "notify")
+
+    def _collect_no_keyword(self) -> dict:
+        t = self.br_nk_type.currentData()
+        if t in ("none", None):
+            return {}
+        if t == "cmd":
+            return {"type": "cmd", "command": self.br_nk_cmd.text().strip()}
+        if t == "jump":
+            return {"type": "jump", "target": self.br_nk_tgt.currentData() or ""}
+        if t == "set":
+            txt = self.br_nk_set.text().strip()
+            if "=" in txt:
+                var, val = txt.split("=", 1)
+            else:
+                var, val = txt, ""
+            a = {"type": "set", "var": var.strip(), "value": val.strip()}
+            if self.br_nk_tgt.currentData():
+                a["target"] = self.br_nk_tgt.currentData()
+            return a
+        if t == "notify":
+            return {"type": "notify", "message": self.br_nk_msg.text().strip()}
+        return {}
+
     # ---- 收集 ----
     @staticmethod
     def _make_onhit_combo() -> QComboBox:
@@ -1908,6 +2043,112 @@ class StepDialog(QDialog):
                           ("jump", "跳转步骤/标签"), ("set", "变量赋值")]:
             cb.addItem(lab, code)
         return cb
+
+    # ---- 常驻触发动作列表 ----
+    def _rs_act_desc(self, a: dict) -> str:
+        t = a.get("type")
+        if t == "cmd":
+            return f"命令: {a.get('command', '')}"
+        if t == "delay":
+            return f"延时: {a.get('ms', 0)}ms"
+        if t == "set":
+            return f"赋值: {a.get('var', '')}={a.get('value', '')}"
+        if t == "jump":
+            return f"跳转: {a.get('target', '')}"
+        if t == "macro":
+            return f"宏控制: {'重置宏' if a.get('op') == 'reset' else '终止宏'}"
+        return str(a)
+
+    def _rs_act_refresh(self) -> None:
+        self.rs_actions.clear()
+        for a in self._resident_actions:
+            self.rs_actions.addItem(self._rs_act_desc(a))
+
+    def _rs_act_dlg(self, cur: dict | None = None) -> dict | None:
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("常驻触发动作")
+        type_cb = QComboBox()
+        for code, lab in [("cmd", "发送命令"), ("delay", "延时(ms)"), ("set", "变量赋值"),
+                          ("jump", "跳转步骤/标签"), ("macro", "宏控制")]:
+            type_cb.addItem(lab, code)
+        ed = QLineEdit()
+        ed.setPlaceholderText("命令 / 延时毫秒 / {变量}=值 / 步骤序号或标签")
+        macro_cb = QComboBox()
+        for code, lab in [("terminate", "终止宏"), ("reset", "重置宏(清空状态/缓存)")]:
+            macro_cb.addItem(lab, code)
+
+        def sync(idx: int) -> None:
+            is_macro = type_cb.itemData(idx) == "macro"
+            ed.setVisible(not is_macro)
+            macro_cb.setVisible(is_macro)
+        type_cb.currentIndexChanged.connect(sync)
+
+        form = QFormLayout()
+        form.addRow("类型", type_cb)
+        form.addRow("参数", ed)
+        form.addRow(macro_cb)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                               QDialogButtonBox.StandardButton.Cancel, dlg)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        lay = QVBoxLayout(dlg)
+        lay.addLayout(form)
+        lay.addWidget(box)
+
+        if cur:
+            type_cb.setCurrentIndex(max(0, type_cb.findData(cur.get("type", "cmd"))))
+            if cur.get("type") == "macro":
+                macro_cb.setCurrentIndex(max(0, macro_cb.findData(cur.get("op", "terminate"))))
+            elif cur.get("type") == "cmd":
+                ed.setText(cur.get("command", ""))
+            elif cur.get("type") == "delay":
+                ed.setText(str(cur.get("ms", 0)))
+            elif cur.get("type") == "set":
+                ed.setText(f"{cur.get('var', '')}={cur.get('value', '')}")
+            elif cur.get("type") == "jump":
+                ed.setText(str(cur.get("target", "")))
+        sync(type_cb.currentIndex())
+        if not dlg.exec():
+            return None
+        t = type_cb.currentData()
+        if t == "macro":
+            return {"type": "macro", "op": macro_cb.currentData()}
+        text = ed.text().strip()
+        if t == "cmd":
+            return {"type": "cmd", "command": text}
+        if t == "delay":
+            try:
+                ms = max(0, int(text))
+            except (ValueError, TypeError):
+                ms = 0
+            return {"type": "delay", "ms": ms}
+        if t == "set":
+            var, _, val = text.partition("=")
+            return {"type": "set", "var": var.strip(), "value": val.strip()}
+        if t == "jump":
+            return {"type": "jump", "target": text}
+        return None
+
+    def _rs_act_add(self) -> None:
+        a = self._rs_act_dlg()
+        if a:
+            self._resident_actions.append(a)
+            self._rs_act_refresh()
+
+    def _rs_act_edit(self) -> None:
+        row = self.rs_actions.currentRow()
+        if 0 <= row < len(self._resident_actions):
+            a = self._rs_act_dlg(self._resident_actions[row])
+            if a:
+                self._resident_actions[row] = a
+                self._rs_act_refresh()
+
+    def _rs_act_del(self) -> None:
+        row = self.rs_actions.currentRow()
+        if 0 <= row < len(self._resident_actions):
+            self._resident_actions.pop(row)
+            self._rs_act_refresh()
 
     def _collect_onhit(self, type_cb: QComboBox, ed: QLineEdit) -> dict | None:
         at = type_cb.currentData()
@@ -2025,6 +2266,9 @@ class StepDialog(QDialog):
             s["keywords"] = [dict(k) for k in self._branch_keywords]
             s["delay_ms"] = self.br_delay_sb.value()
             s["timeout_ms"] = self.br_timeout_sb.value()
+            nk = self._collect_no_keyword()
+            if nk:
+                s["no_keyword"] = nk
         elif t == "loop":
             s["start"] = self.lp_start_cb.currentData() or ""
             s["count"] = self.lp_count_sb.value()
@@ -2062,6 +2306,7 @@ class StepDialog(QDialog):
             s["timeout_ms"] = self.mt_timeout_sb.value()
             s["auto_retry"] = self.mt_retry_cb.isChecked()
             s["retry_max"] = self.mt_retry_sb.value()
+            s["loop_until_hit"] = self.mt_loop_cb.isChecked()
             oh = self._collect_onhit(self.mt_hit_type, self.mt_hit_ed)
             if oh:
                 s["on_hit"] = oh
@@ -2078,6 +2323,14 @@ class StepDialog(QDialog):
             s["cond_timeout_ms"] = self.cr_cond_timeout_sb.value()
             s["cruise_timeout_ms"] = self.cr_cruise_timeout_sb.value()
             s["hit_mode"] = self.cr_hit_mode_cb.currentData() or "home_exec"
+        elif t == "resident":
+            conds = list(self.rs_cond.conditions)
+            s["relation"] = self.rs_cond.relation()
+            s["conditions"] = conds
+            s["match_type"] = conds[0].get("match_type", "contains") if conds else "contains"
+            s["pattern"] = conds[0].get("pattern", "") if conds else ""
+            s["actions"] = [dict(a) for a in self._resident_actions]
+            s["beep"] = self.rs_beep_cb.isChecked()
         self._step = s
         self.accept()
 

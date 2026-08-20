@@ -113,8 +113,9 @@ class NavDock(QWidget):
     - state.room / GMCP.Move / map.pushed / look.parsed → 当前房间名/出口/详情
     - nav.*             → walk 进行中/已到达/卡住/停止 状态回显
     顶部出口按钮＝当前房间的可走方向（点=走一步）；底部目的地列表＝服务器
-    `node` 命令返回的玩家定义路径（名称+目的地，双击=node walk <名称>）。
-    移动静止 3 秒自动刷新 node 列表；`node` 表格行由 session 拦截不上主输出。
+     `node` 命令返回的玩家定义路径（名称+目的地，双击=node walk <名称>）。
+    node/walk 列表改为手动获取（点「获取」按钮）；`node` 表格行由 session
+    拦截不上主输出。
     """
 
     def __init__(self, session=None, parent=None) -> None:
@@ -137,13 +138,8 @@ class NavDock(QWidget):
         self._capturing = False
         self._seen_header = False
         self._after_node = None
-        self._bound_account = None
         self._walk_capturing = False
         self._walk_seen_header = False
-        self._idle_timer = QTimer(self)
-        self._idle_timer.setSingleShot(True)
-        self._idle_timer.setInterval(2000)
-        self._idle_timer.timeout.connect(self._idle_refresh)
         self._cap_timer = QTimer(self)
         self._cap_timer.setSingleShot(True)
         self._cap_timer.setInterval(5000)
@@ -170,7 +166,7 @@ class NavDock(QWidget):
         # ---- 目的地（服务器 node 命令列表，点击=node walk <名称>）----
         self.dest_ed = QLineEdit()
         self.dest_ed.setPlaceholderText("node 名称，回车=node walk <名称>")
-        self.go_btn = QPushButton("刷新")
+        self.go_btn = QPushButton("获取")
         self.go_btn.clicked.connect(self._fetch_node_list)
         self.dest_ed.returnPressed.connect(self._send_node_walk)
 
@@ -207,7 +203,7 @@ class NavDock(QWidget):
         # ---- walk 内建路径表（服务器 walk 命令返回，双击=walk <拼音>）----
         self.walk_ed = QLineEdit()
         self.walk_ed.setPlaceholderText("walk 拼音名，回车=walk <拼音名>")
-        self.walk_go_btn = QPushButton("刷新")
+        self.walk_go_btn = QPushButton("获取")
         self.walk_go_btn.clicked.connect(self._fetch_walk_list)
         self.walk_ed.returnPressed.connect(self._send_walk_cmd)
 
@@ -264,16 +260,16 @@ class NavDock(QWidget):
             "exits": list(getattr(session, "exits", []) or []),
         })
         self._capturing = False
-        # 仅首次绑定该账号时刷新 node 列表；切换标签复用已有数据，避免频繁
-        # 自动 node/walk 请求产生噪声（无路径区域的"你不能在这里定义路径"等）。
-        if getattr(self, "_bound_account", None) != self._account:
-            self._bound_account = self._account
-            self._fetch_node_list()
+        # node/walk 列表改为手动获取：绑定账号、移动换房都不再自动刷新，
+        # 需要时由用户点击「获取」按钮拉取，避免静默命令打断操作与产生噪声。
 
     def _unsub(self) -> None:
         if self._bus is not None:
             for event, sub in self._subs:
-                self._bus.unsubscribe(event, sub)
+                try:
+                    self._bus.unsubscribe(event, sub)
+                except Exception:
+                    pass
         self._subs = []
 
     # ---- 事件（实时替换，不累积）----
@@ -302,13 +298,6 @@ class NavDock(QWidget):
             self._refresh_from_cache()
         else:
             return
-        # 发生移动/换房：静止 3 秒后自动刷新 node 列表
-        self._restart_idle_refresh()
-
-    def _restart_idle_refresh(self) -> None:
-        self._idle_timer.stop()
-        if self.session is not None and getattr(self.session, "logged_in", False):
-            self._idle_timer.start()
 
     def _sync_node(self, payload: dict) -> None:
         name = payload.get("name") or ""
@@ -476,10 +465,6 @@ class NavDock(QWidget):
             if s is not None:
                 s.abort_walk_capture()
             self.status.setText(f"walk 读取超时（已获 {len(self._walk_rows)} 条）")
-
-    def _idle_refresh(self) -> None:
-        """移动静止定时刷新：先 node，捕获结束后自动接 walk，两表一起更新。"""
-        self._fetch_node_list(auto=True, follow="walk")
 
     def _run_node_follow(self) -> None:
         """node 捕获结束后的联动刷新（空闲时自动接 walk）。"""

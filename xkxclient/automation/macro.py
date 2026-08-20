@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, QTimer
 from xkxclient.automation.runner import split_commands, substitute
 from xkxclient.automation.trigger import play_ding
 from xkxclient.core.fullme import extract_fullme_url
+from xkxclient.core.specialcmd import build_items
 
 # 移动异常特征行（服务器拦截/防挂机输出）：命中只作提示，不立即判定失败。
 # 泼皮等 NPC 瞬时拦路 / busy（不能移动）时移动通常仍会成功（GMCP.Move result=true 会推），
@@ -21,6 +22,17 @@ _MOVE_ABNORMAL_PATTERNS = ("拦住你", "拉住", "不能移动", "一脚深一�
 # 太短会在 busy 未结束时重发而反复失败；3-5 秒停顿后 busy 结束即可正常推进下一步。
 _BLOCK_WAIT_MS = 5000   # 移动异常后等待 GMCP.Move 确认（true=成功）的窗口
 _RETRY_WAIT_MS = 5000   # 确认失败后原地重发前的停顿（覆盖 busy 周期）
+
+
+def _cmd_total_delay_ms(text: str) -> int:
+    """命令串内 `#wa N` 延时的总和（毫秒）。宏命令步骤发送后须等足
+    该延时（节流队列串行消费）再推进下一步，否则循环宏会不断注入命令造成积压。"""
+    pieces = [c.strip() for c in (text or "").split(";") if c.strip()]
+    total = 0
+    for it in build_items(pieces):
+        if isinstance(it, tuple) and len(it) == 2 and it[0] == "delay":
+            total += int(it[1])
+    return total
 
 
 def _parse_move_cmds(text: str) -> list[tuple[str, bool]]:
@@ -281,6 +293,8 @@ class MacroEngine(QObject):
         self._move_log: dict[str, list[dict]] = {}          # 移动日志：name -> [(dir, from_room, to_room), ...]
         self._wait_cleanup: dict[str, Callable] = {}        # 移动并触发等待清理器（停止/终止时解除订阅）
         self._recursion_depth: dict[str, int] = {}          # _step 递归深度保护（jump 成环兜底）
+        self._resident_subs: dict[str, Callable] = {}       # 常驻触发：宏名 -> net.text_display 订阅句柄
+        self._resident_running: dict[str, bool] = {}        # 常驻触发动作执行中标记（防重入）
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -395,9 +409,18 @@ class MacroEngine(QObject):
         for cleanup in list(self._wait_cleanup.values()):
             cleanup()
         self._wait_cleanup.clear()
+        for name in list(self._resident_subs.keys()):
+            self._clear_resident(name)
+        self._resident_running.clear()
         self._waiting = None
         if names:
             self.bus.publish("macro.stop", account=self.session.account_id, names=names)
+        # 停止宏后清空节流队列：此前注入的待发命令（含 #wa 串）若不清理，
+        # 会继续按序发送导致「停止后仍在执行大量命令」。
+        try:
+            self.session.throttle.cancel_all()
+        except Exception:
+            pass
 
     def _clear_wait(self) -> None:
         if self._wait_input_timer is not None:
@@ -449,9 +472,16 @@ class MacroEngine(QObject):
                          name=name, index=pos + 1, total=len(m.steps))
 
         if t == "cmd":
+            total_ms = 0
             for cmd in split_commands(substitute(step.get("command", ""), self.session.vars)):
                 self.session.send_auto(cmd)
-            self._goto(name, pos + 1)
+                total_ms += _cmd_total_delay_ms(cmd)
+            if total_ms > 0:
+                # 命令串含 `#wa N`：节流队列会按序执行延时，须等足总延时后再推进，
+                # 否则循环宏不等待 #wa 就进入下一圈，命令海量积压。
+                self._chain(name, total_ms, pos + 1)
+            else:
+                self._goto(name, pos + 1)
         elif t == "delay":
             self._chain(name, int(step.get("ms") or step.get("delay_ms") or 500), pos + 1)
         elif t == "label":
@@ -486,6 +516,10 @@ class MacroEngine(QObject):
             self._wait_captcha(name, step, pos)
         elif t == "loop":
             self._loop(name, step, pos)
+        elif t == "resident":
+            # 常驻触发：注册后台监听，不阻塞主流程；命中时暂停宏执行触发后列表
+            self._register_resident(name, step)
+            self._goto(name, pos + 1)
         elif t == "branch":
             self._branch(name, step, pos)
         else:
@@ -574,10 +608,14 @@ class MacroEngine(QObject):
             return None
 
         def _match_trigger_cond(c: dict, line: str) -> list | None:
+            from xkxclient.automation.runner import substitute, substitute_template
             mtx = c.get("match_type", "contains")
             if mtx == "status":
                 return [] if self._match_status_cond(c) else None
-            trg = Trigger("_c", match_type=mtx, pattern=c.get("pattern", ""))
+            # 模板的 `{名}` 是捕获占位符：只代入 `<保留变量>`，防止命中一次后
+            # 捕获变量写回 vars 使模板退化为静态文本；其余类型正常代入。
+            pat = (substitute_template if mtx == "template" else substitute)(c.get("pattern", ""), self.session.vars)
+            trg = Trigger("_c", match_type=mtx, pattern=pat)
             if mtx == "contains":
                 return [] if trg.pattern in line else None
             if mtx == "exact":
@@ -781,7 +819,11 @@ class MacroEngine(QObject):
         mtx = c.get("match_type", "contains")
         if mtx == "status":
             return self._match_status_cond(c)
-        trg = Trigger("_c", match_type=mtx, pattern=c.get("pattern", ""))
+        from xkxclient.automation.runner import substitute, substitute_template
+        # 模板的 `{名}` 是捕获占位符：只代入 `<保留变量>`，防止命中一次后
+        # 捕获变量写回 vars 使模板退化为静态文本；其余类型正常代入。
+        pat = (substitute_template if mtx == "template" else substitute)(c.get("pattern", ""), self.session.vars)
+        trg = Trigger("_c", match_type=mtx, pattern=pat)
         if mtx == "contains":
             return trg.pattern in line
         if mtx == "exact":
@@ -805,6 +847,8 @@ class MacroEngine(QObject):
         - 命中 → 延时 delay_ms 后发送下一个命令
         - 当前命令超时（timeout_ms，>0）未命中 → 跳过等待，直接发送下一个命令
         - `()` 括起的命令（单个或 `;` 分隔的组）只按延时顺序执行，不走触发/超时
+        - `loop_until_hit`（默认关）：全部命令执行完仍未命中触发 → 从头重复执行，
+          直至命中才继续下一步（未命中时不会走完步骤，需自行保证能终止）
         - 移动日志：每次方向移动记录 `(方向, 出发房间, 到达房间)` 到 `_move_log[name]`，
           到达房间由 GMCP.Move 确认回写
         - 移动异常回退（auto_retry 默认开）：文本命中 `拦住你/拉住/不能移动` 时延迟
@@ -823,6 +867,7 @@ class MacroEngine(QObject):
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
         auto_retry = bool(step.get("auto_retry", True))
         retry_max = max(1, int(step.get("retry_max") or 3))
+        loop_until_hit = bool(step.get("loop_until_hit", False))
         conds = step.get("conditions")
         if conds:
             conds = [dict(c) for c in conds]
@@ -849,6 +894,7 @@ class MacroEngine(QObject):
 
         done = [False]
         attempts: dict[int, int] = {}          # 每命令失败重试计数（回退后重发）
+        hit_any = [False]                      # 是否命中过触发条件（循环执行至命中用）
         text_sub = [None]                      # net.text_display 订阅句柄
         gmcp_sub = [None]                      # GMCP.Move 订阅句柄
         wait_timer = [None]                    # 触发等待超时计时器
@@ -950,6 +996,7 @@ class MacroEngine(QObject):
                     return
                 if eval_line(line):
                     waited[0] = True
+                    hit_any[0] = True
                     if block_pending[0]:
                         block_pending[0] = False
                     if block_timer[0] is not None:
@@ -1048,7 +1095,11 @@ class MacroEngine(QObject):
 
         def next_or_finish(idx: int) -> None:
             if idx >= len(cmds):
-                finish()
+                if loop_until_hit and not hit_any[0]:
+                    # 全部命令执行完仍未命中触发：从头重复执行，直至命中
+                    send(0)
+                else:
+                    finish()
             else:
                 send(idx)
 
@@ -1408,7 +1459,15 @@ class MacroEngine(QObject):
             self._waiting = None
         if self._captcha_wait and self._captcha_wait[0] == name:
             self._close_captcha()
+        self._clear_resident(name)
+        self._resident_running.pop(name, None)
         self.bus.publish("macro.end", account=self.session.account_id, name=name)
+        # 宏停止（自然结束/中止）后清空节流队列：该宏注入的待发命令
+        # （移动/延时串）不再需要，立即停发，避免「宏停了人物还在走」。
+        try:
+            self.session.throttle.cancel_all()
+        except Exception:
+            pass
 
     def _arm_timer(self, name: str, ms: int, callback, repeat: bool = False) -> None:
         """延时/周期定时：复用每宏名常驻 QTimer（_timers[name]），不在每次调用时新建。
@@ -1472,19 +1531,26 @@ class MacroEngine(QObject):
         ctype = cond.get("type") or cond.get("match_type")  # 兼容跳转(type) 与 判断条件列表(match_type)
         var = cond.get("var", "")
         line = line if line is not None else getattr(self.session, "last_line", "")
+        from xkxclient.automation.runner import substitute, substitute_template
+        # 模板的 `{名}` 是捕获占位符：只代入 `<保留变量>`，防止命中一次后捕获变量
+        # 写回 vars 使模板退化为静态文本；其余类型正常代入。
+        if ctype == "template":
+            pat = substitute_template(cond.get("pattern", ""), self.session.vars)
+        else:
+            pat = substitute(cond.get("pattern", ""), self.session.vars)
         if ctype in ("jump", "wait", "loop"):
-            ok = self._last_line_has(cond.get("pattern", ""), line)
+            ok = self._last_line_has(pat, line)
         elif ctype == "contains":
-            ok = cond.get("pattern", "") in line
+            ok = pat in line
         elif ctype == "exact":
-            ok = line == cond.get("pattern", "")
+            ok = line == pat
         elif ctype == "template":
             from xkxclient.automation.trigger import Trigger
-            trg = Trigger("_c", match_type="template", pattern=cond.get("pattern", ""))
+            trg = Trigger("_c", match_type="template", pattern=pat)
             rx = trg.template_regex
             ok = (trg.pattern in line) if rx is None else (rx.search(line) is not None)
         elif ctype == "regex":
-            ok = self._last_line_has(cond.get("pattern", ""), line)
+            ok = self._last_line_has(pat, line)
         elif ctype == "cmp":
             key = self._varname(var)
             ok = self._cmp(str(self.session.vars.get(key, "")),
@@ -1677,19 +1743,150 @@ class MacroEngine(QObject):
             self._loop_count.pop(key, None)  # 完成 count 次后计数归零，防止再次进入直接跳过
             self._goto(name, pos + 1)
 
+    # ---- 常驻触发步骤 ----
+    def _register_resident(self, name: str, step: dict) -> None:
+        """注册常驻触发监听：宏运行期间始终等待触发，不阻塞主流程。
+        命中时停止宏所有其他步骤，按序执行触发后动作列表，执行完宏保持停止。"""
+        self._clear_resident(name)
+
+        def on_line(payload: dict) -> None:
+            if (payload.get("account") or "") != self.session.account_id:
+                return
+            if name not in self._active or name in self._paused:
+                return
+            if self._resident_running.get(name):
+                return
+            line = payload.get("line") or ""
+            if self._resident_cond_match(step, line):
+                self._resident_hit(name, step)
+
+        # 存闭包本身而非 subscribe 返回值（元组），否则 _clear_resident
+        # 无法 unsubscribe 到正确的回调，旧订阅累积导致常驻多次命中/失效
+        self.bus.subscribe("net.text_display", on_line)
+        self._resident_subs[name] = on_line
+
+    def _clear_resident(self, name: str) -> None:
+        sub = self._resident_subs.pop(name, None)
+        if sub is not None:
+            try:
+                self.bus.unsubscribe("net.text_display", sub)
+            except Exception:
+                pass
+
+    def _resident_cond_match(self, step: dict, line: str) -> bool:
+        conds = step.get("conditions")
+        if not conds:
+            return False
+        relation = step.get("relation", "or")
+        if relation == "and":
+            return all(self._hit_match(c, line) for c in conds)
+        return any(self._hit_match(c, line) for c in conds)
+
+    def _resident_hit(self, name: str, step: dict) -> None:
+        """常驻触发命中：停止宏所有其他步骤，执行本触发设定的执行列表。
+
+        命中后宏主流程终止（清状态与积压缓存），执行列表按序执行；
+        若执行列表含「跳转」动作则重新激活宏从目标步骤继续，否则宏保持停止。
+        """
+        if name not in self._active:
+            return
+        if self._resident_running.get(name):
+            return
+        self._resident_running[name] = True
+        if step.get("beep"):
+            try:
+                play_ding()
+            except Exception:
+                pass
+        # 停止宏其他步骤（终止主流程，清空宏状态与未执行动作缓存）
+        self._halt(name)
+        actions = step.get("actions") or []
+        self._exec_resident_actions(name, actions, 0)
+
+    def _exec_resident_actions(self, name: str, actions: list, idx: int) -> None:
+        """按顺序执行常驻触发动作列表；支持 命令/延时/跳转/宏控制/变量赋值。
+        宏已停止仍完整执行列表；跳转动作重新激活宏从目标步骤继续。"""
+        if idx >= len(actions):
+            self._resident_done(name)
+            return
+        a = actions[idx] or {}
+
+        def nxt():
+            self._exec_resident_actions(name, actions, idx + 1)
+
+        t = a.get("type")
+        if t == "cmd":
+            for cmd in split_commands(substitute(a.get("command", ""), self.session.vars)):
+                self.session.send_auto(cmd)
+            nxt()
+        elif t == "delay":
+            ms = max(0, int(a.get("ms") or a.get("delay_ms") or 0))
+            if ms > 0:
+                QTimer.singleShot(ms, nxt)
+            else:
+                nxt()
+        elif t == "set":
+            var = self._varname(a.get("var", ""))
+            if var:
+                self.session.vars[var] = substitute(str(a.get("value", "")), self.session.vars)
+            nxt()
+        elif t == "jump":
+            # 宏已被常驻触发停止：跳转动作重新激活宏并从目标步骤继续
+            m = self.macros.get(name)
+            target = a.get("target", "")
+            if m:
+                if isinstance(target, str) and target.isdigit():
+                    target = max(0, int(target) - 1)
+                elif isinstance(target, str):
+                    target = m.labels.get(target, 0)
+                self._pos[name] = int(target)
+                self._active[name] = m
+                self._loop_count = {k: v for k, v in self._loop_count.items() if k[0] != name}
+                self._paused.discard(name)
+                self._call_stack.pop(name, None)
+                # 常驻监听已被命中时的 _halt 清除：跳转重启宏后必须重新注册，
+                # 否则跳转到主流程步骤（跳过第一步 resident）会导致常驻失效
+                rs_step = next((s for s in m.steps if s.get("type") == "resident"), None)
+                if rs_step is not None:
+                    self._register_resident(name, rs_step)
+                self.bus.publish("macro.start", account=self.session.account_id, name=name)
+                self._step(name)
+            nxt()
+        elif t == "macro":
+            op = a.get("op", "terminate")
+            if op == "reset":
+                # 重置宏：清空宏状态与未执行完的动作缓存
+                try:
+                    self.session.throttle.cancel_all()
+                except Exception:
+                    pass
+            self._halt(name)
+            return
+        else:
+            nxt()
+
+    def _resident_done(self, name: str) -> None:
+        """常驻触发动作执行完毕：宏已被停止，无需恢复。"""
+        self._resident_running.pop(name, None)
+
     def _branch(self, name: str, step: dict, pos: int) -> None:
         """判断分支步骤：等待触发条件命中（阻塞，同触发器步骤），从命中行搜寻关键字。
 
         - `conditions` 非空：等待条件命中（与/或）；为空时跳过条件判断，关键字即触发条件。
         - 多个关键字为「或」关系：按顺序取第一个在命中行出现的关键字执行对应动作。
         - 每个关键字动作：cmd(发送命令) / jump(跳转步骤/标签) / set(变量赋值)。
-        - `delay_ms`：命中后延时执行动作；`timeout_ms`：等待超时，超时继续下一步。
+        - `delay_ms`：命中后延时执行动作；`timeout_ms`：等待超时。
+        - `no_keyword`（可选）：条件命中但整个等待窗口内都没有关键字命中，超时后执行该
+          动作（cmd/jump/set/notify/continue）；未配置则超时继续下一步。
         """
         conds = step.get("conditions")
         keywords = step.get("keywords") or []
         relation = step.get("relation", "or")
         delay_ms = int(step.get("delay_ms") or 0)
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
+        no_keyword = step.get("no_keyword") or {}
+        done = [False]          # 命中防重入：同 hit/trigger 步骤对齐
+        cond_hit_no_kw = [False]   # 条件命中过但无关键字命中（供超时可选操作判断）
 
         def match_conds(line: str) -> bool:
             if not conds:
@@ -1706,6 +1903,8 @@ class MacroEngine(QObject):
             return None
 
         def on_line(payload: dict) -> None:
+            if done[0]:
+                return
             if name not in self._active or name in self._paused:
                 return
             if (payload.get("account") or "") != self.session.account_id:
@@ -1715,7 +1914,10 @@ class MacroEngine(QObject):
                 return
             kw = find_keyword(line)
             if kw is None:
+                # 条件命中但无关键字：继续等待关键字；记录状态供超时可选操作使用
+                cond_hit_no_kw[0] = True
                 return
+            done[0] = True
             # 命中：先取消订阅，避免后续行重复触发
             if self._trigger_sub is not None:
                 self.bus.unsubscribe("net.text_display", self._trigger_sub)
@@ -1743,11 +1945,26 @@ class MacroEngine(QObject):
         if timeout_ms > 0:
             self._trigger_timer = QTimer(self)
             self._trigger_timer.setSingleShot(True)
-            self._trigger_timer.timeout.connect(lambda: self._timeout_trigger(name, pos))
+            self._trigger_timer.timeout.connect(lambda: self._branch_timeout(name, pos, cond_hit_no_kw))
             self._trigger_timer.start(timeout_ms)
 
+    def _branch_timeout(self, name: str, pos: int, cond_hit_no_kw: list[bool]) -> None:
+        """判断分支等待超时：条件命中过但无关键字时执行配置的可选操作，否则继续下一步。"""
+        self._trigger_timer = None
+        if self._trigger_sub is not None:
+            self.bus.unsubscribe("net.text_display", self._trigger_sub)
+            self._trigger_sub = None
+        if name not in self._active:
+            return
+        step = self._active[name].steps[pos]
+        no_keyword = step.get("no_keyword") or {}
+        if cond_hit_no_kw[0] and no_keyword.get("type"):
+            self._exec_branch_action(name, no_keyword, pos)
+        else:
+            self._goto(name, pos + 1)
+
     def _exec_branch_action(self, name: str, action: dict, pos: int) -> None:
-        """判断分支关键字动作：cmd / jump / set。jump 后不再继续本步骤链。"""
+        """判断分支动作：cmd / jump / set / notify / continue。jump 后不再继续本步骤链。"""
         t = action.get("type")
         if t == "cmd":
             for cmd in split_commands(substitute(action.get("command", ""), self.session.vars)):
@@ -1766,6 +1983,12 @@ class MacroEngine(QObject):
                 self._goto_later(name, target)
             else:
                 self._goto(name, pos + 1)
+        elif t == "notify":
+            self.bus.publish("ui.message", account=self.session.account_id,
+                             message=substitute(str(action.get("message", "")), self.session.vars))
+            self._goto(name, pos + 1)
+        elif t == "continue":
+            self._goto(name, pos + 1)
         else:
             self._goto(name, pos + 1)
 

@@ -82,10 +82,23 @@ class MapDock(QWidget):
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.config_step_ms(int(sec * 1000))
 
+    def _sync_current(self) -> None:
+        """寻路前用 session 已确认的最新房间名校准本地当前位置。
+
+        GMCP.Move 的房间短名可能是父/子房间（如百年堂短名=庄家胡同），
+        look 解析才是权威房间名；两者乱序时本地缓存可能落后，寻路起点会错。
+        """
+        if self.session is None or self.cache is None:
+            return
+        rn = str(getattr(self.session, "room_name", "") or "").strip()
+        if rn and rn != str(self.cache.current or "").strip():
+            self.cache.set_current_name(rn)
+
     def _on_plan(self) -> None:
         """寻路：只列出路径，是否行走由用户点「行走」决定。"""
         if self.session is None:
             return
+        self._sync_current()
         target = self.target.text().strip()
         if not target:
             return
@@ -107,7 +120,9 @@ class MapDock(QWidget):
         if not route:
             self.path_label.setText(f"已在目标房间: {target}")
         else:
-            self.path_label.setText(f"路径 → {target}（{len(route)} 步）: " + " → ".join(route))
+            start_name = self.cache.current or "当前位置"
+            self.path_label.setText(
+                f"{start_name} → {target}（{len(route)} 步）: " + " → ".join(route))
         self.cur_label.setText(f"已规划 → {target}（{len(route)} 步）")
         self.go_btn.setEnabled(True)
 
@@ -137,11 +152,11 @@ class MapDock(QWidget):
 
     def _choose_target(self, name: str, cands) -> list[str] | None:
         items = []
-        for i, (_nid, dist, path) in enumerate(cands, 1):
-            if dist == 0:
+        for i, (_nid, dist, path, reachable) in enumerate(cands, 1):
+            if not reachable:
+                tag = "数据不可达"
+            elif dist == 0:
                 tag = "当前所在"
-            elif dist == float("inf"):
-                tag = "距离未知"
             else:
                 tag = f"距离 {int(dist)} 步"
             if path:
@@ -149,7 +164,7 @@ class MapDock(QWidget):
             items.append(f"#{i} {tag} · {name}")
         chosen, ok = QInputDialog.getItem(
             self, "选择目的地",
-            f"同名房间 {len(cands)} 个（按距离由近到远）：",
+            f"同名房间 {len(cands)} 个（可达优先，按距离由近到远）：",
             items, 0, False)
         if not ok or chosen is None:
             return None

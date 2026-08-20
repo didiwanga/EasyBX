@@ -183,6 +183,8 @@ class MapCache(QObject):
             return
         na = self.nodes[a]["neighbors"]
         nb = self.nodes[b]["neighbors"]
+        if a_dir in na and na[a_dir] == b:
+            return  # 边已存在且一致：无变化，不标记待上报
         if a_dir in na and na[a_dir] != b:
             return  # 同名歧义：保留已有边
         # 实际行走为准：清理 a 指向 b 的其他方向脏边（同房间经多个方向到同一实例为异常数据）
@@ -359,11 +361,21 @@ class MapCache(QObject):
         nid = self._resolve_node(name, set(dirs), expected)
         if nid is None:
             nid = self._new_node(name, dirs, expected or [0, 0, 0])
+        else:
+            # 行走推算出的坐标补全已有实例（服务器拉来的无坐标/占位节点），
+            # 避免坐标链断裂导致整片区域无坐标、重名消歧/导航失真
+            if expected is not None:
+                nd = self.nodes.get(nid)
+                if nd is not None:
+                    c = nd.get("coords")
+                    if not c or (c[0] == 0 and c[1] == 0):
+                        nd["coords"] = list(expected)
+                        self.changed_ids.add(nid)
         if prev and prev in self.nodes and nid != prev:
             self._link_ids(prev, d, nid)
         self._set_current(nid)
-        self.changed_ids.add(nid)
-        self.changed_rooms.add(name)
+        # 待上报标记由 _new_node（新实例）/_link_ids（边变化）按需添加；
+        # 重复经过已记录房间不再重复标记，待上传因此能收敛到 0
         # 名字键视图重建：新行走房间进入 rooms/edges，地图与导航即时可用
         self._rebuild_views()
         self._prune_node_neighbors()
@@ -483,34 +495,68 @@ class MapCache(QObject):
                 q.append(nb)
         return None
 
-    def find_targets(self, name: str, start: str | None = None) -> list[tuple[str, float, list[str]]]:
-        """同名实例候选，按当前坐标距离由近到远：[(nid, 距离, 导航路径)]。
+    def route_to(self, target_nid: str) -> list[str] | None:
+        """实例级 BFS：从当前位置实例沿邻居边走到目标实例。
 
-        距离用坐标（已按区域/全局坐标系对齐）计算；无坐标实例排后。路径为
-        名字键骨架路线（同一名字下各实例共用）。
+        重名房间的每个实例走各自路径，不再共用名字键骨架路线；实例图不连通
+        时返回 None（调用方回退名字键路径）。
+        """
+        start = self.current_id
+        if not start or start not in self.nodes or target_nid not in self.nodes:
+            return None
+        if start == target_nid:
+            return []
+        q: deque[str] = deque([start])
+        prev: dict[str, tuple[str, str]] = {}
+        seen = {start}
+        while q:
+            cur = q.popleft()
+            for d, nid in (self.nodes[cur].get("neighbors") or {}).items():
+                if nid not in self.nodes or nid in seen:
+                    continue
+                seen.add(nid)
+                prev[nid] = (cur, d)
+                if nid == target_nid:
+                    path = []
+                    node = nid
+                    while node != start:
+                        p, dd = prev[node]
+                        path.append(dd)
+                        node = p
+                    path.reverse()
+                    return path
+                q.append(nid)
+        return None
+
+    def find_targets(self, name: str, start: str | None = None) -> list[tuple[str, float, list[str], bool]]:
+        """同名实例候选，按可达性 + 距离由近到远。
+
+        返回 [(nid, 距离, 路径, 可达)]：实例级路径可到达的实例在前（距离=路径步数），
+        实例图不连通的实例排后（距离=坐标曼哈顿距离或名字键路径步数，标记不可达）。
         """
         ids = self.name_to_ids.get(name, [])
         if not ids:
             return []
         cur = start or self.current_id
-        cur_coords = self.nodes[cur].get("coords") if cur and cur in self.nodes else None
-        if cur_coords is None and self.current and self.name_to_ids.get(self.current):
-            cur_coords = self.nodes[self.name_to_ids[self.current][0]].get("coords")
+        cur_c = self.nodes.get(cur, {}).get("coords") if cur and cur in self.nodes else None
+        name_path = self.route(name) or []
         cands = []
         for nid in ids:
-            c = self.nodes[nid].get("coords")
-            if cur_coords and c:
-                dist = sum(abs(a - b) for a, b in zip(cur_coords, c))
+            inst_path = self.route_to(nid) if cur and cur in self.nodes else None
+            path = inst_path if inst_path is not None else (list(name_path) if name_path else None)
+            c = self.nodes.get(nid, {}).get("coords")
+            if inst_path is not None:
+                dist = float(len(inst_path))
+                reachable = True
+            elif cur_c and c:
+                dist = float(sum(abs(a - b) for a, b in zip(cur_c, c)))
+                reachable = False
             else:
-                dist = float("inf")
-            cands.append((nid, dist))
-        cands.sort(key=lambda x: x[1])
-        path = self.route(name) or []
-        if cur_coords is None:
-            # 当前位置无坐标：统一用路径步数作距离，保证候选可比较有数值
-            fb = float(len(path))
-            return [(nid, fb, list(path)) for nid, _ in cands]
-        return [(nid, dist, list(path)) for nid, dist in cands]
+                dist = float(len(name_path)) if name_path else float("inf")
+                reachable = False
+            cands.append((nid, dist, path, reachable))
+        cands.sort(key=lambda x: (0 if x[3] else 1, x[1]))
+        return cands
 
     def push_moves(self, moves: list[dict]) -> None:
         """MapSync 批量上报的服务端回写（本地缓存已覆盖时无需操作）。"""

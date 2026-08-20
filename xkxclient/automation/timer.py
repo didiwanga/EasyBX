@@ -33,6 +33,7 @@ class TimerEngine(QObject):
         self.timers: dict[str, TimerDef] = {}
         self.runner = ActionRunner(bus, session)
         self.master_on = True  # B9 全局开关
+        self._paused: set[str] = set()   # 暂停的定时器（记住原状态，start 恢复）
         self._interval: dict[str, QTimer] = {}
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
@@ -55,6 +56,11 @@ class TimerEngine(QObject):
                 continue  # 字段类型异常的历史脏数据：跳过，不崩溃
             timers[td.name] = td
         self.timers = timers
+        # 清掉历史存留的 next_at（旧格式是滚动分钟值，可能已过期），
+        # 首个 tick 依据 schedule 重新计算下一次触发时刻，避免加载即误触发。
+        for td in self.timers.values():
+            td.next_at = 0.0
+        self._paused.clear()
         self._schedule_all()
         self._ensure_tick()
 
@@ -75,6 +81,8 @@ class TimerEngine(QObject):
         if name not in self.timers:
             return
         td = self.timers[name]
+        self.master_on = True  # 恢复全局开关：此前若被「控制→停止定时器」关闭，单台启动必须重新打开
+        self._paused.discard(name)
         td.enabled = True
         sched = td.schedule or {}
         if sched.get("type") == "interval" or (sched.get("interval_ms") or 0) > 0:
@@ -89,7 +97,12 @@ class TimerEngine(QObject):
         if name not in self.timers:
             return
         td = self.timers[name]
-        td.enabled = pause
+        if pause:
+            # 暂停：记住原状态并真正停用（daily/weekly 走 enabled 判断，必须禁用才不触发）
+            self._paused.add(name)
+        else:
+            self._paused.discard(name)
+        td.enabled = False
         if name in self._interval:
             self._interval[name].stop()
         if not pause:
@@ -102,6 +115,28 @@ class TimerEngine(QObject):
             self.start(name)
 
     def stop_all(self) -> None:
+        for t in self._interval.values():
+            t.stop()
+        self._interval.clear()
+        self._paused.clear()
+        for td in self.timers.values():
+            td.next_at = 0.0
+        self._tick.stop()
+
+    def enable_all(self) -> None:
+        """启用全部定时器（供触发器「控制→启动定时器」调用）。"""
+        self.master_on = True
+        self._paused.clear()
+        for td in self.timers.values():
+            td.enabled = True
+        self._schedule_all()
+        self._ensure_tick()
+
+    def disable_all(self) -> None:
+        """停用全部定时器（供触发器「控制→停止定时器」调用），
+        停止所有 interval 计时并关闭全局开关，防止已排程定时器继续触发。"""
+        self.master_on = False
+        self._paused.clear()
         for t in self._interval.values():
             t.stop()
         self._interval.clear()
@@ -141,59 +176,77 @@ class TimerEngine(QObject):
         return "interval_ms" in sched and (sched.get("interval_ms") or 0) > 0
 
     def _check_calendar(self, name: str, td: TimerDef, sched: dict, now: float) -> None:
+        """日历定时器到期检查：next_at 存精确触发时刻。
+
+        - 一次性定时器（once_at）：绝对时间，仅在触发时刻后 120s 窗口内触发一次
+          （加载过晚/过期不补触发）；
+        - 每日/每周：首次 tick 由 daily_at 计算出下一次精确时刻；到期触发后推进到
+          下一次。事件循环卡顿跨过目标分钟也能在恢复后的 tick 补触发，不再漏当天。
+        """
+        stype = sched.get("type")
+        if not td.enabled:
+            return
+        once = sched.get("once_at")
+        if once is not None:
+            once_ts = self._parse_once(once)
+            if once_ts is not None and 0 <= now - once_ts <= 120:
+                td.enabled = False
+                self._fire(name)
+            return
+        if td.next_at == 0.0:
+            td.next_at = self._next_due(sched, now)
+            if td.next_at is None:
+                return
         if now < td.next_at:
             return
-        td.next_at = now + 60
-        if self._due(td, sched, now):
-            if sched.get("type") == "once":
-                td.enabled = False
-            else:
-                td.last_at = now
-            self._fire(name)
+        td.last_at = now
+        self._fire(name)
+        if stype == "once":
+            td.enabled = False
+        else:
+            td.next_at = self._next_due(sched, td.next_at)
 
-    def _due(self, td: TimerDef, sched: dict, now: float) -> bool:
+    @staticmethod
+    def _parse_once(once) -> float | None:
+        """once_at 解析：`%Y-%m-%d %H:%M` 字符串或时间戳数值。"""
         import datetime as dt
-        lt = dt.datetime.fromtimestamp(now)
+        if isinstance(once, str):
+            try:
+                return dt.datetime.strptime(once, "%Y-%m-%d %H:%M").timestamp()
+            except ValueError:
+                return None
+        try:
+            return float(once)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _next_due(sched: dict, after: float) -> float | None:
+        """after 之后（严格）下一次按 daily_at 触发的绝对时间戳；未配置返回 None。
+
+        兼容两种存储：列表 ["09:30"]（旧 UI 格式）与分钟整数 570（引擎原生格式）；
+        week_days 非空时按 1-7 过滤周一~周日。
+        """
+        import datetime as dt
         want = sched.get("daily_at")
-        hm = (lt.hour, lt.minute)
-        if want:
-            # 兼容两种存储：
-            # - 列表 ["09:30"]（旧 UI 格式）
-            # - 分钟整数 570（引擎原生格式）
-            raw = want[0] if isinstance(want, (list, tuple)) else want
-            if isinstance(raw, str) and ":" in str(raw):
-                hh, mm = str(raw).split(":", 1)
-                target = (int(hh), int(mm))
-            else:
-                target = divmod(int(raw), 60)
-            if hm == target:
-                wd = sched.get("week_days") or []
-                if wd and lt.weekday() + 1 not in wd:
-                    return False
-                if sched.get("type") == "once" and sched.get("once_at"):
-                    once = sched.get("once_at")
-                    if isinstance(once, str):
-                        try:
-                            once_ts = dt.datetime.strptime(once, "%Y-%m-%d %H:%M").timestamp()
-                        except ValueError:
-                            return False
-                    else:
-                        once_ts = float(once)
-                    return abs(now - once_ts) < 120
-                return True
-            return False
-        # once 无 daily_at：绝对时间比较
-        if sched.get("type") == "once" and sched.get("once_at"):
-            once = sched.get("once_at")
-            if isinstance(once, str):
-                try:
-                    on_ts = dt.datetime.strptime(once, "%Y-%m-%d %H:%M").timestamp()
-                except ValueError:
-                    return False
-            else:
-                on_ts = float(once)
-            return 0 <= (now - on_ts) < 60
-        return False
+        if not want:
+            return None
+        raw = want[0] if isinstance(want, (list, tuple)) else want
+        if isinstance(raw, str) and ":" in str(raw):
+            hh, mm = str(raw).split(":", 1)
+            hh, mm = int(hh), int(mm)
+        else:
+            hh, mm = divmod(int(raw), 60)
+        wd = sched.get("week_days") or []
+        base = dt.datetime.fromtimestamp(after)
+        for i in range(8):
+            day = base + dt.timedelta(days=i)
+            if wd and day.weekday() + 1 not in wd:
+                continue
+            ts = day.replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+            if ts > after:
+                return ts
+        return None
 
     def _fire(self, name: str) -> None:
         if not self.master_on:

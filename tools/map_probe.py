@@ -262,6 +262,7 @@ class MapProbe:
         self._ferry_going = False
         self._ferry_boarded = False
         self._ferry_disembarked = False
+        self._ferry_retries = 0
 
         self._last_activity = time.time()
         self._load_map_cache()
@@ -606,7 +607,13 @@ class MapProbe:
                 # walk/walkto 行走中：只记录房间与坐标，不推进探索（避免与 walk 命令打架）
                 self.moving = False
                 self.capture_look = False
-                if self.action_move_wait:
+                if getattr(self, "walk_target_name", "") and name == self.walk_target_name:
+                    self.logs.append(f"[probe] walk 命中目标名 {name!r}")
+                    self.walk_target_name = ""
+                    self.action_deadline = 0.0
+                    self.action_move_end = time.time() + 5.0
+                    self.action_move_wait = True
+                elif self.action_move_wait:
                     # ferry/gu 到达对岸/目的地：延迟 5s 收尾采集
                     self.action_move_wait = False
                     self.action_move_end = time.time() + 5.0
@@ -619,6 +626,19 @@ class MapProbe:
                     else:
                         self._walkto_step()
                 elif self.explore_active:
+                    if nid == prev:
+                        # 同一实例：方向原地打转（迷宫/循环），标记已走防止死循环
+                        self.nodes[self.room]["walked"] |= {pend}
+                        self.logs.append(f"[probe] explore 原地循环 {pend!r}，标记已走")
+                    else:
+                        # 首次真实到达缓存节点：重置其已走标记为当前到达边（op），
+                        # 仅去掉缓存的假标记，保留本次会话已真实走过的边，防止互跳死循环
+                        nd = self.nodes.get(nid)
+                        if nd and nd.get("from_cache") and nid not in self._explore_touched:
+                            op = _DIR_OPPOSITE.get(pend)
+                            nd["walked"] = {op} if op else set()
+                            self._explore_touched.add(nid)
+                            self.logs.append(f"[probe] 缓存节点真实到达，重置探索: {self.room_name!r}")
                     self._explore_step()
             else:
                 self._on_move_ok()
@@ -746,7 +766,9 @@ class MapProbe:
         while q:
             cur = q.popleft()
             node = self.nodes.get(cur) or {}
-            if any(d not in node.get("walked", set()) for d in node.get("exits", set())):
+            # 只在有未走边且实例数不超过阈值（迷宫/田地/民居重名无收益则跳过）时作为前沿
+            if any(d not in node.get("walked", set()) for d in node.get("exits", set())) and \
+               len(self.name_to_ids.get(node.get("name", ""), [])) <= 10:
                 return cur
             for nxt in (node.get("neighbors") or {}).values():
                 if nxt not in seen:
@@ -871,6 +893,10 @@ class MapProbe:
                 self._go(arg)
             else:
                 self.send_text(arg)
+        elif kind == "walk":
+            self.probe_cmd = f"walk:{arg}"
+            self.logs.append(f"[probe] walk 官方逍遥行 → {arg}")
+            self._run_walk(arg)
         elif kind == "walkto":
             self.probe_cmd = f"walkto {arg}"
             self.logs.append(f"[probe] walkto {arg} (上限 {collect_ms}ms)")
@@ -892,11 +918,16 @@ class MapProbe:
         elif kind == "explore":
             self.probe_cmd = "explore"
             self.logs.append(f"[probe] explore (BFS 遍历, 上限 {collect_ms}ms)")
-            # 缓存节点出口置为未走，允许沿真实移动重新探索（缓存边可能缺失/孤立）
-            for nid, nd in self.nodes.items():
-                if nd.get("from_cache"):
-                    nd["walked"] = set()
+            # 缓存节点 walked 保持全出口已走（_load_map_cache 已设置），不作为探索前沿，
+            # 避免沿缓存骨架边乱走到全国；仅真实 GMCP.Move 到达的新房间扩展探索。
             self.explore_active = True
+            # 出生点可能命中缓存节点（walked=全出口），清空其已走标记允许从当前位置扩展
+            cur = self.nodes.get(self.room)
+            self._explore_touched: set[str] = set()
+            self._explore_new_name_move = 0
+            if cur:
+                cur["walked"] = set()
+                self._explore_touched.add(self.room)
             self._explore_visited = {self.room}
             self._explore_no_new = 0
             self._explore_moves = 0
@@ -936,6 +967,12 @@ class MapProbe:
 
     def _ask_ferry(self) -> None:
         if not self._ferry_ids:
+            rec = self.room_records.get(self.room, {})
+            npcs = rec.get("npc", []) or []
+            cand = [n for n in npcs if any(k in n[0] for k in ("船", "渡", "艄", "舟"))]
+            if cand:
+                self._ferry_ids = self._id_variants(cand[0][1])
+        if not self._ferry_ids:
             self.logs.append("[probe] 船夫 id 均无到达，放弃")
             self.action_deadline = 0.0
             self.action_move_end = 0.0
@@ -943,6 +980,8 @@ class MapProbe:
             return
         en = self._ferry_ids.pop(0)
         topic = self._ferry_topic
+        if topic in ("jiang", "guojiang", "jianghe", "river"):
+            topic = "过江"
         self._ferry_going = False
         self._ferry_boarded = False
         self._ferry_disembarked = False
@@ -951,6 +990,19 @@ class MapProbe:
         self.action_deadline = time.time() + 20.0
         self.logs.append(f"[probe] 渡{topic}: ask {en} about {topic}")
         self.send_text(f"ask {en} about {topic}")
+
+    def _run_walk(self, target: str) -> None:
+        """官方逍遥行 walk：发命令后被动采集 GMCP.Move，超时或命中目标名结束。
+        跨区域可能经渡口等需人工步骤，walk 会停在原地，超时后由下一任务处理。"""
+        parts = target.split(":")
+        target_name = parts[0]
+        timeout = float(parts[1]) if len(parts) > 1 else 240.0
+        self.walk_target_name = target_name
+        self.action_move_wait = False
+        self.action_move_end = 0.0
+        self.action_deadline = time.time() + timeout
+        self.logs.append(f"[probe] walk {target_name} (超时 {timeout:.0f}s)")
+        self.send_text(f"walk {target_name}")
 
     def _run_gu(self) -> None:
         """找当前房间车夫 NPC，gu 雇马车。"""
@@ -977,6 +1029,7 @@ class MapProbe:
             return False
         self.walkto_target, self.walkto_path = best
         self.walkto_target_name = target_name
+        self.walkto_steps = 0
         self.walkto_active = True
         self._walkto_step()
         return True
@@ -986,6 +1039,15 @@ class MapProbe:
             self._finish_walkto()
             return
         d = self.walkto_path.pop(0)
+        self.walkto_steps += 1
+        if self.walkto_steps > 20:
+            self.logs.append("[probe] walkto 超 20 步未到达，放弃")
+            self.walkto_active = False
+            self.walkto_path = []
+            self.moving = False
+            self.move_pending_dir = ""
+            self._end_probe()
+            return
         self.move_pending_dir = d
         self.move_timeout = time.time() + 8.0
         self.moving = True
@@ -1005,41 +1067,53 @@ class MapProbe:
         到达即由 _on_move 的 probe_phase 分支再次调用，直到无可探索边或超时。"""
         if not self.explore_active:
             return
-        # 连续多次回到已知节点说明在环路空转，停止以防死循环
+        # 新增房间名收益检测：最近 40 步未发现新名字（迷宫绕圈）则跳到其他前沿
+        if len(self.name_to_ids.get(self.room_name, [])) == 1:
+            self._explore_new_name_move = self._explore_moves
+        elif self._explore_moves - self._explore_new_name_move > 40:
+            self._explore_give_up(f"[probe] explore {self._explore_moves} 步内 40 步无新房间名，转移前沿")
+            return
+        # 连续多次回到已知节点说明在环路空转，跳到其他前沿
         if self.room not in self._explore_visited:
             self._explore_visited.add(self.room)
             self._explore_no_new = 0
         else:
             self._explore_no_new += 1
             if self._explore_no_new >= 20:
-                self.logs.append("[probe] explore 连续 20 步回到已知节点，停止")
-                self.explore_active = False
-                self._end_probe()
+                self._explore_give_up("[probe] explore 连续 20 步回到已知节点，转移前沿")
                 return
         node = self.nodes.get(self.room) or {}
         if not self.explore_path:
-            un = [d for d in node.get("exits", set()) if d not in node.get("walked", set())]
+            # 优先用最近一次 GMCP 确认的真实出口；无 GMCP 时才用节点 exits（缓存兜底）
+            pool = self.exits_now or node.get("exits", set())
+            un = [d for d in pool if d not in node.get("walked", set())]
             if un:
                 d = sorted(un)[0]
                 self.nodes[self.room]["walked"].add(d)
                 self._go_explore(d)
                 return
-            target = self._find_frontier()
-            if target is None:
-                self.logs.append("[probe] explore 完成：无可探索边")
-                self.explore_active = False
-                self._end_probe()
-                return
-            path = self._route_to(target)
-            if not path:
-                self.logs.append("[probe] explore 无法到达前沿，结束")
-                self.explore_active = False
-                self._end_probe()
-                return
-            self.explore_path = path[1:]
-            self._go_explore(path[0])
+            self._explore_give_up("[probe] explore 当前无未走边，寻找前沿")
             return
         self._go_explore(self.explore_path.pop(0))
+
+    def _explore_give_up(self, msg: str) -> None:
+        """当前区域无收益：尝试跳到仍有未走边且名字唯一的前沿继续；无前沿才结束。"""
+        self.logs.append(msg)
+        self.explore_path = []
+        target = self._find_frontier()
+        if target is None:
+            self.logs.append("[probe] explore 完成：无可探索边")
+            self.explore_active = False
+            self._end_probe()
+            return
+        path = self._route_to(target)
+        if not path:
+            self.logs.append("[probe] explore 无法到达前沿，结束")
+            self.explore_active = False
+            self._end_probe()
+            return
+        self.explore_path = path[1:]
+        self._go_explore(path[0])
 
     def _go_explore(self, d: str) -> None:
         self._explore_moves += 1
@@ -1087,6 +1161,12 @@ class MapProbe:
                     self.logs.append("[probe] ask 无到达，试下一个 id")
                     self._ask_ferry()
                     return
+                if self._ferry_going and self._ferry_retries < 3:
+                    # 渡江中等船超时：船往返需时间，重新 ask 催船
+                    self._ferry_retries += 1
+                    self.logs.append(f"[probe] 渡江等待超时，重试 ask（第 {self._ferry_retries} 次）")
+                    self._ask_ferry()
+                    return
                 self.action_deadline = 0.0
                 self.action_move_end = 0.0
                 self.logs.append("[probe] 动作无到达，超时结束")
@@ -1131,6 +1211,7 @@ class MapProbe:
                 "name": nd["name"],
                 "coords": nd.get("coords"),
                 "exits": sorted(nd["exits"]),
+                "from_cache": bool(nd.get("from_cache")),
                 "neighbors": {
                     d: {"to": t, "name": self.nodes[t].get("name", t)}
                     for d, t in sorted(nd["neighbors"].items())

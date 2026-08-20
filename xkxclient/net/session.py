@@ -3,6 +3,7 @@
 import json
 import re
 import time
+from collections import deque
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
@@ -87,7 +88,8 @@ class AccountSession(QObject):
         self.exits: list[str] = []
         self.connected = False
         self.logged_in = False
-        self.vars: dict = {}
+        from xkxclient.automation.runner import ReservedVars
+        self.vars: dict = ReservedVars(self)
         self.last_line = ""
         self.chat_open = True  # B5e：聊天栏恒开
         self._fullme_collect = 0
@@ -157,6 +159,11 @@ class AccountSession(QObject):
         #   只能先缓存在本地、等分页窗口关闭后原样发出）
         self._pending_inputs: list[str] = []
         self._pending_inputs_msg = False
+        # 手动指令严格顺序队列：所有用户自主指令（含 #wa/#N）统一进入该 FIFO，
+        # 串行发送。不与自动化 throttle（宏/触发/导航）混排，避免自动化积压
+        # 命令插队/阻塞，导致手动移动方向错乱。
+        self._manual_queue: deque = deque()
+        self._manual_busy = False
         # 自动导航刷新最近时间戳（request_node/request_walk 更新）：用于兜底静默
         # node/walk 自动刷新在无路径区域产生的噪声提示（如"你不能在这里定义路径"），
         # 即使捕获窗口因超时/交错关闭，也能按时间窗口吞掉，不打扰主输出。
@@ -345,13 +352,48 @@ class AccountSession(QObject):
         self.line_displayed.emit([Span("> " + t)], False)
 
     def _send_pieces(self, pieces: list[str]) -> None:
-        """把命令片段（已别名展开）发往服务器：含 #wa/#N 走节流队列，否则直发。"""
-        from xkxclient.core.specialcmd import build_items, is_special
-        if any(is_special(p) for p in pieces):
-            self.throttle.enqueue_items(build_items(pieces))
-        else:
-            for piece in pieces:
-                self.connection.send_line(piece)
+        """把命令片段（已别名展开）发往服务器。
+
+        手动指令统一进入严格顺序 FIFO 队列串行发送（含 #wa/#N 延时），
+        保证用户自主指令之间不重排、不被自动化 throttle 队列的积压命令插队。
+        """
+        from xkxclient.core.specialcmd import build_items
+        self._enqueue_manual(build_items(pieces))
+
+    def _enqueue_manual(self, items: list) -> None:
+        """手动指令入队（str=命令，("delay", ms)=延时），串行泵发送。"""
+        for it in items:
+            if isinstance(it, str):
+                self._manual_queue.append(it)
+            elif isinstance(it, tuple) and len(it) == 2 and it[0] == "delay":
+                self._manual_queue.append(("delay", max(0, int(it[1]))))
+        self._manual_pump()
+
+    def _manual_pump(self) -> None:
+        """手动队列泵：逐条直发；遇延时挂起，到期继续下一条。"""
+        if self._manual_busy:
+            return
+        while self._manual_queue:
+            item = self._manual_queue[0]
+            if isinstance(item, tuple) and item[0] == "delay":
+                ms = int(item[1])
+                self._manual_queue.popleft()
+                if ms > 0:
+                    self._manual_busy = True
+                    QTimer.singleShot(ms, self._manual_resume)
+                return
+            self._manual_queue.popleft()
+            self.connection.send_line(item)
+
+    def _manual_resume(self) -> None:
+        """延时到期：解除 busy 标记后继续泵（避免 busy 挡住 singleShot 回调）。"""
+        self._manual_busy = False
+        self._manual_pump()
+
+    def _cancel_manual(self) -> None:
+        """清空手动指令队列（关闭/登出时）。"""
+        self._manual_queue.clear()
+        self._manual_busy = False
 
     def _queue_pending_input(self, pieces: list[str]) -> None:
         """node/walk 读取窗口内：用户指令先本地排队，等分页窗口关闭后补发。
@@ -1242,6 +1284,7 @@ class AccountSession(QObject):
         self.timers.stop_all()
         self.macros.stop()
         self.throttle.cancel_all()
+        self._cancel_manual()
         self.throttle.close()
         self.combat.close()
         self.connection.close()

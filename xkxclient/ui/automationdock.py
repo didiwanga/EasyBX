@@ -695,10 +695,20 @@ class MacroControlDock(QWidget):
                 for ev in ("macro.start", "macro.stop", "macro.end", "macro.step", "macro.state"):
                     sub = bus.subscribe(ev, lambda p, e=ev: self._on_event(p, acc, e))
                     self._subs.append((ev, sub))
+                # 登录完成兜底刷新：切换用户后宏列表/按钮立即同步到当前账号，
+                # 不必等宏有动作
+                sub = bus.subscribe("login.done", lambda p: self._on_login_done(p, acc))
+                self._subs.append(("login.done", sub))
                 # 宏编辑器保存后实时刷新宏列表
                 sub = bus.subscribe("automation.saved",
                                     lambda p: self._on_saved(p, acc))
                 self._subs.append(("automation.saved", sub))
+        self.reload()
+        self._sync(idle=True)
+
+    def _on_login_done(self, payload: dict, acc: str) -> None:
+        if (payload.get("account") or "") != acc:
+            return
         self.reload()
         self._sync(idle=True)
 
@@ -717,7 +727,10 @@ class MacroControlDock(QWidget):
                 bus = getattr(self.session, "bus", None)
             if bus is not None:
                 for ev, sub in self._subs:
-                    bus.unsubscribe(ev, sub)
+                    try:
+                        bus.unsubscribe(ev, sub)
+                    except Exception:
+                        pass
         self._subs = []
 
     def _on_event(self, payload: dict, acc: str, ev: str) -> None:
@@ -785,11 +798,12 @@ class MacroControlDock(QWidget):
         self._sync(idle=True)
 
     def _sync(self, idle: bool = False, running: bool = False, paused: bool = False) -> None:
-        """按钮可用性：idle 仅运行；运行中 暂停+停止；暂停中 继续+停止。"""
+        """按钮可用性：idle 仅运行；运行中 暂停+停止；暂停中 继续+停止。
+        停止按钮常亮：任何状态下点击都强制停止宏并清空积压命令。"""
         self.run_btn.setEnabled(idle)
         self.pause_btn.setEnabled(running and not paused)
         self.resume_btn.setEnabled(running and paused)
-        self.stop_btn.setEnabled(running or not idle)
+        self.stop_btn.setEnabled(True)
 
     def set_progress(self, text: str) -> None:
         self.status.setText(text)

@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 # 反向方向（与客户端 _DIR_OPPOSITE 一致）
@@ -170,8 +170,16 @@ class MapStore:
                 "desc": json.loads(row["desc"]) if row["desc"] else [],
                 "category": row["category"] or "",
             }
+        self._rebuild_name_index()
         self._nseq = max((int(n[1:]) for n in self._nodes
                           if n.startswith("n") and n[1:].isdigit()), default=-1) + 1
+
+    def _rebuild_name_index(self) -> None:
+        """按房间名索引实例，避免合并时对每个上报节点全库扫描（O(N*M)→O(M)）。"""
+        idx: dict[str, list[str]] = {}
+        for nid, nd in self._nodes.items():
+            idx.setdefault(nd["name"], []).append(nid)
+        self._name_index = idx
 
     # ---- 节点存取 ----
     def _new_nid(self) -> str:
@@ -180,6 +188,7 @@ class MapStore:
         return nid
 
     def _save_node(self, nid: str, nd: dict) -> None:
+        # 不在此 commit：merge_report 批量落库后统一提交，避免每节点一次磁盘 fsync
         self._conn.execute(
             "INSERT OR REPLACE INTO nodes(nid, name, exits, coords, neighbors, source,"
             " updated_at, created_rev, updated_rev) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -188,14 +197,12 @@ class MapStore:
              json.dumps(nd["neighbors"]), nd.get("source"),
              nd.get("updated_at", time.time()),
              nd.get("created_rev", 0), nd.get("updated_rev", 0)))
-        self._conn.commit()
 
     # ---- 身份识别 ----
     def _resolve(self, name: str, exits: set, coords):
         """同名 + 出口集一致 + 坐标一致（或任一未知）→ 复用实例；否则 None。"""
-        for nid, nd in self._nodes.items():
-            if nd["name"] != name:
-                continue
+        for nid in self._name_index.get(name, []):
+            nd = self._nodes[nid]
             if set(nd["exits"]) != exits:
                 continue
             c = _coord_t(nd["coords"])
@@ -261,9 +268,8 @@ class MapStore:
                 if nid is None:
                     # 同名+同出口但坐标矛盾：可能是同一房间坐标版本不同。
                     # 记录 conflict；若现有坐标是占位而新坐标更真实，则替换。
-                    same_exit = [x for x in self._nodes
-                                 if self._nodes[x]["name"] == name
-                                 and set(self._nodes[x]["exits"]) == exits]
+                    same_exit = [x for x in self._name_index.get(name, [])
+                                 if set(self._nodes[x]["exits"]) == exits]
                     upgrade = None
                     for x in same_exit:
                         oc = _coord_t(self._nodes[x]["coords"])
@@ -287,6 +293,7 @@ class MapStore:
                         "updated_at": now, "created_rev": self.revision + 1,
                         "updated_rev": self.revision + 1,
                     }
+                    self._name_index.setdefault(name, []).append(nid)
                     new_nodes += 1
                     changed = True
                     touched.add(nid)
@@ -308,15 +315,14 @@ class MapStore:
                         changed = True
                         touched.add(nid)
                 if neigh_names:
+                    # 仅登记待重链的邻居；是否变更由 2) 重链实际新增边决定，
+                    # 否则重复上报相同数据也会误判 changed 导致 revision 无限增长
                     links.setdefault(nid, {}).update(neigh_names)
-                    touched.add(nid)
-                    changed = True
 
             # 2) 重链邻居：方向 → 主库 nid（同名取首个不同实例）
             for a_nid, ls in links.items():
                 for d, tn in ls.items():
-                    cands = [x for x in self._nodes
-                             if self._nodes[x]["name"] == tn and x != a_nid]
+                    cands = [x for x in self._name_index.get(tn, []) if x != a_nid]
                     if not cands:
                         continue
                     b = cands[0]
@@ -359,26 +365,33 @@ class MapStore:
                         cur["category"] = cat
                         changed = True
 
-            # 4) 落库 + revision
+            # 4) 批量落库 + revision（一次事务提交，避免每节点一次 fsync）
             if changed:
                 rev = self._bump_rev()
                 for nid in touched:
                     nd = self._nodes[nid]
                     nd["updated_rev"] = rev
                     self._save_node(nid, nd)
-                for rname, r in self._rooms.items():
-                    self._conn.execute(
+                # 只写本次上报涉及的房间，不整表回写
+                rrows = []
+                for rname in (report.get("rooms") or {}):
+                    r = self._rooms.get(rname)
+                    if not r:
+                        continue
+                    rrows.append((rname, json.dumps(r.get("npc", [])),
+                                  json.dumps(r.get("desc", [])),
+                                  r.get("category", ""), now))
+                if rrows:
+                    self._conn.executemany(
                         "INSERT OR REPLACE INTO rooms(name, npc, desc, category, updated_at)"
-                        " VALUES(?,?,?,?,?)",
-                        (rname, json.dumps(r.get("npc", [])),
-                         json.dumps(r.get("desc", [])), r.get("category", ""), now))
-                self._conn.commit()
-                for c in conflicts:
-                    self._conn.execute(
+                        " VALUES(?,?,?,?,?)", rrows)
+                crows = [(c["kind"], c.get("name"), c.get("nid"),
+                          json.dumps(c.get("detail", {}), ensure_ascii=False), now)
+                         for c in conflicts]
+                if crows:
+                    self._conn.executemany(
                         "INSERT INTO conflicts(kind, name, nid, detail, created_at)"
-                        " VALUES(?,?,?,?,?)",
-                        (c["kind"], c.get("name"), c.get("nid"),
-                         json.dumps(c.get("detail", {}), ensure_ascii=False), now))
+                        " VALUES(?,?,?,?,?)", crows)
                 self._conn.commit()
             else:
                 rev = self.revision
@@ -440,9 +453,8 @@ class MapStore:
 
     def _room_exits(self, name: str) -> list[str]:
         out: set[str] = set()
-        for nid, nd in self._nodes.items():
-            if nd["name"] == name:
-                out |= set(nd["exits"])
+        for nid in self._name_index.get(name, []):
+            out |= set(self._nodes[nid]["exits"])
         return sorted(out)
 
     # ---- 统计 ----
@@ -569,7 +581,8 @@ def main():
     store = MapStore(DB_PATH)
     Handler.store = store
     print(f"[map_sync_server] listening on 0.0.0.0:{PORT} (db={DB_PATH})", flush=True)
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # 多线程：大合并不再阻塞 stats/拉取与其他客户端请求
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

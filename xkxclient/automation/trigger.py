@@ -228,12 +228,23 @@ class TriggerEngine(QObject):
         """评估单个条件：行匹配（contains/regex/exact/template）或状态比较（status）。
 
         命中返回捕获列表（可空），未命中返回 None。状态比较命中无捕获返回 []。
+        pattern 支持 `{变量}` 与 `<保留变量>` 实时代入（如 `<中文名>说道：…`）。
         """
         if c.get("match_type") == "status":
             ok = self._match_status_cond(c)
             return [] if ok else None
         mt = c.get("match_type") or t.match_type or "contains"
         pat = c.get("pattern") or ""
+        try:
+            from xkxclient.automation.runner import substitute, substitute_template
+            # 模板的 `{名}` 是捕获占位符，代入当前变量值会破坏捕获结构（命中一次后
+            # 模板退化为静态文本）；模板只代入 `<保留变量>`，其余类型正常代入。
+            if mt == "template":
+                pat = substitute_template(pat, self.session.vars)
+            else:
+                pat = substitute(pat, self.session.vars)
+        except Exception:
+            pass
         return self._match_with(mt, pat, line)
 
     def _match_status_cond(self, c: dict) -> bool:

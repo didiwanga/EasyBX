@@ -12,8 +12,9 @@ import re
 
 _WA_RE = re.compile(r"^#wa\s*(\d+)\s*$", re.IGNORECASE)
 _REPEAT_RE = re.compile(r"^#(\d+)\s+(.+)$")
-# 「叮」命令：任意命令流中发提示音，不发送到服务器（可写在多命令里如 `n;叮,n`）
-_DING_RE = re.compile(r"^叮+$")
+# 提示音命令：任意命令流中发提示音，不发送到服务器（可写在多命令里如 `n;叮,n`）。
+# 支持「叮」（含重复如 叮叮）与英文 beep（不区分大小写）。
+_DING_RE = re.compile(r"^(?:叮+|beep)$", re.IGNORECASE)
 # 单条重复/延时的安全上限，避免误输入导致客户端长时间卡在队列里
 _MAX_REPEAT = 500
 _MAX_DELAY_MS = 600_000      # 10 分钟
@@ -29,7 +30,7 @@ def build_items(pieces: list[str]) -> list:
     """把已按 `;` 拆分的命令串转为动作序列。
 
     返回顺序列表：普通命令为 str；`#wa N` → ("delay", ms)；`#N cmd`
-    展开为 N 个 str；「叮」 → ("beep", None)。供 CommandThrottle.enqueue_items 消费。
+    展开为 N 个 str；「叮」/`beep` → ("beep", None)。供 CommandThrottle.enqueue_items 消费。
     """
     items: list = []
     for p in pieces:
@@ -47,6 +48,12 @@ def build_items(pieces: list[str]) -> list:
             n = int(m.group(1))
             cmd = m.group(2).strip()
             if 0 < n <= _MAX_REPEAT and cmd:
+                wm = _WA_RE.match(cmd)
+                if wm:
+                    ms = int(wm.group(1))
+                    if 0 < ms <= _MAX_DELAY_MS:
+                        items.extend(("delay", ms) for _ in range(n))
+                        continue
                 if _DING_RE.match(cmd):
                     items.extend(("beep", None) for _ in range(n))
                 else:

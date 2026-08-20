@@ -104,7 +104,7 @@ class CommandThrottle(QObject):
             self._busy = True
             return
         if isinstance(item, tuple) and item[0] == "beep":
-            # 「叮」命令：播放提示音，不发往服务器
+            # 「叮」/beep 命令：播放提示音，不发往服务器
             self._busy = True
             from xkxclient.automation.trigger import play_ding
             play_ding()

@@ -28,7 +28,11 @@ from xkxclient.core.map import _norm_dir
 from xkxclient.version import MAP_SYNC_BASE
 
 _DEFAULT_BASE = MAP_SYNC_BASE
-_TIMEOUT = 15
+_TIMEOUT = 30
+
+# 上报分片：单批最多实例数 / 单次 push 最多批次（300*20=6000，超出留待下次）
+_PUSH_BATCH = 300
+_PUSH_MAX_BATCHES = 20
 
 
 def _opener():
@@ -105,15 +109,24 @@ class MapSync:
             except Exception:
                 pass
 
-    # ---- 导出本地增量 ----
-    def export_changes(self) -> dict:
-        """导出本地 MapCache 自上次导出以来变更的节点与元数据。
+    # ---- 导出本地增量（分片）----
+    def _export_batch(self, limit: int = _PUSH_BATCH) -> dict:
+        """导出待上报变更中的一批（单批上限 limit），并顺带清除已失效的僵尸实例标记。
 
         由 MapCache 内部标记 changed 节点；这里构造上报 payload。
         """
-        changed = getattr(self.cache, "changed_ids", set())
+        with self._lock:
+            changed = set(getattr(self.cache, "changed_ids", set()))
+            changed_rooms = set(getattr(self.cache, "changed_rooms", set()))
+        dead = {nid for nid in changed if nid not in self.cache.nodes}
+        if dead:
+            with self._lock:
+                self.cache.changed_ids.difference_update(dead)
+            changed.difference_update(dead)
+        batch = list(changed)[:limit]
+        batch_rooms = list(changed_rooms)[:max(50, limit // 4)]
         nodes = {}
-        for nid in changed:
+        for nid in batch:
             nd = self.cache.nodes.get(nid)
             if nd is None:
                 continue
@@ -127,7 +140,7 @@ class MapSync:
                               if t in self.cache.nodes},
             }
         rooms = {}
-        for name in _changed_rooms(self.cache):
+        for name in batch_rooms:
             r = self.cache.rooms.get(name)
             if not r:
                 continue
@@ -140,30 +153,43 @@ class MapSync:
 
     # ---- 上报 ----
     def push(self) -> dict | None:
-        """上报本地增量到服务端。成功返回服务端 {revision, ...}，失败抛 MapSyncError。"""
+        """上报本地增量到服务端（分片：一次只发一批，成功仅清已上报部分）。
+
+        服务器合并慢/网络抖动时只丢当前批，未上报部分保留重试，避免超大 payload
+        反复超时而永远传不完。成功返回最后一次服务端响应 {revision, ...}，失败抛
+        MapSyncError。
+        """
         if not self.active:
             return None
-        payload = self.export_changes()
-        if not payload["nodes"] and not payload["rooms"]:
-            return None
-        body = {
-            "client_id": self.client_id,
-            "account": self.account,
-            "nodes": payload["nodes"],
-            "rooms": payload["rooms"],
-        }
-        req = urllib.request.Request(
-            self.base + "/report",
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            method="POST")
-        req.add_header("Content-Type", "application/json; charset=utf-8")
-        data = _read_json(req)
-        with self._lock:
-            self.cache.changed_ids.clear()
-            self.cache.changed_rooms.clear()
-        self.last_rev = int(data.get("revision") or self.last_rev)
-        self._set_status(True)
-        return data
+        last = None
+        for _ in range(_PUSH_MAX_BATCHES):
+            payload = self._export_batch()
+            if not payload["nodes"] and not payload["rooms"]:
+                break
+            body = {
+                "client_id": self.client_id,
+                "account": self.account,
+                "nodes": payload["nodes"],
+                "rooms": payload["rooms"],
+            }
+            req = urllib.request.Request(
+                self.base + "/report",
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                method="POST")
+            req.add_header("Content-Type", "application/json; charset=utf-8")
+            data = _read_json(req)
+            with self._lock:
+                self.cache.changed_ids.difference_update(payload["nodes"].keys())
+                self.cache.changed_rooms.difference_update(payload["rooms"].keys())
+            self.last_rev = int(data.get("revision") or self.last_rev)
+            self._set_status(True)
+            last = data
+            with self._lock:
+                remaining = (len(getattr(self.cache, "changed_ids", set()))
+                             + len(getattr(self.cache, "changed_rooms", set())))
+            if remaining <= 0:
+                break
+        return last
 
     # ---- 拉取 ----
     def pull(self, since: int | None = None) -> dict:
@@ -200,6 +226,10 @@ class MapSync:
                 local_nid = cache._resolve_node(name, exits, coords)
                 if local_nid is None:
                     local_nid = cache._new_node(name, exits, coords)
+                    # 远端数据视为已同步：撤销 _new_node 的待上报标记，避免全量
+                    # 拉取后把服务器数据原样回传（ping-pong）
+                    cache.changed_ids.discard(local_nid)
+                    cache.changed_rooms.discard(name)
                     applied_nodes += 1
                 else:
                     # 已有实例：补出口（不覆盖本地坐标，除非本地是占位且远端更真实）
@@ -330,7 +360,3 @@ def _load_client_id() -> str:
         cid = uuid.uuid4().hex[:12]
         cfg.set("map.client_id", cid)
     return cid
-
-
-def _changed_rooms(cache) -> set[str]:
-    return set(getattr(cache, "changed_rooms", set()))
