@@ -719,3 +719,69 @@ class Navigator(QObject):
         if self._timer is not None:
             self._timer.stop()
         self.bus.publish("nav.arrived", account=getattr(self.session, "account_id", None))
+
+
+class MazeWalker(QObject):
+    """迷宫直达路径执行器（迷宫路径大全）：预置走法按每步延时注入命令节流队列。
+
+    迷宫路径是玩家整理的确定性走法，不依赖 GMCP.Move 确认；特殊命令
+    （enter/swim/ban/give/break 等）与方向一样按步发送。`#N 重复`/`#wa 延时`
+    由 send_auto 的特殊命令解析处理。事件复用 nav.*（start/arrived/stopped），
+    与 Navigator 使用同一套 UI 事件，两者互斥使用（maze 走时不用 Navigator）。
+    """
+
+    def __init__(self, session, bus, parent=None) -> None:
+        super().__init__(parent)
+        self.session = session
+        self.bus = bus
+        self.running = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._poll)
+        self._deadline = 0.0
+
+    def start(self, steps: list[str]) -> None:
+        """把迷宫步骤按每步 `#wa 步速` 注入节流队列，并轮询等待发送完毕。"""
+        if not steps or self.running:
+            return
+        if getattr(self.session, "logged_in", False) is False:
+            return
+        self.running = True
+        self._step_ms = int(ConfigManager.instance().get("map.step_ms", 1500))
+        text = ";".join(f"#wa {self._step_ms};{s}" for s in steps)
+        self.session.send_auto(text)
+        self.bus.publish("nav.start", account=getattr(self.session, "account_id", None),
+                         total=len(steps), steps=list(steps), maze=True)
+        import time
+        self._deadline = time.time() + len(steps) * (self._step_ms + 1500) / 1000.0 + 30
+        self._timer.start()
+
+    def _poll(self) -> None:
+        import time
+        th = getattr(self.session, "throttle", None)
+        if th is not None and th.pending() == 0 and not th.busy:
+            self._finish()
+        elif time.time() > self._deadline:
+            self.bus.publish("nav.stopped", account=getattr(self.session, "account_id", None),
+                             reason="迷宫直达超时")
+            self._stop_inner()
+        # 否则继续轮询等待发送泵清空
+
+    def stop(self) -> None:
+        if not self.running:
+            return
+        th = getattr(self.session, "throttle", None)
+        if th is not None:
+            th.cancel_all()
+        self.bus.publish("nav.stopped", account=getattr(self.session, "account_id", None),
+                         reason="手动停止")
+        self._stop_inner()
+
+    def _stop_inner(self) -> None:
+        self.running = False
+        self._timer.stop()
+
+    def _finish(self) -> None:
+        self._stop_inner()
+        self.bus.publish("nav.arrived", account=getattr(self.session, "account_id", None),
+                         maze=True)

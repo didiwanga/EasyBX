@@ -48,7 +48,6 @@ class StateDock(QWidget):
         self.nl_bar = QProgressBar(); self.nl_bar.setRange(0, 100)
         self.food_bar = QProgressBar(); self.food_bar.setRange(0, 100)
         self.water_bar = QProgressBar(); self.water_bar.setRange(0, 100)
-        self.busy_label = QLabel("")
         self.enemy_bar = QProgressBar(); self.enemy_bar.setRange(0, 100)
         self.enemy_bar.setFormat("敌人 %v%")
         self.enemy_label = QLabel("")
@@ -66,7 +65,6 @@ class StateDock(QWidget):
         rows.addRow("食物", self.food_bar)
         rows.addRow("饮水", self.water_bar)
         rows.addRow("属性", self.attr_label)
-        rows.addRow("状态", self.busy_label)
         rows.addRow("敌人", self.enemy_bar)
         rows.addRow("", self.enemy_label)
         rows.addRow("战况", self.spirit_label)
@@ -93,7 +91,18 @@ class StateDock(QWidget):
         title = st.title or ""
         fam = st.family or ""
         self.name_label.setText(f"{name} {title} Lv{st.level or '?'}".strip())
-        self.meta_label.setText(f"{fam}  exp {_int(st.combat_exp)}")
+        # 人物状态：🔴战斗 > 🟡忙碌 > 🟢空闲（GMCP fighting/in_combat/busy 三态可区分）
+        busy = getattr(st, "busy", None)
+        fighting = getattr(st, "fighting", None)
+        in_combat = getattr(st, "in_combat", None)
+        fighting_on = (fighting is not None and str(fighting).lower() == "true")
+        if fighting_on or in_combat:
+            state_text = "🔴 战斗"
+        elif busy is not None and str(busy).lower() == "true":
+            state_text = "🟡 忙碌"
+        else:
+            state_text = "🟢 空闲"
+        self.meta_label.setText(f"{fam}  exp {_int(st.combat_exp)}  {state_text}")
         self.qi_bar.setValue(_clamp(st.qi / st.max_qi if st.max_qi else 0))
         self.qi_bar.setFormat(f"{_int(st.qi)}/{_int(st.max_qi)}")
         self.nl_bar.setValue(_clamp(st.neili / st.max_neili if st.max_neili else 0))
@@ -126,17 +135,6 @@ class StateDock(QWidget):
         if getattr(st, "potential", None):
             parts.append(f"潜{_int(st.potential)}")
         self.attr_label.setText("  ".join(parts) if parts else "")
-
-        busy = getattr(st, "busy", None)
-        fighting = getattr(st, "fighting", None)
-        in_combat = getattr(st, "in_combat", None)
-        bits = []
-        if busy is not None and str(busy).lower() == "true":
-            bits.append("busy")
-        fighting_on = (fighting is not None and str(fighting).lower() == "true")
-        if fighting_on or in_combat:
-            bits.append("战斗中")
-        self.busy_label.setText(" ".join(bits) or "正常")
 
         spirit = getattr(st, "fighter_spirit", 0) or 0
         vig = getattr(st, "vigour", 0) or 0

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtCore import QEvent, QProcess, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QResizeEvent
 from PyQt6.QtWidgets import (QCheckBox, QDialog, QDockWidget, QLabel, QMainWindow,
                              QMessageBox, QProgressBar, QSizePolicy, QTabWidget, QToolBar,
@@ -225,6 +225,7 @@ class MainWindow(QMainWindow):
         pm.addAction("🔄 重置面板布局", self._reset_layout)
 
         tm = bar.addMenu("🛠️ 便捷工具")
+        tm.addAction("🗺 北侠查询", self._open_npc_query)
         tm.addAction("🔲 fullme 2×2（开 4 次）", self._full_me_4)
         tm.addAction("🌐 服务器环境变量", self._open_env_settings)
 
@@ -262,8 +263,6 @@ class MainWindow(QMainWindow):
         tb.addAction("🔗 别名", lambda: self._open_editor("alias"))
         tb.addAction("⏱ 定时器", lambda: self._open_editor("timer"))
         tb.addAction("🎬 宏", lambda: self._open_editor("macro"))
-        tb.addAction("🧩 节点图", self._open_node_editor)
-        tb.addAction("📜 脚本", lambda: self._open_editor("script"))
         tb.addSeparator()
         self._trg_on_act = tb.addAction("🟢 触发器")
         self._trg_on_act.setCheckable(True)
@@ -283,6 +282,7 @@ class MainWindow(QMainWindow):
         tb.addAction("📖 命令速查", self._toggle_dock(self.commands_dock))
         tb.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
         tb.addAction("👁 发现玩家", self._open_player_watch)
+        tb.addAction("🗺 北侠查询", self._open_npc_query)
         # 最右侧：屏显屏蔽便捷按钮（弹性占位把它推到工具栏右端）
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -390,8 +390,10 @@ class MainWindow(QMainWindow):
 
     def _on_map_pushed(self, payload: dict) -> None:
         account = payload.get("account")
-        if account is not None and self.session is not None and account != self.session.account_id:
-            return
+        tab = self._cur_tab
+        cur_sid = getattr(getattr(tab, "session", None), "account_id", None)
+        if account is not None and cur_sid is not None and account != cur_sid:
+            return  # 其他账号的移动不刷新当前标签地图
         self.map_dock.widget().map_view.reload()
         self.nav_dock.widget()._refresh_from_cache()
 
@@ -654,6 +656,27 @@ class MainWindow(QMainWindow):
         tab = self._tab()
         session = tab.session if tab else None
         PlayerWatchDialog(session, self).exec()
+
+    def _open_npc_query(self) -> None:
+        """便捷工具→北侠查询：调起独立小程序 EasyBXbQuery.exe（内嵌浏览器打开
+        NPC/房间查询看板）。exe 放在 %APPDATA%\\XkxClient\\ 下；打包版也查找
+        主程序同目录。主客户端不含 QtWebEngine，体积不膨胀。"""
+        import sys as _sys
+        from pathlib import Path
+
+        root = cfg.ConfigManager.instance().root
+        candidates = [root / "EasyBXbQuery.exe"]
+        if getattr(_sys, "frozen", False):
+            candidates.append(Path(_sys.executable).parent / "EasyBXbQuery.exe")
+        exe = next((p for p in candidates if p and p.exists()), None)
+        if exe is None:
+            QMessageBox.information(
+                self, "北侠查询",
+                "未找到北侠查询小程序（EasyBXbQuery.exe）。\n\n"
+                f"请把该文件放到：{root}")
+            return
+        if not QProcess.startDetached(str(exe)):
+            QMessageBox.warning(self, "北侠查询", f"启动失败：{exe}")
 
     def _toggle_chat(self) -> None:
         pass  # B5e：聊天栏恒开，无总开关

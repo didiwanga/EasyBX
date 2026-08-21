@@ -26,6 +26,9 @@ class MapDock(QWidget):
         self.cache = getattr(session, "map_cache", None) if session else None
         self.map_view = LocalMapWidget(self.cache)
         self._plan_route: list[str] | None = None
+        self._plan_maze = False
+        self._plan_maze_hint = ""
+        self._plan_maze_text = ""
 
         self.cur_label = QLabel("当前位置: -")
         self.target = QLineEdit()
@@ -111,6 +114,11 @@ class MapDock(QWidget):
                 route = self._choose_target(target, cands)
         if route is None:
             route = self._find_route(target)  # 本地无路/被取消 -> 服务端兜底
+        self._plan_maze = False
+        self._plan_maze_hint = ""
+        self._plan_maze_text = ""
+        if route is None:
+            route = self._plan_maze_route(target)  # 地图无路 -> 迷宫直达路径兜底
         self._plan_route = route
         self.go_btn.setEnabled(False)
         if route is None:
@@ -120,15 +128,61 @@ class MapDock(QWidget):
         if not route:
             self.path_label.setText(f"已在目标房间: {target}")
         else:
-            start_name = self.cache.current or "当前位置"
+            start_name = (self.cache.current if self.cache is not None else "") or "当前位置"
+            head = "迷宫直达" if self._plan_maze else ""
             self.path_label.setText(
-                f"{start_name} → {target}（{len(route)} 步）: " + " → ".join(route))
-        self.cur_label.setText(f"已规划 → {target}（{len(route)} 步）")
+                f"{head}{start_name} → {target}（{len(route)} 步）: " + " → ".join(route))
+            if self._plan_maze_hint:
+                self.path_label.setText(
+                    self.path_label.text() + f"\n{self._plan_maze_hint}")
+            if self._plan_maze_text:
+                self.path_label.setText(
+                    self.path_label.text() + f"\n说明：{self._plan_maze_text}")
+        self.cur_label.setText(f"已规划{'(迷宫)' if self._plan_maze else ''} → {target}（{len(route)} 步）")
         self.go_btn.setEnabled(True)
 
+    def _plan_maze_route(self, target: str) -> list[str] | None:
+        """地图/服务端都无路时，查迷宫路径大全：可走路径直接可走，纯说明显示文字。"""
+        from xkxclient.core.mazeroutes import find_maze
+        entries = find_maze(target)
+        if not entries:
+            return None
+        walkable = [e for e in entries if e.get("steps")]
+        guides = [e for e in entries if not e.get("steps")]
+        if not walkable:
+            # 只有文字说明的迷宫（靠 look 反复尝试）
+            self._plan_maze = False
+            self.cur_label.setText(f"{target} 迷宫说明")
+            self.path_label.setText("；".join(g.get("text", "") for g in guides))
+            self._plan_route = None
+            return None
+        entry = walkable[0]
+        if len(walkable) > 1:
+            labels = [f"{e.get('region', '')} {e.get('from', '')} → {e.get('to', '')}"
+                      for e in walkable]
+            chosen, ok = QInputDialog.getItem(
+                self, "迷宫直达路径",
+                f"「{target}」有 {len(walkable)} 条预置走法，请选择起点：",
+                labels, 0, False)
+            if not ok or chosen is None:
+                return None
+            entry = walkable[labels.index(chosen)]
+        self._plan_maze = True
+        self._plan_maze_hint = entry.get("hint") or f"起点：{entry.get('from', '')}"
+        self._plan_maze_text = entry.get("text") or ""
+        return list(entry.get("steps") or [])
+
     def _on_go(self) -> None:
-        """开始行走已规划的路径。"""
+        """开始行走已规划的路径。迷宫直达走 MazeWalker，其余走 Navigator。"""
         if self.session is None or not self._plan_route:
+            return
+        if self._plan_maze:
+            mw = getattr(self.session, "maze_walker", None)
+            if mw is None:
+                return
+            self.go_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            mw.start(self._plan_route)
             return
         nav = self.session.navigator
         if nav is None:
@@ -197,6 +251,9 @@ class MapDock(QWidget):
     def _on_stop(self) -> None:
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.stop()
+        mw = getattr(self.session, "maze_walker", None)
+        if mw is not None and getattr(mw, "running", False):
+            mw.stop()
         self.stop_btn.setEnabled(False)
         self.go_btn.setEnabled(bool(self._plan_route))
 

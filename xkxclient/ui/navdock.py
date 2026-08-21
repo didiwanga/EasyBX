@@ -440,6 +440,9 @@ class NavDock(QWidget):
         nav = getattr(self.session, "navigator", None)
         if nav is not None and getattr(nav, "running", False):
             return True
+        mw = getattr(self.session, "maze_walker", None)
+        if mw is not None and getattr(mw, "running", False):
+            return True
         macros = getattr(self.session, "macros", None)
         if macros is not None and getattr(macros, "is_running", lambda: False)():
             return True
@@ -566,6 +569,9 @@ class NavDock(QWidget):
     def _on_stop(self) -> None:
         if self.session is not None and self.session.navigator is not None:
             self.session.navigator.stop()
+        mw = getattr(self.session, "maze_walker", None)
+        if mw is not None and getattr(mw, "running", False):
+            mw.stop()
         self.stop_btn.setEnabled(False)
 
     # ---- 内建路径：服务器 walk 命令列表 ----

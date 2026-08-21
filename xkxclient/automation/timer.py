@@ -193,10 +193,11 @@ class TimerEngine(QObject):
                 td.enabled = False
                 self._fire(name)
             return
-        if td.next_at == 0.0:
-            td.next_at = self._next_due(sched, now)
-            if td.next_at is None:
-                return
+        if td.next_at == 0.0 or td.next_at is None:
+            nxt = self._next_due(sched, now)
+            if nxt is None:
+                return  # 配置缺失/非法：不存 None（否则下轮 now < None TypeError 崩进程），下轮重算
+            td.next_at = nxt
         if now < td.next_at:
             return
         td.last_at = now
@@ -204,7 +205,8 @@ class TimerEngine(QObject):
         if stype == "once":
             td.enabled = False
         else:
-            td.next_at = self._next_due(sched, td.next_at)
+            nxt = self._next_due(sched, td.next_at)
+            td.next_at = nxt if nxt is not None else 0.0
 
     @staticmethod
     def _parse_once(once) -> float | None:

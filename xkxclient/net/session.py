@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -121,9 +121,10 @@ class AccountSession(QObject):
         self.history = HistoryStore(account_id)
         self.look_parser = LookParser(app.bus)
         self.map_cache = MapCache(app.bus, account_id, self)
-        from xkxclient.core.map import LookCapture, Navigator
+        from xkxclient.core.map import LookCapture, MazeWalker, Navigator
         self.look_capture = LookCapture(app.bus, self.map_cache, self)
         self.navigator = Navigator(self.map_cache, self, app.bus, self)
+        self.maze_walker = MazeWalker(self, app.bus, self)
         self.auto_look = ConfigManager.instance().get("map.auto_look", False)
         # 地图上下端同步（mapsync.py）：登录后拉全量、行走上报、定时拉增量
         self.map_sync = MapSync(
@@ -315,7 +316,6 @@ class AccountSession(QObject):
                 self.app.bus.publish("ui.message", account=self.account_id, message=str(result))
             return
         self._track_pending(text)
-        from xkxclient.core.specialcmd import build_items, is_special
         # 逐段（; 分隔）展开别名：支持 `a1;a2` 一次执行多个别名
         raw = [p.strip() for p in text.split(";") if p.strip()]
         pieces: list[str] = []
@@ -349,7 +349,8 @@ class AccountSession(QObject):
             return
         from xkxclient.net.ansi import Span
 
-        self.line_displayed.emit([Span("> " + t)], False)
+        # 灰色回显：与服务器正文区分，避免误认成游戏输出
+        self.line_displayed.emit([Span("> " + t, fg="808080")], False)
 
     def _send_pieces(self, pieces: list[str]) -> None:
         """把命令片段（已别名展开）发往服务器。

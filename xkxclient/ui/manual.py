@@ -108,5 +108,10 @@ class LuaManualDialog(QDialog):
             session = getattr(parent, "_cur_tab", None)
             if session is not None:
                 session = session.session
+            if session is None:
+                # 无标签页（未登录任何账号）：ScriptEditor 首行就访问 session.app 会崩
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(parent, "Lua 脚本", "请先登录一个账号再打开脚本编辑器。")
+                return
             w = ScriptEditor(session, parent)
             w.show()

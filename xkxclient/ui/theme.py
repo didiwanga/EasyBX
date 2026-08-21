@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from xkxclient.core.config import ConfigManager
@@ -265,10 +266,8 @@ QProgressBar::chunk {{ background: {accent}; }}
 """
 
 
-def _build_palette(p: dict[str, str]) -> "QPalette":
+def _build_palette(p: dict[str, str]) -> QPalette:
     """把颜色令牌同时写进 QPalette，保证未被 QSS 覆盖的控件也随主题变色。"""
-    from PyQt6.QtGui import QColor, QPalette
-
     pal = QPalette()
     text = QColor(p.get("text", "#e0e0e0"))
     dim = QColor(p.get("text_dim", "#9aa0a3"))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -30,9 +32,10 @@ class ScreenBlockDialog(QDialog):
         self.rules: list[dict] = [dict(r) for r in (self.config.get("screen_block") or [])]
 
         self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         add_btn = QPushButton("添加")
         edit_btn = QPushButton("编辑")
-        del_btn = QPushButton("删除")
+        del_btn = QPushButton("删除选中")
         add_btn.clicked.connect(self._add)
         edit_btn.clicked.connect(self._edit)
         del_btn.clicked.connect(self._delete)
@@ -41,8 +44,7 @@ class ScreenBlockDialog(QDialog):
         btn_row.addWidget(add_btn)
         btn_row.addWidget(edit_btn)
         btn_row.addWidget(del_btn)
-
-        close_btn = QPushButton("关闭")
+        btn_row.addWidget(close_btn := QPushButton("关闭"))
         close_btn.clicked.connect(self.accept)
         lay = QVBoxLayout(self)
         lay.addWidget(self.list, 1)
@@ -108,10 +110,24 @@ class ScreenBlockDialog(QDialog):
             self.list.setCurrentRow(idx)
 
     def _delete(self) -> None:
-        idx = self._selected()
-        if idx >= 0 and idx < len(self.rules):
-            self.rules.pop(idx)
-            self._refresh()
+        rows = sorted({self.list.row(i) for i in self.list.selectedItems()})
+        if not rows:
+            idx = self._selected()
+            if idx >= 0 and idx < len(self.rules):
+                rows = [idx]
+        for i in reversed(rows):
+            if 0 <= i < len(self.rules):
+                self.rules.pop(i)
+        self._refresh()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Delete:
+            self._delete()
+            return
+        if event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.list.selectAll()
+            return
+        super().keyPressEvent(event)
 
     def accept(self) -> None:
         self.config.set("screen_block", [dict(r) for r in self.rules])

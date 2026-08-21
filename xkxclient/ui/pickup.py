@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QHBoxLayout,
@@ -35,6 +36,7 @@ class AutoPickupDialog(QDialog):
         self.enabled_cb.setChecked(bool(cfg.get("enabled", False)))
 
         self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         hint = QLabel("物品显示为「中文名(英文名)」如 石炭(Shi tan)。可填中文名或英文名，"
                       "命中后自动发送 get <英文名>。")
         hint.setWordWrap(True)
@@ -81,14 +83,22 @@ class AutoPickupDialog(QDialog):
         self.input.setFocus()
 
     def _delete(self) -> None:
-        row = self.list.currentRow()
-        if 0 <= row < len(self.items):
-            self.items.pop(row)
-            self._refresh()
+        rows = sorted({self.list.row(i) for i in self.list.selectedItems()})
+        if not rows:
+            row = self.list.currentRow()
+            if 0 <= row < len(self.items):
+                rows = [row]
+        for i in reversed(rows):
+            if 0 <= i < len(self.items):
+                self.items.pop(i)
+        self._refresh()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Delete:
             self._delete()
+            return
+        if event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.list.selectAll()
             return
         super().keyPressEvent(event)
 

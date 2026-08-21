@@ -559,17 +559,41 @@ class _EditorBase(QDialog):
                                  d.get("graph") or None, self, on_saved=_on_saved)
         editor.show()
 
+    def _set_item_state(self, idx: int, on: bool) -> None:
+        """原地更新指定条目的启停外观（灰字），不重建整棵树。
+
+        重建整树会重置滚动/选择，导致紧随其后的右键（直接再右键另一条）落到
+        错误行上、看起来像是「没保存」；原地更新则保持列表位置与选中不变。
+        """
+        from PyQt6.QtGui import QColor
+        from PyQt6.QtWidgets import QApplication
+        pal = QApplication.palette(self.item_list)
+        color = (QColor(150, 150, 150) if not on
+                 else pal.color(pal.ColorRole.Text))
+        def walk(node: QTreeWidgetItem) -> bool:
+            for i in range(node.childCount()):
+                child = node.child(i)
+                if child.data(0, Qt.ItemDataRole.UserRole) == idx:
+                    child.setForeground(0, color)
+                    return True
+                if walk(child):
+                    return True
+            return False
+        for i in range(self.item_list.topLevelItemCount()):
+            if walk(self.item_list.topLevelItem(i)):
+                return
+
     def _group_toggle(self, group: str, on: bool) -> None:
-        for d in self.items:
+        for i, d in enumerate(self.items):
             if (d.get("group") or "").strip() == group:
                 d["enabled"] = on
-        self._refresh()
+                self._set_item_state(i, on)
         self._persist()
 
     def _single_toggle(self, idx: int, on: bool) -> None:
         if 0 <= idx < len(self.items):
             self.items[idx]["enabled"] = on
-        self._refresh()
+            self._set_item_state(idx, on)
         self._persist()
 
     def _on_select(self, cur, _prev) -> None:
@@ -2057,6 +2081,14 @@ class StepDialog(QDialog):
             return f"跳转: {a.get('target', '')}"
         if t == "macro":
             return f"宏控制: {'重置宏' if a.get('op') == 'reset' else '终止宏'}"
+        if t == "if_reserved":
+            def _br(b):
+                if not (b or {}).get("target"):
+                    return "无"
+                kind = "跳转" if b.get("kind") == "jump" else "命令"
+                return f"{kind}「{b.get('target')}」"
+            return (f"判断<{a.get('var', '')}> {a.get('op', '=')} {a.get('value', '')}"
+                    f" · 真:{_br(a.get('then'))} 假:{_br(a.get('else'))}")
         return str(a)
 
     def _rs_act_refresh(self) -> None:
@@ -2066,11 +2098,13 @@ class StepDialog(QDialog):
 
     def _rs_act_dlg(self, cur: dict | None = None) -> dict | None:
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        from xkxclient.automation.runner import RESERVED_VARS
         dlg = QDialog(self)
         dlg.setWindowTitle("常驻触发动作")
         type_cb = QComboBox()
         for code, lab in [("cmd", "发送命令"), ("delay", "延时(ms)"), ("set", "变量赋值"),
-                          ("jump", "跳转步骤/标签"), ("macro", "宏控制")]:
+                          ("jump", "跳转步骤/标签"), ("macro", "宏控制"),
+                          ("if_reserved", "判断保留变量")]:
             type_cb.addItem(lab, code)
         ed = QLineEdit()
         ed.setPlaceholderText("命令 / 延时毫秒 / {变量}=值 / 步骤序号或标签")
@@ -2078,16 +2112,55 @@ class StepDialog(QDialog):
         for code, lab in [("terminate", "终止宏"), ("reset", "重置宏(清空状态/缓存)")]:
             macro_cb.addItem(lab, code)
 
+        # 判断保留变量：下拉选择保留变量名 + 比较 + 真假分支去向
+        iv_var = QComboBox()
+        for name in RESERVED_VARS:
+            iv_var.addItem(f"<{name}>", name)
+        iv_op = QComboBox()
+        for op, lab in _STATUS_OPS:
+            iv_op.addItem(lab, op)
+        iv_val = QLineEdit()
+        iv_val.setPlaceholderText("比较值")
+        iv_then_kind = QComboBox()
+        for code, lab in [("jump", "跳转"), ("cmd", "命令")]:
+            iv_then_kind.addItem(lab, code)
+        iv_then_tgt = QLineEdit()
+        iv_then_tgt.setPlaceholderText("跳转标签/步骤序号 或 命令")
+        iv_else_kind = QComboBox()
+        for code, lab in [("jump", "跳转"), ("cmd", "命令")]:
+            iv_else_kind.addItem(lab, code)
+        iv_else_tgt = QLineEdit()
+        iv_else_tgt.setPlaceholderText("跳转标签/步骤序号 或 命令")
+
+        iv_w = QWidget()
+        iv_f = QFormLayout(iv_w)
+        iv_f.setContentsMargins(0, 0, 0, 0)
+        op_row = QHBoxLayout()
+        op_row.addWidget(iv_op)
+        op_row.addWidget(iv_val, 1)
+        then_row = QHBoxLayout()
+        then_row.addWidget(iv_then_kind)
+        then_row.addWidget(iv_then_tgt, 1)
+        else_row = QHBoxLayout()
+        else_row.addWidget(iv_else_kind)
+        else_row.addWidget(iv_else_tgt, 1)
+        iv_f.addRow("保留变量", iv_var)
+        iv_f.addRow("比较", op_row)
+        iv_f.addRow("真 → 去向", then_row)
+        iv_f.addRow("假 → 去向", else_row)
+
         def sync(idx: int) -> None:
-            is_macro = type_cb.itemData(idx) == "macro"
-            ed.setVisible(not is_macro)
-            macro_cb.setVisible(is_macro)
+            t = type_cb.itemData(idx)
+            ed.setVisible(t in ("cmd", "delay", "set", "jump"))
+            macro_cb.setVisible(t == "macro")
+            iv_w.setVisible(t == "if_reserved")
         type_cb.currentIndexChanged.connect(sync)
 
         form = QFormLayout()
         form.addRow("类型", type_cb)
         form.addRow("参数", ed)
         form.addRow(macro_cb)
+        form.addRow(iv_w)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                QDialogButtonBox.StandardButton.Cancel, dlg)
         box.accepted.connect(dlg.accept)
@@ -2100,6 +2173,16 @@ class StepDialog(QDialog):
             type_cb.setCurrentIndex(max(0, type_cb.findData(cur.get("type", "cmd"))))
             if cur.get("type") == "macro":
                 macro_cb.setCurrentIndex(max(0, macro_cb.findData(cur.get("op", "terminate"))))
+            elif cur.get("type") == "if_reserved":
+                iv_var.setCurrentIndex(max(0, iv_var.findData(cur.get("var", ""))))
+                iv_op.setCurrentIndex(max(0, iv_op.findData(cur.get("op", "="))))
+                iv_val.setText(str(cur.get("value", "")))
+                tn = cur.get("then") or {}
+                iv_then_kind.setCurrentIndex(max(0, iv_then_kind.findData(tn.get("kind", "jump"))))
+                iv_then_tgt.setText(str(tn.get("target", "")))
+                el = cur.get("else") or {}
+                iv_else_kind.setCurrentIndex(max(0, iv_else_kind.findData(el.get("kind", "jump"))))
+                iv_else_tgt.setText(str(el.get("target", "")))
             elif cur.get("type") == "cmd":
                 ed.setText(cur.get("command", ""))
             elif cur.get("type") == "delay":
@@ -2114,6 +2197,12 @@ class StepDialog(QDialog):
         t = type_cb.currentData()
         if t == "macro":
             return {"type": "macro", "op": macro_cb.currentData()}
+        if t == "if_reserved":
+            return {"type": "if_reserved",
+                    "var": iv_var.currentData(), "op": iv_op.currentData(),
+                    "value": iv_val.text().strip(),
+                    "then": {"kind": iv_then_kind.currentData(), "target": iv_then_tgt.text().strip()},
+                    "else": {"kind": iv_else_kind.currentData(), "target": iv_else_tgt.text().strip()}}
         text = ed.text().strip()
         if t == "cmd":
             return {"type": "cmd", "command": text}

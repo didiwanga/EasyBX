@@ -289,12 +289,16 @@ class MacroEngine(QObject):
         self._captcha_sub: Callable | None = None           # net.text_display 订阅
         self._captcha_timer: QTimer | None = None           # 3s 检测窗口
         self._captcha_win = None                            # 验证码窗口引用（防 GC）
+        self.headless = False                               # 无头模式：验证码不弹窗，交由外部处理
+        self._captcha_url: str | None = None                # 无头模式验证码图片 URL
+        self._captcha_var: str | None = None                # 无头模式验证码变量名
         self._call_stack: dict[str, list[int]] = {}         # 调用触发返回栈（每宏一个栈）
         self._move_log: dict[str, list[dict]] = {}          # 移动日志：name -> [(dir, from_room, to_room), ...]
         self._wait_cleanup: dict[str, Callable] = {}        # 移动并触发等待清理器（停止/终止时解除订阅）
         self._recursion_depth: dict[str, int] = {}          # _step 递归深度保护（jump 成环兜底）
         self._resident_subs: dict[str, Callable] = {}       # 常驻触发：宏名 -> net.text_display 订阅句柄
         self._resident_running: dict[str, bool] = {}        # 常驻触发动作执行中标记（防重入）
+        self._resident_gen: dict[str, int] = {}             # 常驻动作链代际号：stop/新命中使旧延时链失效
 
     def load(self, definitions: list[dict]) -> None:
         self.macros = {}
@@ -412,6 +416,7 @@ class MacroEngine(QObject):
         for name in list(self._resident_subs.keys()):
             self._clear_resident(name)
         self._resident_running.clear()
+        self._resident_gen.clear()  # 作废所有挂起的常驻延时动作链
         self._waiting = None
         if names:
             self.bus.publish("macro.stop", account=self.session.account_id, names=names)
@@ -809,10 +814,13 @@ class MacroEngine(QObject):
             self._trigger_timer.timeout.connect(lambda: finish(False))
             self._trigger_timer.start(timeout_ms)
 
-        # 周期重发：每 delay_ms 未命中则重发命令
+        # 周期重发：每 delay_ms 未命中则重发命令（暂停/已停时不发）
         if delay_ms > 0:
-            self._arm_timer(name, delay_ms, lambda: (send_cmd() if not done[0] else None),
-                            repeat=True)
+            def _resend():
+                if done[0] or name not in self._active or name in self._paused:
+                    return
+                send_cmd()
+            self._arm_timer(name, delay_ms, _resend, repeat=True)
 
     def _hit_match(self, c: dict, line: str) -> bool:
         from xkxclient.automation.trigger import Trigger
@@ -1079,7 +1087,11 @@ class MacroEngine(QObject):
                 return
             # 原地延时重发原命令（走完整 wait：订阅触发 + GMCP）。
             # 停顿 _RETRY_WAIT_MS 覆盖泼皮 busy 周期：busy 结束后重发即成功。
-            self._arm_timer(name, max(_RETRY_WAIT_MS, delay_ms), lambda: send(idx))
+            def _retry_send():
+                if done[0] or name not in self._active or name in self._paused:
+                    return  # 暂停/停止后不再重发移动命令
+                send(idx)
+            self._arm_timer(name, max(_RETRY_WAIT_MS, delay_ms), _retry_send)
 
         def finish() -> None:
             if done[0]:
@@ -1188,8 +1200,8 @@ class MacroEngine(QObject):
                 return
 
             def step_walk(i: int) -> None:
-                if name not in self._active:
-                    return
+                if name not in self._active or name in self._paused:
+                    return  # 暂停/停止后不再继续走位
                 if i >= len(steps):
                     on_done()
                     return
@@ -1385,6 +1397,23 @@ class MacroEngine(QObject):
         self._captcha_timer.start(timeout_ms)
 
     def _open_captcha_win(self, name: str, pos: int, var: str, url: str) -> None:
+        if self.headless:
+            # 无头模式：不弹 Qt 窗口，暴露状态并发事件，由外部（Web 控制台）输入
+            self._captcha_var = var
+            self._captcha_url = url
+            self.bus.publish("macro.captcha", account=self.session.account_id,
+                             name=name, var=var, url=url)
+            # 输入阶段超时兜底：Web 端一直不提交会永久占住单宏串行锁并抑制 fullme 弹窗
+            if self._captcha_timer is None:
+                self._captcha_timer = QTimer(self)
+                self._captcha_timer.setSingleShot(True)
+            try:
+                self._captcha_timer.timeout.disconnect()
+            except TypeError:
+                pass
+            self._captcha_timer.timeout.connect(lambda: self._input_timeout_captcha(name, pos))
+            self._captcha_timer.start(300_000)  # 5 分钟内须提交/取消
+            return
         from xkxclient.ui.fullme import CaptchaWindow
 
         def on_submit(code: str) -> None:
@@ -1407,6 +1436,39 @@ class MacroEngine(QObject):
         self._captcha_win.finished.connect(on_finished)
         self._captcha_win.show()
 
+    def resume_captcha(self, code: str) -> None:
+        """无头验证码提交：验证码写入变量并继续宏。"""
+        if self._captcha_wait is None:
+            return
+        name, pos = self._captcha_wait
+        var = self._captcha_var or "captcha"
+        self.session.vars[self._varname(var)] = code
+        self.session._macro_captcha_active = False
+        self._captcha_wait = None
+        self._captcha_url = None
+        self._captcha_var = None
+        if name in self._active:
+            self._goto(name, pos + 1)
+
+    def cancel_captcha(self) -> None:
+        """无头验证码取消：停止当前宏。"""
+        if self._captcha_wait is None:
+            return
+        self._captcha_wait = None
+        self._captcha_url = None
+        self._captcha_var = None
+        self.session._macro_captcha_active = False
+        self.stop()
+
+    def _input_timeout_captcha(self, name: str, pos: int) -> None:
+        """无头验证码输入超时：Web 端长时间未提交，取消并停止宏。"""
+        self._captcha_timer = None
+        if self._captcha_wait != (name, pos):
+            return  # 已提交/已取消：迟到超时无害
+        self.bus.publish("ui.message", account=self.session.account_id,
+                         message="宏验证码等待输入超时（5 分钟），已取消并停止宏")
+        self.cancel_captcha()
+
     def _timeout_captcha(self, name: str, pos: int) -> None:
         self._captcha_timer = None
         if self._captcha_sub is not None:
@@ -1415,10 +1477,13 @@ class MacroEngine(QObject):
         if self._captcha_wait != (name, pos):
             return
         self._captcha_wait = None
+        self._captcha_url = None
+        self._captcha_var = None
         self.session._macro_captcha_active = False
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(None, "验证码", "未检测到验证码链接，宏已停止。",
-                                QMessageBox.StandardButton.Ok)
+        if not self.headless:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(None, "验证码", "未检测到验证码链接，宏已停止。",
+                                    QMessageBox.StandardButton.Ok)
         self.stop()
 
     def _close_captcha(self) -> None:
@@ -1433,6 +1498,8 @@ class MacroEngine(QObject):
             self._captcha_win.close()
             self._captcha_win = None
         self._captcha_wait = None
+        self._captcha_url = None
+        self._captcha_var = None
         if getattr(self.session, "_macro_captcha_active", False):
             self.session._macro_captcha_active = False
 
@@ -1460,7 +1527,9 @@ class MacroEngine(QObject):
         if self._captcha_wait and self._captcha_wait[0] == name:
             self._close_captcha()
         self._clear_resident(name)
-        self._resident_running.pop(name, None)
+        # 注意：不清 _resident_running[name]——常驻命中后 _halt 是动作链执行的一部分，
+        # 此处清除会让 jump 重激活后的剩余动作失去重入保护；标志由
+        # _resident_done（动作链走完）/ stop（整体停止）/ terminate 分支负责清理。
         self.bus.publish("macro.end", account=self.session.account_id, name=name)
         # 宏停止（自然结束/中止）后清空节流队列：该宏注入的待发命令
         # （移动/延时串）不再需要，立即停发，避免「宏停了人物还在走」。
@@ -1512,7 +1581,13 @@ class MacroEngine(QObject):
                 # 步骤序号（1-based，来自 UI 下拉）→ 0-based 索引
                 target = max(0, int(target) - 1)
             else:
-                target = m.labels.get(target, 0)
+                # 标签不存在：告警并终止，而不是静默跳回步骤 0 形成死循环
+                if target not in m.labels:
+                    self.bus.publish("ui.message", account=self.session.account_id,
+                                     message=f"宏「{name}」跳转目标标签不存在：{target}，已停止")
+                    self._halt(name)
+                    return
+                target = m.labels[target]
         self._pos[name] = int(target)
         self._step(name)
 
@@ -1523,7 +1598,12 @@ class MacroEngine(QObject):
             if target.isdigit():
                 target = max(0, int(target) - 1)
             else:
-                target = m.labels.get(target, 0)
+                if target not in m.labels:
+                    self.bus.publish("ui.message", account=self.session.account_id,
+                                     message=f"宏「{name}」跳转目标标签不存在：{target}，已停止")
+                    self._halt(name)
+                    return
+                target = m.labels[target]
         idx = int(target)
         self._chain(name, ms, idx)
 
@@ -1700,7 +1780,7 @@ class MacroEngine(QObject):
             pass
 
         def go():
-            if name in self._active:
+            if name in self._active and name not in self._paused:
                 self._goto_branch(name, pos, branch)
         tm.timeout.connect(go)
         tm.start(ms)
@@ -1803,16 +1883,23 @@ class MacroEngine(QObject):
         actions = step.get("actions") or []
         self._exec_resident_actions(name, actions, 0)
 
-    def _exec_resident_actions(self, name: str, actions: list, idx: int) -> None:
+    def _exec_resident_actions(self, name: str, actions: list, idx: int,
+                               gen: int | None = None) -> None:
         """按顺序执行常驻触发动作列表；支持 命令/延时/跳转/宏控制/变量赋值。
-        宏已停止仍完整执行列表；跳转动作重新激活宏从目标步骤继续。"""
+        宏已停止仍完整执行列表；跳转动作重新激活宏从目标步骤继续。
+        gen 为动作链代际号：stop 或新命中会使旧链的挂起延时失效，不再继续执行。"""
+        if gen is None:
+            self._resident_gen[name] = self._resident_gen.get(name, 0) + 1
+            gen = self._resident_gen[name]
+        if self._resident_gen.get(name) != gen:
+            return  # 旧代际链：已被 stop/重新命中作废
         if idx >= len(actions):
             self._resident_done(name)
             return
         a = actions[idx] or {}
 
         def nxt():
-            self._exec_resident_actions(name, actions, idx + 1)
+            self._exec_resident_actions(name, actions, idx + 1, gen)
 
         t = a.get("type")
         if t == "cmd":
@@ -1832,25 +1919,23 @@ class MacroEngine(QObject):
             nxt()
         elif t == "jump":
             # 宏已被常驻触发停止：跳转动作重新激活宏并从目标步骤继续
-            m = self.macros.get(name)
-            target = a.get("target", "")
-            if m:
-                if isinstance(target, str) and target.isdigit():
-                    target = max(0, int(target) - 1)
-                elif isinstance(target, str):
-                    target = m.labels.get(target, 0)
-                self._pos[name] = int(target)
-                self._active[name] = m
-                self._loop_count = {k: v for k, v in self._loop_count.items() if k[0] != name}
-                self._paused.discard(name)
-                self._call_stack.pop(name, None)
-                # 常驻监听已被命中时的 _halt 清除：跳转重启宏后必须重新注册，
-                # 否则跳转到主流程步骤（跳过第一步 resident）会导致常驻失效
-                rs_step = next((s for s in m.steps if s.get("type") == "resident"), None)
-                if rs_step is not None:
-                    self._register_resident(name, rs_step)
-                self.bus.publish("macro.start", account=self.session.account_id, name=name)
-                self._step(name)
+            self._resident_jump(name, a.get("target", ""))
+            nxt()
+        elif t == "if_reserved":
+            # 判断保留变量：真/假分支各可 跳转步骤/标签 或 发送命令
+            from xkxclient.automation.runner import _reserved_value
+            var = str(a.get("var") or "")
+            cur = _reserved_value(self.session, var)
+            ok = self._cmp(str(cur or ""), a.get("op", "="), str(a.get("value", "")))
+            br = a.get("then") if ok else a.get("else")
+            br = br or {}
+            kind = br.get("kind")
+            target = str(br.get("target") or "")
+            if kind == "jump" and target:
+                self._resident_jump(name, target)
+            elif kind == "cmd" and target:
+                for cmd in split_commands(substitute(target, self.session.vars)):
+                    self.session.send_auto(cmd)
             nxt()
         elif t == "macro":
             op = a.get("op", "terminate")
@@ -1860,10 +1945,36 @@ class MacroEngine(QObject):
                     self.session.throttle.cancel_all()
                 except Exception:
                     pass
+            # 动作链到此终止：清防重入标志（_halt 不再代清），否则重启宏后常驻被旧标志挡住
+            self._resident_running.pop(name, None)
             self._halt(name)
             return
         else:
             nxt()
+
+    def _resident_jump(self, name: str, target) -> None:
+        """常驻触发动作中的跳转：重新激活宏并从目标步骤继续。
+        宏已被常驻触发停止：解析目标（标签/步骤序号）后重启宏；
+        常驻监听已在命中时被 _halt 清除，重启宏后必须重新注册，
+        否则跳转到主流程步骤（跳过第一步 resident）会导致常驻失效。"""
+        m = self.macros.get(name)
+        if m is None:
+            return
+        if isinstance(target, str):
+            if target.isdigit():
+                target = max(0, int(target) - 1)
+            else:
+                target = m.labels.get(target, 0)
+        self._pos[name] = int(target)
+        self._active[name] = m
+        self._loop_count = {k: v for k, v in self._loop_count.items() if k[0] != name}
+        self._paused.discard(name)
+        self._call_stack.pop(name, None)
+        rs_step = next((s for s in m.steps if s.get("type") == "resident"), None)
+        if rs_step is not None:
+            self._register_resident(name, rs_step)
+        self.bus.publish("macro.start", account=self.session.account_id, name=name)
+        self._step(name)
 
     def _resident_done(self, name: str) -> None:
         """常驻触发动作执行完毕：宏已被停止，无需恢复。"""
@@ -1884,7 +1995,6 @@ class MacroEngine(QObject):
         relation = step.get("relation", "or")
         delay_ms = int(step.get("delay_ms") or 0)
         timeout_ms = int(step.get("timeout_ms") or (step.get("timeout") or step.get("timeout_s") or 0) * 1000)
-        no_keyword = step.get("no_keyword") or {}
         done = [False]          # 命中防重入：同 hit/trigger 步骤对齐
         cond_hit_no_kw = [False]   # 条件命中过但无关键字命中（供超时可选操作判断）
 

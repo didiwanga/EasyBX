@@ -5,7 +5,6 @@ import re
 import time
 
 from PyQt6.QtCore import QBuffer, QObject, QTimer
-from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 
 from xkxclient.automation.runner import ActionRunner
 
@@ -20,8 +19,15 @@ _HOT_LIMIT = 30          # 窗口内触发次数上限
 
 
 def play_ding() -> None:
-    """播放一声合成「叮」（正弦衰减音，无需音频文件）。"""
+    """播放一声合成「叮」（正弦衰减音，无需音频文件）。
+
+    音频设备不可用（无头服务器缺 libGL / 无声卡）时静默降级为无操作。
+    """
     if _ding_players:
+        return
+    try:
+        from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+    except Exception:
         return
     sample_rate = 44100
     duration = 0.4
