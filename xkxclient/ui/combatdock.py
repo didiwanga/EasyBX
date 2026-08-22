@@ -54,6 +54,8 @@ class CombatAssistDock(QWidget):
     def __init__(self, session, parent=None) -> None:
         super().__init__(parent)
         self.session = session
+        self._engine = None
+        self._refresh_timer = None
         self.setMinimumWidth(240)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -160,7 +162,19 @@ class CombatAssistDock(QWidget):
         self.bind(session)
 
     # ---- 绑定 ----
+    def _unbind(self) -> None:
+        """解绑旧引擎：断开信号 + 停定时器（bind 前必须调用，防重复累积）。"""
+        old = getattr(self, "_engine", None)
+        if old is not None:
+            try:
+                old.msg_signal.disconnect(self._on_msg)
+            except (TypeError, RuntimeError):
+                pass
+        if self._refresh_timer is not None:
+            self._refresh_timer.stop()
+
     def bind(self, session) -> None:
+        self._unbind()
         self.session = session
         self._engine = getattr(session, "combat", None)
         if self._engine is None:
@@ -177,9 +191,10 @@ class CombatAssistDock(QWidget):
         self._engine.msg_signal.connect(self._on_msg)
 
         from PyQt6.QtCore import QTimer
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(500)
-        self._refresh_timer.timeout.connect(self._refresh)
+        if self._refresh_timer is None:
+            self._refresh_timer = QTimer(self)
+            self._refresh_timer.setInterval(500)
+            self._refresh_timer.timeout.connect(self._refresh)
         self._refresh_timer.start()
 
     def _refresh(self) -> None:
@@ -291,6 +306,8 @@ class CombatAssistDock(QWidget):
             self._engine.set_enabled(on)
 
     def _on_prep(self) -> None:
+        if self._engine is None:
+            return
         jifa = {}
         for seg in self.jifa_ed.text().split(";"):
             seg = seg.strip()
@@ -342,6 +359,8 @@ class CombatAssistDock(QWidget):
             self.preset_cb.addItem(pr.get("name") or "方案", pr)
 
     def _on_apply_preset(self) -> None:
+        if self._engine is None:
+            return
         pr = self.preset_cb.currentData()
         if not pr:
             return
@@ -360,6 +379,8 @@ class CombatAssistDock(QWidget):
         self.log_list.scrollToBottom()
 
     def _on_add(self) -> None:
+        if self._engine is None:
+            return
         step = self._step_form(None)
         if step:
             rot = list(self._engine.rotation) + [step]
@@ -367,6 +388,8 @@ class CombatAssistDock(QWidget):
             self._reload_steps()
 
     def _on_edit(self) -> None:
+        if self._engine is None:
+            return
         row = self.step_list.currentRow()
         if row < 0:
             return
@@ -378,6 +401,8 @@ class CombatAssistDock(QWidget):
             self._reload_steps()
 
     def _on_del(self) -> None:
+        if self._engine is None:
+            return
         row = self.step_list.currentRow()
         if row < 0:
             return
@@ -387,8 +412,5 @@ class CombatAssistDock(QWidget):
         self._reload_steps()
 
     def shutdown(self) -> None:
-        if self._engine is not None:
-            try:
-                self._engine.msg_signal.disconnect(self._on_msg)
-            except TypeError:
-                pass
+        self._unbind()
+        self._engine = None

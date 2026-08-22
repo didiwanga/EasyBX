@@ -5,6 +5,7 @@ import re
 from PyQt6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -26,10 +27,24 @@ _LUA_KEYWORDS = {
     "true", "until", "while",
 }
 
+_JS_KEYWORDS = {
+    "async", "await", "break", "case", "catch", "class", "const", "continue",
+    "default", "delete", "do", "else", "export", "extends", "false", "finally",
+    "for", "function", "if", "import", "in", "instanceof", "let", "new", "null",
+    "of", "return", "static", "super", "switch", "this", "throw", "true", "try",
+    "typeof", "undefined", "var", "void", "while", "yield",
+}
 
-class LuaHighlighter(QSyntaxHighlighter):
-    def __init__(self, doc) -> None:
+
+class _BaseHighlighter(QSyntaxHighlighter):
+    """通用着色：关键字/字符串/注释由子类给定规则表。"""
+
+    def __init__(self, doc, keywords: set[str], comment_prefixes: tuple[str, ...],
+                 string_re: str) -> None:
         super().__init__(doc)
+        self._kw = keywords
+        self._cm = comment_prefixes
+        self._string_re = string_re
         self._kw_fmt = QTextCharFormat()
         self._kw_fmt.setForeground(QColor("#569cd6"))
         self._str_fmt = QTextCharFormat()
@@ -40,16 +55,39 @@ class LuaHighlighter(QSyntaxHighlighter):
         self._num_fmt.setForeground(QColor("#b5cea8"))
 
     def highlightBlock(self, text: str) -> None:
-        for m in re.finditer(r"\"[^\"]*\"|'[^']*'|--.*$|\b\w+\b|\d+(?:\.\d+)?", text):
+        stripped = text.lstrip()
+        if any(stripped.startswith(p) for p in self._cm):
+            self.setFormat(0, len(text), self._cm_fmt)
+            return
+        # 字符串优先占位，避免其中单词被当关键字
+        spans: list[tuple[int, int]] = []
+        for m in re.finditer(self._string_re, text):
+            spans.append((m.start(), m.end()))
+            self.setFormat(m.start(), m.end() - m.start(), self._str_fmt)
+
+        def in_string(i: int) -> bool:
+            return any(a <= i < b for a, b in spans)
+
+        for m in re.finditer(r"\w+", text):
             tok = m.group(0)
-            if tok.startswith("--"):
-                self.setFormat(m.start(), len(tok), self._cm_fmt)
-            elif tok.startswith(("\"", "'")):
-                self.setFormat(m.start(), len(tok), self._str_fmt)
-            elif tok.isdigit() or re.fullmatch(r"\d+\.\d+", tok):
-                self.setFormat(m.start(), len(tok), self._num_fmt)
-            elif tok in _LUA_KEYWORDS:
+            if in_string(m.start()):
+                continue
+            if tok in self._kw:
                 self.setFormat(m.start(), len(tok), self._kw_fmt)
+            elif tok.isdigit():
+                self.setFormat(m.start(), len(tok), self._num_fmt)
+
+
+class LuaHighlighter(_BaseHighlighter):
+    def __init__(self, doc) -> None:
+        super().__init__(doc, _LUA_KEYWORDS, ("--",),
+                         r"\"[^\"]*\"|'[^']*'|\[\[[^\]]*\]\]")
+
+
+class JsHighlighter(_BaseHighlighter):
+    def __init__(self, doc) -> None:
+        super().__init__(doc, _JS_KEYWORDS, ("//",),
+                         r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`")
 
 
 class ScriptEditor(QDialog):
@@ -65,7 +103,7 @@ class ScriptEditor(QDialog):
         self.manager = session.app.scripts()
         self._current: str | None = None
         self._runner = None
-        self.setWindowTitle("Lua 脚本")
+        self.setWindowTitle("脚本（Lua / JavaScript）")
         self.resize(860, 620)
 
         # 左：脚本列表
@@ -89,6 +127,10 @@ class ScriptEditor(QDialog):
         # 右：属性 + 编辑器 + 输出 + 操作
         self.name_ed = QLineEdit()
         self.name_ed.setPlaceholderText("脚本名称")
+        self.lang_cb = QComboBox()
+        self.lang_cb.addItem("Lua", "lua")
+        self.lang_cb.addItem("JavaScript", "js")
+        self.lang_cb.currentIndexChanged.connect(self._on_lang_changed)
         self.enabled_chk = QCheckBox("启用（登录后自动运行）")
         self.enabled_chk.toggled.connect(self._on_enabled_toggled)
         self.timeout_sp = QSpinBox()
@@ -99,6 +141,8 @@ class ScriptEditor(QDialog):
         prop = QHBoxLayout()
         prop.addWidget(QLabel("名称"))
         prop.addWidget(self.name_ed, 1)
+        prop.addWidget(QLabel("语言"))
+        prop.addWidget(self.lang_cb)
         prop.addWidget(self.enabled_chk)
         prop.addWidget(QLabel("超时"))
         prop.addWidget(self.timeout_sp)
@@ -115,8 +159,8 @@ class ScriptEditor(QDialog):
         stop_btn = QPushButton("停止")
         pause_btn = QPushButton("暂停")
         save_btn = QPushButton("保存")
-        imp_btn = QPushButton("导入 .lua…")
-        exp_btn = QPushButton("导出 .lua…")
+        imp_btn = QPushButton("导入…")
+        exp_btn = QPushButton("导出…")
         run_btn.clicked.connect(self._run)
         stop_btn.clicked.connect(self._stop)
         pause_btn.clicked.connect(self._toggle_pause)
@@ -185,10 +229,28 @@ class ScriptEditor(QDialog):
         if not d:
             return
         self.name_ed.setText(name)
+        lang = str(d.get("lang") or "lua")
+        idx = 0 if lang == "lua" else 1
+        if self.lang_cb.currentIndex() != idx:
+            self.lang_cb.setCurrentIndex(idx)  # 触发 _on_lang_changed 换高亮器
+        else:
+            self._apply_highlighter(lang)
         self.editor.setPlainText(d.get("code") or "")
         self.enabled_chk.setChecked(bool(d.get("enabled", False)))
         self.timeout_sp.setValue(int((d.get("timeout") or 60) * 1000))
         self.output.setPlainText("")
+
+    def _on_lang_changed(self, _idx: int) -> None:
+        self._apply_highlighter(self._cur_lang())
+
+    def _cur_lang(self) -> str:
+        return self.lang_cb.currentData() or "lua"
+
+    def _apply_highlighter(self, lang: str) -> None:
+        want = JsHighlighter if lang == "js" else LuaHighlighter
+        if not isinstance(self.hl, want):
+            self.hl.deleteLater()
+            self.hl = want(self.editor.document())
 
     # ---- 操作 ----
     def _on_new(self) -> None:
@@ -218,8 +280,10 @@ class ScriptEditor(QDialog):
             return
         if self._current and name != self._current:
             self.manager.remove(self._current)
-        self.manager.save(name, self.editor.toPlainText(), timeout=self.timeout_sp.value() / 1000.0,
-                          enabled=self.enabled_chk.isChecked())
+        self.manager.save(name, self.editor.toPlainText(),
+                          timeout=self.timeout_sp.value() / 1000.0,
+                          enabled=self.enabled_chk.isChecked(),
+                          lang=self._cur_lang())
         self._current = name
         self._refresh_list(select=name)
 
@@ -261,8 +325,8 @@ class ScriptEditor(QDialog):
 
     def _toggle_pause(self) -> None:
         r = self.manager.runner(self.session.account_id, self._current) if self._current else None
-        if r is None:
-            return
+        if r is None or not hasattr(r, "request_data"):
+            return  # JS 宿主不支持暂停
         if r.request_data("_paused"):
             self.manager.resume(self.session.account_id, self._current)
             self.cur_btn.setText("暂停")
@@ -279,25 +343,32 @@ class ScriptEditor(QDialog):
             self._runner = None
 
     def _import(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入脚本", "", "Lua 脚本 (*.lua)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入脚本", "", "脚本 (*.lua *.js *.mjs);;Lua (*.lua);;JavaScript (*.js)")
         if path:
             try:
-                name = self.manager.import_lua(path)
+                name = self.manager.import_script(path)
             except OSError as exc:
                 QMessageBox.warning(self, "导入失败", str(exc))
                 return
             self._current = name
             self.name_ed.setText(name)      # 同步名字框，避免 _save_current 存成旧名
+            lang = self.manager.lang_of(name)
+            idx = 0 if lang == "lua" else 1
+            if self.lang_cb.currentIndex() != idx:
+                self.lang_cb.setCurrentIndex(idx)
             self.editor.setPlainText(self.manager.code_of(name))
             self._refresh_list(select=name)
 
     def _export(self) -> None:
         if not self._current:
             return
+        ext = ".js" if self._cur_lang() == "js" else ".lua"
+        flt = ("JavaScript (*.js)" if ext == ".js" else "Lua 脚本 (*.lua)")
         path, _ = QFileDialog.getSaveFileName(self, "导出脚本",
-                                              str(self._current + ".lua"), "Lua 脚本 (*.lua)")
+                                              str(self._current + ext), flt)
         if path:
-            self.manager.export_lua(self._current, path)
+            self.manager.export_script(self._current, path)
 
     def closeEvent(self, event) -> None:
         self._detach_runner()

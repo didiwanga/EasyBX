@@ -42,22 +42,43 @@ class ReservedVars(dict):
 
     def __setitem__(self, key, value) -> None:
         if key in RESERVED_VARS:
-            bus = getattr(getattr(self._session, "app", None), "bus", None)
-            if bus is not None:
-                try:
-                    bus.publish(
-                        "ui.message",
-                        account=getattr(self._session, "account_id", ""),
-                        message=f"「{key}」是客户端保留变量，只能调用不能赋值",
-                    )
-                except Exception:
-                    pass
+            self._warn_reserved(key)
             return
         super().__setitem__(key, value)
+
+    def _warn_reserved(self, key) -> None:
+        bus = getattr(getattr(self._session, "app", None), "bus", None)
+        if bus is not None:
+            try:
+                bus.publish(
+                    "ui.message",
+                    account=getattr(self._session, "account_id", ""),
+                    message=f"「{key}」是客户端保留变量，只能调用不能赋值",
+                )
+            except Exception:
+                pass
 
     def update(self, *args, **kwargs) -> None:
         for k, v in dict(*args, **kwargs).items():
             self[k] = v
+
+    def setdefault(self, key, default=None):
+        if key in RESERVED_VARS:
+            self._warn_reserved(key)
+            return self.get(key)
+        return super().setdefault(key, default)
+
+    def pop(self, key, *args):
+        if key in RESERVED_VARS:
+            self._warn_reserved(key)
+            return args[0] if args else None
+        return super().pop(key, *args)
+
+    def __delitem__(self, key) -> None:
+        if key in RESERVED_VARS:
+            self._warn_reserved(key)
+            return
+        super().__delitem__(key)
 
 
 def _reserved_value(session, name: str):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections import deque
 
@@ -17,7 +18,6 @@ from xkxclient.core.mapsync import MapSync
 from xkxclient.core.state import CharacterState
 from xkxclient.net.connection import Connection
 from xkxclient.parse.look import LookParser
-
 # 登录后统一发送一次的状态/频道开启指令（含 buff/move/combat/status + hp/score/look）
 _LOGIN_TUNES = ("tune gmcp buff on;tune gmcp move on;tune gmcp combat on;"
                 "tune gmcp status on;hp;score;look")
@@ -70,6 +70,27 @@ DEFAULT_PROMPTS = {
 # - 「您的英文名字（要注册新人物请输入new。）：编码已改为GBK。」（注册提示行，编码确认与提示合并在一行）
 # 均需识别为名字提示。
 _REAL_NAME_RE = re.compile(r"您的英文名字(?:\（[^）]*\）)?\s*：")
+
+
+class _MapMarshal(QObject):
+    """后台同步线程 → Qt 主线程执行器（信号队列化，fire-and-forget）。"""
+
+    _call = pyqtSignal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._call.connect(self._run)
+
+    @staticmethod
+    def _run(fn) -> None:
+        try:
+            fn()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def post(self, fn) -> None:
+        self._call.emit(fn)
 
 
 class AccountSession(QObject):
@@ -132,6 +153,10 @@ class AccountSession(QObject):
             on_status=lambda ok, err: self.app.bus.publish(
                 "map.sync_state", account=self.account_id, ok=ok, error=err))
         self._map_sync_timer: QTimer | None = None
+        self._map_sync_busy = False
+        # 主线程执行器：后台同步线程把「合并快照」这类缓存结构变更投递回
+        # 主线程执行（与行走采集/地图渲染/寻路互斥于事件循环，消除并发修改）
+        self._map_marshal = _MapMarshal(self)
 
         # 技能/look 文本捕获
         self._capture_skills = False
@@ -321,11 +346,12 @@ class AccountSession(QObject):
         pieces: list[str] = []
         for p in raw:
             expanded = self.aliases.expand(p)
-            if expanded:
+            if expanded is None:
+                pieces.append(p)  # 未命中任何别名
+            elif expanded:
+                # 命中替换别名；空串=回调型别名已消费，不再发送原文（脚本动态注册）
                 pieces.extend(c for cmd in expanded.split("\n")
                               for c in cmd.split(";") if c.strip())
-            else:
-                pieces.append(p)
         # 变量代入：命令框/快捷动作输入 `{变量}` 引用触发器/宏捕获的变量
         from xkxclient.automation.runner import substitute
         pieces = [substitute(p, self.vars) for p in pieces]
@@ -460,7 +486,8 @@ class AccountSession(QObject):
         text = "".join(s.text for s in spans)
         self.last_line = text
         self.app.bus.publish("net.text_display", account=self.account_id, line=text,
-                             segments=[{"t": s.text, "fg": s.fg, "bg": s.bg, "bold": s.bold}
+                             segments=[{"t": s.text, "fg": s.fg, "bg": s.bg,
+                                        "bold": s.bold, "blink": s.blink}
                                        for s in spans])
         self._maybe_tough(text)
         if self._login and not self._login.finished:
@@ -1094,7 +1121,7 @@ class AccountSession(QObject):
             cfg.save_account(self.account_id, data)
 
     def _on_gmcp(self, payload: bytes) -> None:
-        module, data = gmcp.parse_payload(payload)
+        module, data = gmcp.parse_payload(payload, self.connection.encoding)
         if module.startswith("GMCP."):
             module = module[len("GMCP."):]
         module = module.split(".", 1)[0]
@@ -1249,21 +1276,48 @@ class AccountSession(QObject):
         self._map_sync_worker(sync, full=False)
 
     def _map_sync_worker(self, sync, full: bool) -> None:
-        """后台线程执行同步（urllib 阻塞调用不入 UI 线程）。"""
+        """地图同步编排：网络阻塞在后台线程，缓存结构变更全部回主线程。
+
+        - 待上报导出在主线程完成（读 cache 与主线程采集互斥于事件循环）
+        - 合并快照经 _MapMarshal 投递回主线程执行
+        - _map_sync_busy 去重：上一轮未完成前跳过新触发，防线程堆积
+        """
+        if self._map_sync_busy:
+            return
+        self._map_sync_busy = True
+        try:
+            batches = sync.export_pending()
+        except Exception as exc:
+            sync._set_status(False, str(exc))
+            self._map_sync_busy = False
+            return
+
         def _run():
             try:
+                for pl in batches:
+                    resp = sync.send_report(pl)
+                    sync.commit(pl, resp)
                 if full:
                     snap = sync.pull(0)
-                    if snap.get("nodes") or snap.get("rooms"):
-                        sync.apply_snapshot(snap)
-                    sync._set_status(True)
                 else:
-                    sync.tick()
+                    snap = sync.pull()
+                sync._set_status(True)
+                if snap.get("nodes") or snap.get("rooms"):
+                    done = threading.Event()
+
+                    def on_main():
+                        try:
+                            sync.apply_snapshot(snap)
+                        finally:
+                            done.set()
+                    self._map_marshal.post(on_main)
+                    done.wait(60)
             except Exception as exc:
                 sync._set_status(False, str(exc))
-        import threading as _th
-        t = _th.Thread(target=_run, daemon=True)
-        t.start()
+            finally:
+                self._map_sync_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _stop_map_sync(self) -> None:
         if self._map_sync_timer is not None:

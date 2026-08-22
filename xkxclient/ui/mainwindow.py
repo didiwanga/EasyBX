@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         vm.addAction("🔗 别名", lambda: self._open_editor("alias"))
         vm.addAction("⏱ 定时器", lambda: self._open_editor("timer"))
         vm.addAction("🧩 节点图宏", self._open_node_editor)
-        vm.addAction("📜 Lua 脚本", lambda: self._open_editor("script"))
+        vm.addAction("📜 脚本（Lua/JS）", lambda: self._open_editor("script"))
         vm.addAction("🪣 自动拾取", self._open_auto_pickup)
         vm.addAction("👁 发现玩家", self._open_player_watch)
 
@@ -213,7 +213,7 @@ class MainWindow(QMainWindow):
         pm.addAction("🕹 移动控制", self._toggle_dock(self.move_dock))
         pm.addAction("▶️ 宏控制", self._toggle_dock(self.macro_dock))
         pm.addAction("🧭 导航目的地", self._toggle_dock(self.nav_dock))
-        pm.addAction("🗺️ 地图", self._toggle_dock(self.map_dock))
+        # 地图 dock 暂不开放：入口隐藏，dock 保持隐藏（内部数据绑定照常运行）
         pm.addAction("📝 记事本", self._toggle_dock(self.notepad_dock))
         pm.addAction("⏺ 宏录制", self._toggle_dock(self.recorder_dock))
         pm.addAction("🥊 自动战斗", self._toggle_dock(self.combat_dock))
@@ -444,6 +444,17 @@ class MainWindow(QMainWindow):
             return
         self.move_dock.widget().set_exits(payload.get("exits") or [])
 
+    def _replace_popup(self, attr: str, w) -> None:
+        """替换持有的弹窗引用：旧窗还开着就先关，避免引用被覆盖后
+        PyQt 直接销毁用户正在看的窗口。"""
+        old = getattr(self, attr, None)
+        if old is not None and old is not w:
+            try:
+                old.close()
+            except RuntimeError:
+                pass  # 旧窗已被销毁
+        setattr(self, attr, w)
+
     def _on_fullme_grid(self, payload: dict) -> None:
         if payload.get("account") != getattr(self._cur_tab, "account_id", None):
             return
@@ -452,7 +463,7 @@ class MainWindow(QMainWindow):
         session = self._cur_tab.session
         w = FullmeGridWindow(session, urls=payload.get("urls") or [])
         w._debug_log = lambda msg: self.status.showMessage(str(msg)[:140], 8000)
-        self._fullme_grid_win = w
+        self._replace_popup("_fullme_grid_win", w)
         w.show()
 
     def _on_login_done(self, payload: dict) -> None:
@@ -470,7 +481,7 @@ class MainWindow(QMainWindow):
         session = self._cur_tab.session
         w = HongbaoWindow(session, url=payload.get("url", ""))
         w._debug_log = lambda msg: self.status.showMessage(str(msg)[:120], 5000)
-        self._hongbao_win = w
+        self._replace_popup("_hongbao_win", w)
         w.show()
 
     def _on_map_sync_state(self, payload: dict) -> None:
@@ -496,7 +507,7 @@ class MainWindow(QMainWindow):
         session = self._cur_tab.session
         w = FullmeWindow(session, source=payload.get("source", "manual"), url=payload.get("url", ""))
         w._debug_log = lambda msg: self.status.showMessage(str(msg)[:120], 5000)
-        self._fullme_win = w
+        self._replace_popup("_fullme_win", w)
         w.show()
 
     def _on_throttle(self, payload: dict) -> None:
@@ -518,6 +529,14 @@ class MainWindow(QMainWindow):
 
     # ---- 动作 ----
     def add_account_tab(self, account_id: str, session) -> None:
+        # 同一账号已有标签：直接切换，禁止重复开（双标签共享 session 会互踩，
+        # 且关其一即 close 掉会话使另一标签变僵尸）
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, AccountTab) and t.account_id == account_id:
+                self.tabs.setCurrentIndex(i)
+                t.input_line.setFocus()
+                return
         tab = AccountTab(account_id, session)
         session.line_displayed.connect(tab.append_spans)
         session.channel_text.connect(tab.append_channel)
@@ -837,6 +856,9 @@ class MainWindow(QMainWindow):
                 self.restoreState(bytes.fromhex(raw))
             except (ValueError, TypeError):
                 pass
+        # 地图 dock 暂不开放（入口已隐藏）：无论历史布局存了什么状态，启动一律隐藏
+        self.map_dock.hide()
+        self.map_dock.toggleViewAction().setChecked(False)
         # 无已存布局：保持 __init__ 建立的默认布局（_apply_default_layout），
         # 不再用旧快照覆盖（旧快照可能固化了 dock 不显示的错误状态）。
         # 登录前主窗口未显示：仅隐藏浮动 dock（它是独立顶层窗口，停靠 dock 随

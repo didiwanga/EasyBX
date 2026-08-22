@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 from collections import deque
 
@@ -61,6 +62,7 @@ class OutputView(QPlainTextEdit):
 
     new_trigger_requested = pyqtSignal(str)
     screen_block_add_requested = pyqtSignal(str)
+    pickup_add_requested = pyqtSignal(str)      # 右键：添加到自动拾取
     search_requested = pyqtSignal(str)
     command_fill_requested = pyqtSignal(str)   # 右键：填写命令（仅填入命令框）
     command_send_requested = pyqtSignal(str)   # 右键：发送命令（填入并执行）
@@ -276,6 +278,13 @@ class OutputView(QPlainTextEdit):
     def _check_paging(self, text: str) -> None:
         if not _PAGE_RE.search(text):
             return
+        # 距上一页提示超过 5 秒视为新一轮输出：计数与开关复位，
+        # 避免跨任务累计满 20 页后自动翻页永久失效（长时间挂机必踩）
+        now = time.monotonic()
+        if now - getattr(self, "_last_page_ts", 0.0) > 5.0:
+            self._page_count = 0
+            self._auto_paging = True
+        self._last_page_ts = now
         if self._page_count >= _MAX_AUTO_PAGES:
             self._auto_paging = False
             self.autopage_hit.emit(self._page_count)
@@ -428,6 +437,10 @@ class OutputView(QPlainTextEdit):
         self._view_all = False
         self._following = True
         self._new_since_pause = 0
+        # 清屏即新一轮输出：翻页计数复位
+        self._page_count = 0
+        self._auto_paging = True
+        self._last_page_ts = 0.0
         self.new_btn.setVisible(False)
         super().clear()
 
@@ -454,6 +467,7 @@ class OutputView(QPlainTextEdit):
         menu.addAction("搜索…", lambda: self.search_requested.emit(raw))
         menu.addAction("新建触发器…", lambda: self.new_trigger_requested.emit(sel))
         menu.addAction("添加到屏显屏蔽", lambda: self.screen_block_add_requested.emit(sel))
+        menu.addAction("添加到自动拾取", lambda: self.pickup_add_requested.emit(sel))
         menu.addSeparator()
         menu.addAction("字体设置…", self._open_font_dialog)
         menu.addAction("清屏", self.clear)

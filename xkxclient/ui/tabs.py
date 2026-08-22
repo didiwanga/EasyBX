@@ -318,6 +318,7 @@ class AccountTab(QWidget):
 
         self.output.new_trigger_requested.connect(self._new_trigger)
         self.output.screen_block_add_requested.connect(self._add_screen_block)
+        self.output.pickup_add_requested.connect(self._add_pickup)
         self.output.search_requested.connect(lambda t: self.show_find())
         self.output.command_fill_requested.connect(self._fill_command)
         self.output.command_send_requested.connect(self._send_command)
@@ -375,6 +376,29 @@ class AccountTab(QWidget):
             cfg.set("screen_block", rules)
             self.session.reload_screen_block()
             msg = f"已添加到屏显屏蔽: {sel}（查看→屏显屏蔽 可编辑/删除）"
+        self.session.app.bus.publish("ui.message", account=self.account_id, message=msg)
+
+    def _add_pickup(self, sel: str) -> None:
+        """右键「添加到自动拾取」：选中文本作为物品名写入 auto_pickup 配置，
+        立即生效，并提示可在 工具栏→自动拾取 中编辑/删除。"""
+        sel = (sel or "").strip()
+        if not sel:
+            return
+        from xkxclient.core.config import ConfigManager
+        cfg = ConfigManager.instance()
+        data = dict(cfg.get("auto_pickup") or {})
+        items = [str(x) for x in (data.get("items") or [])]
+        if sel in items:
+            msg = f"已存在于自动拾取: {sel}"
+        else:
+            items.append(sel)
+            data["items"] = items
+            data.setdefault("enabled", True)
+            cfg.set("auto_pickup", data)
+            eng = getattr(self.session, "pickup", None)
+            if eng is not None:
+                eng.set_config(bool(data.get("enabled")), items)
+            msg = f"已添加到自动拾取: {sel}（工具栏→自动拾取 可编辑/删除）"
         self.session.app.bus.publish("ui.message", account=self.account_id, message=msg)
 
     def _fill_command(self, text: str) -> None:

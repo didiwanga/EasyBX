@@ -165,6 +165,7 @@ class FullmeGridWindow(QDialog):
     def __init__(self, session, urls: list[str] | None = None, parent=None) -> None:
         super().__init__(parent)
         self.session = session
+        self._closed = False  # closeEvent 置位：短路迟到的网络回调/重试
         # 服务器每次 fullme 只给 1 个链接，且该链接可被打开/刷新 4 次（3 分钟后失效）。
         # 因此取第一个有效链接，在 4 个格子各请求一次（内容相同，方便对图判断）。
         self._url = ""
@@ -285,10 +286,16 @@ class FullmeGridWindow(QDialog):
 
     def _retry_load(self, nam, url: str, label: QLabel, attempt: int) -> None:
         # DNS/网络偶发失败自动重试（初始请求后再重试 2 次），避免一闪而过的「无法解析地址」
-        if attempt >= 2:
+        if attempt >= 2 or getattr(self, "_closed", False):
             return
         backoff = [0, 500][attempt]
-        QTimer.singleShot(backoff, lambda: self._load_into(nam, url, label, attempt + 1))
+        QTimer.singleShot(backoff, lambda: self._retry_into(nam, url, label, attempt))
+
+    def _retry_into(self, nam, url: str, label: QLabel, attempt: int) -> None:
+        """延迟重试入口：窗口可能已关闭（C++ 对象销毁），短路防 RuntimeError。"""
+        if getattr(self, "_closed", False):
+            return
+        self._load_into(nam, url, label, attempt + 1)
 
     def _on_reply(self, reply: QNetworkReply, label: QLabel, attempt: int = 0) -> None:
         url = label.property("url") or ""
@@ -398,6 +405,7 @@ class FullmeGridWindow(QDialog):
             self.input_row.selectAll()
 
     def closeEvent(self, event) -> None:
+        self._closed = True  # 短路已排队的重试 singleShot（窗口销毁后回调会崩）
         if self._sub is not None:
             try:
                 self.session.app.bus.unsubscribe("net.text_display", self._sub)
@@ -455,7 +463,8 @@ class CaptchaWindow(FullmeGridWindow):
 
 class HongbaoWindow(FullmeGridWindow):
     """红包口令弹窗：检测到「在线发出红包…抢红包命令hongbao <口令>」时弹出，
-    展示口令图（同 fullme 图片加载），用户输入口令回车/发送即执行 `hongbao <口令>`。
+    展示口令图（同 fullme 图片加载），用户输入口令回车后向【所有已连接账号】
+    广播执行 `hongbao <口令>`——多开同时抢同一个红包。
 
     提交即发即关，不启用等待服务器回话模式。
     """
@@ -463,7 +472,7 @@ class HongbaoWindow(FullmeGridWindow):
     def __init__(self, session, url: str = "", parent=None) -> None:
         super().__init__(session, urls=[url] if url else [], parent=parent)
         self.setWindowTitle("红包口令")
-        self.desc_label.setText("输入口令后回车，自动发送 hongbao <口令>")
+        self.desc_label.setText("输入口令后回车，向所有已连接账号广播 hongbao <口令>")
         self.desc_label.show()
 
     def wait_result_enabled(self) -> bool:
@@ -475,5 +484,15 @@ class HongbaoWindow(FullmeGridWindow):
             return
         code = code.strip()
         self.input_row.clear()
-        self.session.send(f"hongbao {code}")
+        cmd = f"hongbao {code}"
+        n = 0
+        for s in list(getattr(self.session.app, "_sessions", {}).values()):
+            try:
+                if s is not None and getattr(s, "connected", False):
+                    s.send(cmd)
+                    n += 1
+            except Exception:
+                pass
+        if getattr(self, "_debug_log", None) is not None:
+            self._debug_log(f"红包口令已广播到 {n} 个已连接账号")
         self.close()

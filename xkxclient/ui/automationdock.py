@@ -865,6 +865,19 @@ class MacroRecorderDock(QWidget):
 
     # ---- 状态 ----
     def bind(self, session) -> None:
+        if self._recording and getattr(self, "session", None) is not None \
+                and session is not self.session:
+            # 录制中切换账号：先按原账号保存收尾，防止两账号命令混录、宏存错账号
+            try:
+                self._stop()
+            except Exception:
+                pass
+        prev = getattr(self, "session", None)
+        if prev is not None and prev is not session:
+            # 旧会话的录制钩子摘除，避免其命令继续进新录制
+            if getattr(prev, "_macro_recorder", None) is self._record:
+                prev._macro_recorder = None
+                prev._macro_recording = False
         self.session = session
         if session is not None:
             session._macro_recorder = self._record

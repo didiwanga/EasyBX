@@ -259,7 +259,11 @@ class NavDock(QWidget):
             "name": getattr(session, "room_name", "") or "",
             "exits": list(getattr(session, "exits", []) or []),
         })
+        # 捕获态复位：切账号时旧账号的 node/walk 捕获窗口与超时定时器
+        # 不应残留（否则超时回调会误操作新账号会话）
+        self._cap_timer.stop()
         self._capturing = False
+        self._walk_capturing = False
         # node/walk 列表改为手动获取：绑定账号、移动换房都不再自动刷新，
         # 需要时由用户点击「获取」按钮拉取，避免静默命令打断操作与产生噪声。
 

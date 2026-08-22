@@ -105,6 +105,7 @@ class Span:
     fg: str | None = None
     bg: str | None = None
     bold: bool = False
+    blink: bool = False
 
 
 def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
@@ -115,11 +116,12 @@ def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
     spans: list[Span] = []
     if not data:
         return spans
-    byte_runs: list[tuple[bytes, str | None, str | None, bool]] = []
+    byte_runs: list[tuple[bytes, str | None, str | None, bool, bool]] = []
     cur = bytearray()
     fg: str | None = None
     bg: str | None = None
     bold = False
+    blink = False
     i = 0
     n = len(data)
     while i < n:
@@ -134,7 +136,7 @@ def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
                 final = data[j]
                 # 先冲刷当前累积文本（使用旧颜色），再应用 SGR，
                 # 否则颜色码之前的文本会被错误染上新颜色。
-                byte_runs.append((bytes(cur), fg, bg, bold))
+                byte_runs.append((bytes(cur), fg, bg, bold, blink))
                 cur = bytearray()
                 if final == ord("m"):
                     params: list[int] = []
@@ -148,11 +150,15 @@ def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
                     while k < len(params):
                         p = params[k]
                         if p == 0:
-                            fg, bg, bold = None, None, False
+                            fg, bg, bold, blink = None, None, False, False
                         elif p == 1:
                             bold = True
+                        elif p == 5:
+                            blink = True
                         elif p == 22:
                             bold = False
+                        elif p == 25:
+                            blink = False
                         elif 30 <= p <= 37 or 90 <= p <= 97:
                             fg = _sgr_fg(params[k:])
                         elif p == 38:
@@ -177,11 +183,11 @@ def decode_runs(data: bytes, encoding: str = "gbk") -> list[Span]:
             cur.append(c)
             i += 1
     if cur:
-        byte_runs.append((bytes(cur), fg, bg, bold))
-    for raw, f, b, bo in byte_runs:
+        byte_runs.append((bytes(cur), fg, bg, bold, blink))
+    for raw, f, b, bo, bl in byte_runs:
         if not raw:
             continue
         if bo and f:
             f = _brighten(f)
-        spans.append(Span(raw.decode(encoding, errors="replace"), f, b, bo))
+        spans.append(Span(raw.decode(encoding, errors="replace"), f, b, bo, bl))
     return spans

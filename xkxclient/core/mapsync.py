@@ -25,7 +25,7 @@ import uuid
 
 from xkxclient.core.config import ConfigManager
 from xkxclient.core.map import _norm_dir
-from xkxclient.version import MAP_SYNC_BASE
+from xkxclient.version import MAP_SYNC_BASE, MAP_SYNC_TOKEN
 
 _DEFAULT_BASE = MAP_SYNC_BASE
 _TIMEOUT = 30
@@ -110,14 +110,21 @@ class MapSync:
                 pass
 
     # ---- 导出本地增量（分片）----
-    def _export_batch(self, limit: int = _PUSH_BATCH) -> dict:
+    def _export_batch(self, limit: int = _PUSH_BATCH,
+                      exclude_nodes: set | None = None,
+                      exclude_rooms: set | None = None) -> dict:
         """导出待上报变更中的一批（单批上限 limit），并顺带清除已失效的僵尸实例标记。
 
         由 MapCache 内部标记 changed 节点；这里构造上报 payload。
+        exclude_nodes/exclude_rooms：本轮预导出、尚未 commit 的 id（防重复取同一批）。
         """
         with self._lock:
             changed = set(getattr(self.cache, "changed_ids", set()))
             changed_rooms = set(getattr(self.cache, "changed_rooms", set()))
+        if exclude_nodes:
+            changed -= exclude_nodes
+        if exclude_rooms:
+            changed_rooms -= exclude_rooms
         dead = {nid for nid in changed if nid not in self.cache.nodes}
         if dead:
             with self._lock:
@@ -151,14 +158,54 @@ class MapSync:
             }
         return {"nodes": nodes, "rooms": rooms}
 
-    # ---- 上报 ----
-    def push(self) -> dict | None:
-        """上报本地增量到服务端（分片：一次只发一批，成功仅清已上报部分）。
+    # ---- 上报（导出/发送/提交三段式）----
+    def export_pending(self, max_batches: int = _PUSH_MAX_BATCHES) -> list[dict]:
+        """导出全部待上报批次。必须在 Qt 主线程调用：
+        读 cache.nodes/neighbors 与主线程行走采集并发，需互斥于事件循环。
 
-        服务器合并慢/网络抖动时只丢当前批，未上报部分保留重试，避免超大 payload
-        反复超时而永远传不完。成功返回最后一次服务端响应 {revision, ...}，失败抛
-        MapSyncError。
+        预导出模式：各批互不重叠（exclude 游标），commit 在发送成功后统一进行。
         """
+        out: list[dict] = []
+        ex_n: set = set()
+        ex_r: set = set()
+        for _ in range(max(1, max_batches)):
+            p = self._export_batch(exclude_nodes=ex_n, exclude_rooms=ex_r)
+            if not p["nodes"] and not p["rooms"]:
+                break
+            ex_n |= p["nodes"].keys()
+            ex_r |= p["rooms"].keys()
+            out.append(p)
+        return out
+
+    @staticmethod
+    def send_report(payload: dict) -> dict:
+        """网络发送单批上报（可在后台线程）。返回服务端响应。"""
+        body = {
+            "client_id": payload["client_id"],
+            "account": payload["account"],
+            "nodes": payload["nodes"],
+            "rooms": payload["rooms"],
+        }
+        req = urllib.request.Request(
+            payload["base"] + "/report",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        if MAP_SYNC_TOKEN:
+            req.add_header("X-Map-Token", MAP_SYNC_TOKEN)
+        return _read_json(req)
+
+    def commit(self, payload: dict, resp: dict | None) -> None:
+        """上报成功后清除已上报标记并推进 revision。
+        difference_update 为逐元素原子操作，可安全与主线程并发。"""
+        with self._lock:
+            self.cache.changed_ids.difference_update(payload["nodes"].keys())
+            self.cache.changed_rooms.difference_update(payload["rooms"].keys())
+        if resp:
+            self.last_rev = int(resp.get("revision") or self.last_rev)
+
+    def push(self) -> dict | None:
+        """上报本地增量到服务端（分片，交错导出→发送→提交）。同线程组合接口。"""
         if not self.active:
             return None
         last = None
@@ -166,37 +213,32 @@ class MapSync:
             payload = self._export_batch()
             if not payload["nodes"] and not payload["rooms"]:
                 break
-            body = {
-                "client_id": self.client_id,
-                "account": self.account,
-                "nodes": payload["nodes"],
-                "rooms": payload["rooms"],
-            }
-            req = urllib.request.Request(
-                self.base + "/report",
-                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                method="POST")
-            req.add_header("Content-Type", "application/json; charset=utf-8")
-            data = _read_json(req)
-            with self._lock:
-                self.cache.changed_ids.difference_update(payload["nodes"].keys())
-                self.cache.changed_rooms.difference_update(payload["rooms"].keys())
-            self.last_rev = int(data.get("revision") or self.last_rev)
+            data = self.send_report(self._with_meta(payload))
+            self.commit(payload, data)
             self._set_status(True)
             last = data
-            with self._lock:
-                remaining = (len(getattr(self.cache, "changed_ids", set()))
-                             + len(getattr(self.cache, "changed_rooms", set())))
-            if remaining <= 0:
-                break
         return last
+
+    def _with_meta(self, payload: dict) -> dict:
+        payload.setdefault("client_id", self.client_id)
+        payload.setdefault("account", self.account)
+        payload.setdefault("base", self.base)
+        return payload
 
     # ---- 拉取 ----
     def pull(self, since: int | None = None) -> dict:
-        """拉取服务端增量（since<=0 全量）。返回 {revision, nodes, rooms}。"""
+        """拉取服务端增量（since<=0 全量）。返回 {revision, nodes, rooms}。
+
+        增量拉取带 lite=1：服务端 rooms 只回最近窗口内变更的（rooms 无
+        revision 号，全量 rooms 每次都发会造成大量重复传输）。
+        """
         since = self.last_rev if since is None else since
         url = f"{self.base}/snapshot?since={since}&client={self.client_id}"
+        if since > 0:
+            url += "&lite=1"
         req = urllib.request.Request(url, method="GET")
+        if MAP_SYNC_TOKEN:
+            req.add_header("X-Map-Token", MAP_SYNC_TOKEN)
         data = _read_json(req)
         self.last_rev = int(data.get("revision") or self.last_rev)
         self._set_status(True)
@@ -360,3 +402,7 @@ def _load_client_id() -> str:
         cid = uuid.uuid4().hex[:12]
         cfg.set("map.client_id", cid)
     return cid
+
+
+# 共享上报令牌（随包分发，与服务端 MAP_SYNC_TOKEN 一致才允许写主库）
+

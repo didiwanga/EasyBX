@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sqlite3
@@ -57,6 +58,10 @@ _DIRS = set(_DIR_OPPOSITE)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5002
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map_master.db")
+# 写/读鉴权令牌：设置环境变量 MAP_SYNC_TOKEN 后，report/snapshot/route 必须
+# 携带 X-Map-Token 头；未设置则不校验（向后兼容旧客户端直连）。
+TOKEN = os.environ.get("MAP_SYNC_TOKEN", "").strip()
+_MAX_BODY = 16 * 1024 * 1024  # 单次上报上限 16MB
 
 
 def _norm_dir(d) -> str:
@@ -169,6 +174,7 @@ class MapStore:
                 "npc": json.loads(row["npc"]) if row["npc"] else [],
                 "desc": json.loads(row["desc"]) if row["desc"] else [],
                 "category": row["category"] or "",
+                "updated_at": row["updated_at"],
             }
         self._rebuild_name_index()
         self._nseq = max((int(n[1:]) for n in self._nodes
@@ -347,7 +353,9 @@ class MapStore:
                 for rname, r in rooms.items():
                     if not isinstance(r, dict):
                         continue
-                    cur = self._rooms.setdefault(str(rname), {})
+                    rname = str(rname)
+                    cur = self._rooms.setdefault(rname, {})
+                    cur["updated_at"] = now
                     for key in ("npc", "desc"):
                         vals = r.get(key)
                         if isinstance(vals, list) and vals:
@@ -366,6 +374,15 @@ class MapStore:
                         changed = True
 
             # 4) 批量落库 + revision（一次事务提交，避免每节点一次 fsync）
+            # 冲突记录无论是否有数据变更都要落库（dir 冲突不改主库但必须留痕）
+            if conflicts:
+                crows = [(c["kind"], c.get("name"), c.get("nid"),
+                          json.dumps(c.get("detail", {}), ensure_ascii=False), now)
+                         for c in conflicts]
+                self._conn.executemany(
+                    "INSERT INTO conflicts(kind, name, nid, detail, created_at)"
+                    " VALUES(?,?,?,?,?)", crows)
+                self._conn.commit()
             if changed:
                 rev = self._bump_rev()
                 for nid in touched:
@@ -385,13 +402,6 @@ class MapStore:
                     self._conn.executemany(
                         "INSERT OR REPLACE INTO rooms(name, npc, desc, category, updated_at)"
                         " VALUES(?,?,?,?,?)", rrows)
-                crows = [(c["kind"], c.get("name"), c.get("nid"),
-                          json.dumps(c.get("detail", {}), ensure_ascii=False), now)
-                         for c in conflicts]
-                if crows:
-                    self._conn.executemany(
-                        "INSERT INTO conflicts(kind, name, nid, detail, created_at)"
-                        " VALUES(?,?,?,?,?)", crows)
                 self._conn.commit()
             else:
                 rev = self.revision
@@ -412,8 +422,12 @@ class MapStore:
             }
 
     # ---- 快照（增量分发）----
-    def snapshot(self, since: int, client_id: str = "") -> dict:
-        """返回自 since 以来变更的节点/元数据（since<=0 全量）。"""
+    def snapshot(self, since: int, client_id: str = "", lite: bool = False) -> dict:
+        """返回自 since 以来变更的节点/元数据（since<=0 全量）。
+
+        lite=True：rooms 只回 updated_at 在最近 10 分钟内的（rooms 无 revision
+        号，增量拉取时全量 rooms 传输量大且绝大多数无变化）。
+        """
         with self._lock:
             now = time.time()
             nodes_out: dict[str, dict] = {}
@@ -434,8 +448,11 @@ class MapStore:
                             "coords": nd["coords"],
                             "neighbors": dict(nd["neighbors"]),
                         }
+            cutoff = (now - 600) if lite else 0
             rooms_out: dict[str, dict] = {}
             for rname, r in self._rooms.items():
+                if lite and r.get("updated_at", 0) < cutoff:
+                    continue
                 rooms_out[rname] = {
                     "exits": self._room_exits(rname),
                     "npc": list(r.get("npc", [])),
@@ -443,10 +460,12 @@ class MapStore:
                     "category": r.get("category", ""),
                 }
             if client_id:
+                # 保留已存 account（COALESCE 子查询），只推进 last_revision
                 self._conn.execute(
                     "INSERT OR REPLACE INTO clients(client_id, account, last_revision,"
-                    " last_seen) VALUES(?,?,(SELECT last_revision FROM clients"
-                    " WHERE client_id=?),?)",
+                    " last_seen) VALUES(?,?,"
+                    " COALESCE((SELECT account FROM clients WHERE client_id=?),''),"
+                    " ?)",
                     (client_id, "", self.revision, now))
                 self._conn.commit()
             return {"revision": self.revision, "nodes": nodes_out, "rooms": rooms_out}
@@ -519,13 +538,17 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         q = parse_qs(parsed.query)
+        if path in ("/api/map/snapshot", "/api/map/route") and not self._auth_ok():
+            self.send_json({"error": "unauthorized"}, code=401)
+            return
         if path == "/api/map/snapshot":
             try:
                 since = int((q.get("since") or ["0"])[0])
             except ValueError:
                 since = 0
             client = (q.get("client") or [""])[0]
-            data = self.store.snapshot(since, client)
+            lite = (q.get("lite") or ["0"])[0] in ("1", "true")
+            data = self.store.snapshot(since, client, lite=lite)
             self.send_json(data)
             return
         if path == "/api/map/stats":
@@ -542,11 +565,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json({"error": "not found"}, code=404)
 
+    def _auth_ok(self) -> bool:
+        if not TOKEN:
+            return True
+        return hmac.compare_digest(
+            (self.headers.get("X-Map-Token") or "").strip(), TOKEN)
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/api/map/report" and not self._auth_ok():
+            self.send_json({"error": "unauthorized"}, code=401)
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "bad Content-Length"}, code=400)
+            return
+        if length < 0 or length > _MAX_BODY:
+            self.send_json({"error": "payload too large"}, code=413)
+            return
+        try:
             body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except (ValueError, json.JSONDecodeError):
             self.send_json({"error": "bad json"}, code=400)

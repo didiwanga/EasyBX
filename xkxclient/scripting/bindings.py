@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import time
+import traceback
+
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from xkxclient.automation.timer import TimerDef
 from xkxclient.automation.trigger import Trigger
@@ -8,6 +11,32 @@ from xkxclient.version import VERSION
 
 CLIENT_NAME = "EasyBXb"
 CLIENT_VERSION = VERSION
+
+
+class MainMarshaller(QObject):
+    """工作线程 → Qt 主线程投递器。
+
+    Lua 脚本跑在纯 threading 工作线程；触发器/定时器/宏/导航引擎都是
+    Qt 主线程对象（内部建 QTimer、字典被主线程迭代）。直接从工作线程
+    调用会在非 Qt 线程创建 QTimer（行为未定义）并产生并发修改竞态。
+    统一经本类信号队列化到主线程执行（fire-and-forget，不回传结果）。
+    """
+
+    _call = pyqtSignal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._call.connect(self._run)  # 跨线程 emit 自动排队到主线程
+
+    @staticmethod
+    def _run(fn) -> None:
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+
+    def post(self, fn) -> None:
+        self._call.emit(fn)
 
 
 def _opt(opts, key: str, default=None):
@@ -88,8 +117,18 @@ class LuaBindings:
     def __init__(self, session, worker) -> None:
         self._s = session
         self._w = worker
+        self._mm = None  # 主线程投递器，build() 时在主线程创建
+
+    def _post_main(self, fn) -> None:
+        """引擎变更统一投递主线程；无投递器（如单测直调）时原地执行。"""
+        if self._mm is not None:
+            self._mm.post(fn)
+        else:
+            fn()
 
     def build(self) -> dict:
+        # 投递器必须在 Qt 主线程创建（ScriptRunner.start 由主线程调用）
+        self._mm = MainMarshaller()
         b: dict = {
             "send": self._send,
             "sendRaw": self._send_raw,
@@ -137,19 +176,28 @@ class LuaBindings:
                 one_shot=bool(_opt(opts, "one_shot", False)),
                 group=str(_opt(opts, "group", "")),
             )
-            s.triggers.triggers[:] = [x for x in s.triggers.triggers if x.name != t.name]
-            s.triggers.triggers.append(t)
+
+            def _reg():
+                s.triggers.triggers[:] = [x for x in s.triggers.triggers
+                                          if x.name != t.name]
+                s.triggers.triggers.append(t)
+            self._post_main(_reg)
             self._w.log.emit("[trigger] 注册 %s" % t.name)
             return True
 
         def remove(name: str) -> None:
-            s.triggers.triggers[:] = [x for x in s.triggers.triggers if x.name != str(name)]
+            target = str(name)
+
+            def _rm():
+                s.triggers.triggers[:] = [x for x in s.triggers.triggers
+                                          if x.name != target]
+            self._post_main(_rm)
 
         def enable(name: str) -> None:
-            s.triggers.enable(str(name))
+            self._post_main(lambda: s.triggers.enable(str(name)))
 
         def disable(name: str) -> None:
-            s.triggers.disable(str(name), stop=False)
+            self._post_main(lambda: s.triggers.disable(str(name), stop=False))
 
         return {"register": register, "remove": remove,
                 "enable": enable, "disable": disable,
@@ -166,16 +214,20 @@ class LuaBindings:
             td = TimerDef(name=str(name), enabled=True,
                           schedule={"type": "interval", "interval_ms": max(1, int(ms))},
                           actions=_to_actions(action))
-            s.timers.timers[name] = td
-            s.timers.start(name)
+
+            def _add():
+                # 字典插入必须回主线程：主线程 _on_tick 正在迭代 timers.items()
+                s.timers.timers[name] = td
+                s.timers.start(name)
+            self._post_main(_add)
             self._w.log.emit("[timer] 建立 %s (%sms)" % (name, int(ms)))
             return name
 
         def stop(name: str) -> None:
-            s.timers.stop(str(name))
+            self._post_main(lambda: s.timers.stop(str(name)))
 
         def stop_all() -> None:
-            s.timers.stop_all()
+            self._post_main(s.timers.stop_all)
 
         def names() -> list[str]:
             return list(s.timers.timers.keys())
@@ -185,8 +237,22 @@ class LuaBindings:
     # ---- macro ----
     def _macro_table(self) -> dict:
         s = self._s
-        return {"run": s.macros.start, "stop": s.macros.stop,
-                "pause": s.macros.pause, "resume": s.macros.resume,
+
+        # 宏引擎内部大量 QTimer（_arm_timer/_chain），必须回主线程操作
+        def m_run(name=None):
+            self._post_main(lambda: s.macros.start(str(name or "")))
+
+        def m_stop():
+            self._post_main(s.macros.stop)
+
+        def m_pause(name=None):
+            self._post_main(lambda: s.macros.pause(str(name) if name else None))
+
+        def m_resume(name=None):
+            self._post_main(lambda: s.macros.resume(str(name) if name else None))
+
+        return {"run": m_run, "stop": m_stop,
+                "pause": m_pause, "resume": m_resume,
                 "list": s.macros.list}
 
     # ---- bus ----
@@ -237,9 +303,12 @@ class LuaBindings:
     # ---- var（与 B3/DSL 共用 session.vars，仅内存）----
     def _var_table(self) -> dict:
         s = self._s
-        return {"set": lambda k, v: s.vars.__setitem__(k, v),
+        # vars 字典主线程并发读（substitute/触发器），写入回主线程防竞态
+        return {"set": lambda k, v: self._post_main(
+                    lambda: s.vars.__setitem__(k, v)),
                 "get": lambda k, default=None: s.vars.get(k, default),
-                "unset": lambda k: s.vars.pop(k, None),
+                "unset": lambda k: self._post_main(
+                    lambda: s.vars.pop(k, None)),
                 "all": lambda: dict(s.vars)}
 
     # ---- state ----
@@ -281,8 +350,9 @@ class LuaBindings:
                 return []
             return sorted(cache.rooms.keys())
 
-        return {"walk": lambda dirs: s.navigator.start(_coerce_list(dirs)),
-                "stop": s.navigator.stop,
+        return {"walk": lambda dirs: self._post_main(
+                    lambda: s.navigator.start(_coerce_list(dirs))),
+                "stop": lambda: self._post_main(s.navigator.stop),
                 "stepMs": s.navigator.config_step_ms,
                 "currentRoom": current_room,
                 "route": route,
